@@ -3,7 +3,6 @@ from discord.ext import commands
 from discord import app_commands
 
 # ===== CONFIG =====
-TOKEN = "YOUR_BOT_TOKEN"
 VERIFY_CHANNEL_ID = 1470266528455987261  # verify channel ID (number)
 VERIFIED_ROLE_ID = 1469966592296222761  # verified role ID
 UNVERIFIED_ROLE_ID = 1469934005389365300  # unverified role ID (optional)
