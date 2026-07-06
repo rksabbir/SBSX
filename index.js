@@ -65,10 +65,17 @@ const CONFIG = {
     LOG_CHANNEL_ID: "1488340400673656973",
     VOICE_CHANNEL_ID: "1523230098193383595",
     
+    // Roles
     ROLES: {
         ADMIN: "148832568372973568",
         SUPPORT_TICKET_REPORT: "1488333580705861765",
         SUPPORT_CUSTOMER: "1488335064873046086"
+    },
+    // Target Setup Channels (যে চ্যানেলে কমান্ড দিলে কাজ করবে)
+    CHANNELS: {
+        TICKET_PANEL: "1488339982627115118",
+        REPORT_PANEL: "1488340441115004999",
+        CUSTOMER_PANEL: "1488340017938960484"
     }
 };
 
@@ -452,22 +459,30 @@ client.on("interactionCreate", async (interaction) => {
 // 🛠️ PART 5 - Prefix Setup Commands & Sync Recovery
 // ================================
 client.on("messageCreate", async (message) => {
-    if (message.author.bot || !message.guild || message.guild.id !== CONFIG.ALLOWED_GUILD_ID) return;
+    if (message.author.bot || !message.guild) return;
 
+    // ওনার বা Administrator পারমিশন চেক করা (রোল আইডির ঝামেলা এড়াতে)
+    const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.guild.ownerId === message.author.id || message.member.roles.cache.has(CONFIG.ROLES.ADMIN);
+
+    if (!isServerAdmin) return;
+
+    // !setup Command (For Verification Panel)
     if (message.content === "!setup") {
-        if (!message.member.roles.cache.has(CONFIG.ROLES.ADMIN)) return;
         return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
     }
-    if (message.content === "!ticket") {
-        if (!message.member.roles.cache.has(CONFIG.ROLES.ADMIN)) return;
+    
+    // !ticket command (শুধুমাত্র নির্দিষ্ট টিকেট প্যানেল চ্যানেলে কাজ করবে)
+    if (message.content === "!ticket" && message.channelId === CONFIG.CHANNELS.TICKET_PANEL) {
         return message.channel.send(getTicketPanel());
     }
-    if (message.content === "!report") {
-        if (!message.member.roles.cache.has(CONFIG.ROLES.ADMIN)) return;
+    
+    // !report command (শুধুমাত্র নির্দিষ্ট রিপোর্ট প্যানেল চ্যানেলে কাজ করবে)
+    if (message.content === "!report" && message.channelId === CONFIG.CHANNELS.REPORT_PANEL) {
         return message.channel.send(getReportPanel());
     }
-    if (message.content === "!customer") {
-        if (!message.member.roles.cache.has(CONFIG.ROLES.ADMIN)) return;
+    
+    // !customer command (শুধুমাত্র নির্দিষ্ট কাস্টমার প্যানেল চ্যানেলে কাজ করবে)
+    if (message.content === "!customer" && message.channelId === CONFIG.CHANNELS.CUSTOMER_PANEL) {
         return message.channel.send(getCustomerPanel());
     }
 });
