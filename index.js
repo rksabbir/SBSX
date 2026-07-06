@@ -1,8 +1,9 @@
 // ================================
-// 🚀 PART 1 - Setup, Dependencies & Firebase Config
+// 🚀 PART 1 - Setup + Express + Config + Voice Setup
 // ================================
+
 const express = require("express");
-const admin = require("firebase-admin");
+const fs = require("fs");
 
 const {
     Client,
@@ -24,57 +25,65 @@ const {
     VoiceConnectionStatus
 } = require("@discordjs/voice");
 
-const TOKEN = process.env.TOKEN;
-const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
-const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL;
-
-let decryptedPrivateKey;
-if (process.env.FIREBASE_PRIVATE_KEY_B64) {
-    decryptedPrivateKey = Buffer.from(process.env.FIREBASE_PRIVATE_KEY_B64, 'base64').toString('utf8');
-} else {
-    console.error("❌ Render Environment-এ FIREBASE_PRIVATE_KEY_B64 পাওয়া যায়নি!");
-    process.exit(1);
-}
-
-admin.initializeApp({
-    credential: admin.credential.cert({
-        projectId: FIREBASE_PROJECT_ID,
-        clientEmail: FIREBASE_CLIENT_EMAIL,
-        privateKey: decryptedPrivateKey.replace(/\\n/g, '\n')
-    })
-});
-const db = admin.firestore();
+// ================================
+// 🌐 Express Keep Alive
+// ================================
 
 const app = express();
-app.get("/", (req, res) => res.send("Bot is running perfectly on Render!"));
+
+app.get("/", (req, res) => {
+    res.send("Bot is running!");
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🌐 Web server running on port ${PORT}`));
+
+app.listen(PORT, () => {
+    console.log(`🌐 Web server running on port ${PORT}`);
+});
 
 // ================================
-// ⚙️ Bot Configuration Constants
+// ⚙️ Bot Config
 // ================================
-const CONFIG = {
-    ALLOWED_GUILD_ID: "1488101970425155584",
-    VERIFIED_ROLE_ID: "1488333841402691664", 
-    VERIFY_CHANNEL_NAME: "verify",
-    WELCOME_CHANNEL_NAME: "welcome",
-    WELCOME_CHANNEL_ID: "1488339169821593731",
-    LOG_CHANNEL_ID: "1488340400673656973",
-    VOICE_CHANNEL_ID: "1523230098193383595",
-    
-    ROLES: {
-        ADMIN: "148832568372973568",
-        SUPPORT_TICKET_REPORT: "1488333580705861765",
-        SUPPORT_CUSTOMER: "1488335064873046086"
-    },
-    CHANNELS: {
-        TICKET_PANEL: "1488339982627115118",
-        REPORT_PANEL: "1488340441115004999",
-        CUSTOMER_PANEL: "1488340017938960484"
-    }
+
+const TOKEN = process.env.TOKEN;
+
+// Guild
+const ALLOWED_GUILD_ID = "1488101970425155584";
+
+// Verification
+const VERIFIED_ROLE_ID = "1488333841402691664";
+
+// Channels
+const VERIFY_CHANNEL_NAME = "verify";
+const WELCOME_CHANNEL_NAME = "welcome";
+
+const WELCOME_CHANNEL_ID = "1488339169821593731";
+const LOG_CHANNEL_ID = "1488340400673656973";
+
+// Voice Channel
+const VOICE_CHANNEL_ID = "1523230098193383595";
+
+// 👑 Roles Configuration (এখানে অ্যাডমিন ও সাপোর্ট রোলের আইডিগুলো দেওয়া হয়েছে)
+const ROLES = {
+    ADMIN: "148832568372973568", // অ্যাডমিন রোল আইডি
+    SUPPORT_TICKET_REPORT: "1488333580705861765", // টিকিট ও রিপোর্ট সাপোর্ট রোল
+    SUPPORT_CUSTOMER: "1488335064873046086" // কাস্টমার সাপোর্ট রোল
 };
 
+// Target Setup Panels Channels
+const CHANNELS = {
+    TICKET_PANEL: "1488339982627115118",
+    REPORT_PANEL: "1488340441115004999",
+    CUSTOMER_PANEL: "1488340017938960484"
+};
+
+// Database
+const DATA_FILE = "./database.json";
 const cooldowns = new Map();
+
+// ================================
+// 🤖 Discord Client
+// ================================
 
 const client = new Client({
     intents: [
@@ -84,23 +93,51 @@ const client = new Client({
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildVoiceStates
     ],
-    partials: [Partials.Channel, Partials.GuildMember]
+    partials: [
+        Partials.Channel,
+        Partials.GuildMember
+    ]
 });
 
-process.on("unhandledRejection", (err) => console.error("[Unhandled Rejection]", err));
-process.on("uncaughtException", (err) => console.error("[Uncaught Exception]", err));
+// ================================
+// 🛡️ Anti Crash
+// ================================
+
+process.on("unhandledRejection", (err) => {
+    console.error("[Unhandled Rejection]", err);
+});
+
+process.on("uncaughtException", (err) => {
+    console.error("[Uncaught Exception]", err);
+});
+
+// ================================
+// 🎮 Presence
+// ================================
 
 function setBotPresence() {
     client.user.setPresence({
-        activities: [{ name: "Security & Management", type: ActivityType.Watching }],
+        activities: [
+            {
+                name: "Security & Verification",
+                type: ActivityType.Watching
+            }
+        ],
         status: "online"
     });
 }
 
+// ================================
+// 🔊 Voice Auto Join
+// ================================
+
 async function connectVoice(guild) {
     try {
-        const channel = guild.channels.cache.get(CONFIG.VOICE_CHANNEL_ID);
-        if (!channel) return console.log("Voice channel not found.");
+        const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
+        if (!channel) {
+            console.log("Voice channel not found.");
+            return;
+        }
 
         const connection = joinVoiceChannel({
             channelId: channel.id,
@@ -109,6 +146,7 @@ async function connectVoice(guild) {
             selfDeaf: true,
             selfMute: false
         });
+
         await entersState(connection, VoiceConnectionStatus.Ready, 30000);
         console.log("✅ Voice channel connected.");
     } catch (err) {
@@ -116,35 +154,19 @@ async function connectVoice(guild) {
     }
 }
 
-async function addMemberToFirebase(memberId) {
-    await db.collection("members").doc(memberId).set({ joined: true });
-}
-
-async function removeMemberFromFirebase(memberId) {
-    await db.collection("members").doc(memberId).delete();
-}
-
-async function getSavedMembersFromFirebase() {
-    const snapshot = await db.collection("members").get();
-    return snapshot.docs.map(doc => doc.id);
-}
-
-async function hasActivePanelChannel(userId, type) {
-    const snapshot = await db.collection("panels")
-        .where("ownerId", "==", userId)
-        .where("type", "==", type)
-        .where("status", "in", ["Open", "Claimed"])
-        .get();
-    return !snapshot.empty;
-}
-
 // ================================
-// 🚨 PART 2 - Verification & Welcome System
+// 🚨 PART 2 - Verification System
 // ================================
+
+// Verification Button
 const verificationRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("universal_verify_button").setLabel("Verify Me").setStyle(ButtonStyle.Success)
+    new ButtonBuilder()
+        .setCustomId("universal_verify_button")
+        .setLabel("Verify Me")
+        .setStyle(ButtonStyle.Success)
 );
 
+// Verification Embed
 function createVerificationEmbed() {
     return new EmbedBuilder()
         .setTitle("🚨 Verification Required")
@@ -154,35 +176,21 @@ function createVerificationEmbed() {
         .setTimestamp();
 }
 
-function createWelcomeEmbed(member) {
-    return new EmbedBuilder()
-        .setColor("#00AAFF")
-        .setTitle("🎉 নতুন সদস্য Join করেছে!")
-        .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
-        .setDescription(`✨ স্বাগতম ${member} আমাদের সার্ভারে!\n\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️`)
-        .addFields(
-            { name: "👤 Username", value: member.user.tag, inline: true },
-            { name: "🆔 User ID", value: member.user.id, inline: true },
-            { name: "⏰ Joined Server", value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
-            { name: "👥 Total Members", value: `${member.guild.memberCount}`, inline: true }
-        )
-        .setTimestamp();
-}
-
+// Send Verification Panel When Member Joins
 client.on("guildMemberAdd", async (member) => {
-    if (member.guild.id !== CONFIG.ALLOWED_GUILD_ID) return;
+    if (member.guild.id !== ALLOWED_GUILD_ID) return;
     try {
-        await addMemberToFirebase(member.id);
-        const welcomeChannel = member.guild.channels.cache.get(CONFIG.WELCOME_CHANNEL_ID);
-        if (welcomeChannel) {
-            await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [createWelcomeEmbed(member)] });
-        }
-    } catch (err) { console.error(err); }
-});
+        const verifyChannel = member.guild.channels.cache.find(ch => ch.name === VERIFY_CHANNEL_NAME);
+        if (!verifyChannel) return;
 
-client.on("guildMemberRemove", async (member) => {
-    if (member.guild.id !== CONFIG.ALLOWED_GUILD_ID) return;
-    await removeMemberFromFirebase(member.id);
+        await verifyChannel.send({
+            content: `স্বাগতম <@${member.id}>!`,
+            embeds: [createVerificationEmbed()],
+            components: [verificationRow]
+        });
+    } catch (err) {
+        console.error(err);
+    }
 });
 
 // ================================
@@ -255,11 +263,13 @@ function getChannelControlRow(type) {
 }
 
 // ================================
-// ⚡ PART 4 - Interaction Handling & Core System Logic
+// ⚡ PART 4 - Interaction Handling (Buttons & Menus)
 // ================================
-client.on("interactionCreate", async (interaction) => {
-    if (!interaction.guild || interaction.guild.id !== CONFIG.ALLOWED_GUILD_ID) return;
 
+client.on("interactionCreate", async (interaction) => {
+    if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
+
+    // Cooldown Logic
     if (interaction.isButton() || interaction.isStringSelectMenu()) {
         const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
         if (cooldowns.has(cooldownKey)) {
@@ -269,21 +279,34 @@ client.on("interactionCreate", async (interaction) => {
         setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
+    // Verification Button Click
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const role = interaction.guild.roles.cache.get(CONFIG.VERIFIED_ROLE_ID);
-        if (!role) return interaction.editReply("❌ Verification role পাওয়া যায়নি।");
-        if (interaction.member.roles.cache.has(CONFIG.VERIFIED_ROLE_ID)) {
-            return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
+        try {
+            await interaction.deferReply({ ephemeral: true });
+            const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
+            if (!role) return interaction.editReply("❌ Role not found!");
+
+            if (interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) {
+                return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
+            }
+
+            await interaction.member.roles.add(role);
+            await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
+
+            const welcomeChannel = interaction.guild.channels.cache.find(ch => ch.name === WELCOME_CHANNEL_NAME);
+            if (welcomeChannel) {
+                welcomeChannel.send(`🎉 Welcome ${interaction.user}!`).catch(() => {});
+            }
+        } catch (err) {
+            console.error(err);
+            if (interaction.deferred) {
+                interaction.editReply("❌ Error! Bot Permission চেক করুন।").catch(() => {});
+            }
         }
-        await interaction.member.roles.add(role);
-        await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
-        
-        const welcomeChannel = interaction.guild.channels.cache.find(ch => ch.name === CONFIG.WELCOME_CHANNEL_NAME);
-        if (welcomeChannel) welcomeChannel.send(`🎉 Welcome ${interaction.user}!`).catch(() => {});
         return;
     }
 
+    // Dropdown Select Menu Handling
     if (interaction.isStringSelectMenu()) {
         const value = interaction.values[0];
         let type = "";
@@ -295,11 +318,6 @@ client.on("interactionCreate", async (interaction) => {
         else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${value}`; }
 
         if (type) {
-            const hasActive = await hasActivePanelChannel(interaction.user.id, type);
-            if (hasActive) {
-                return interaction.reply({ content: `⚠️ আপনার ইতিমধ্যে একটি ওপেন ${type} চ্যানেল রয়েছে।`, flags: [MessageFlags.Ephemeral] });
-            }
-
             const ephemeralEmbed = new EmbedBuilder()
                 .setTitle(`📌 Selected Category: ${value.toUpperCase().replace("_", " ")}`)
                 .setDescription(`আপনার নির্বাচনটি সফল হয়েছে। চ্যানেল তৈরি করতে নিচের বাটনে চাপ দিন।`)
@@ -312,52 +330,54 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
+    // Create Channel Button Handling (🛡️ পারমিশন ফিক্স করা হয়েছে যেন অ্যাডমিনরা দেখতে পান)
     if (interaction.isButton() && interaction.customId.startsWith("create_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const dataArr = interaction.customId.split("_");
         const type = dataArr[1];
         const category = dataArr.slice(2).join("_");
 
-        const hasActive = await hasActivePanelChannel(interaction.user.id, type);
-        if (hasActive) return interaction.editReply(`⚠️ আপনার অলরেডি একটি অ্যাক্টিভ ${type} চ্যানেল আছে।`);
+        let supportRoleId = (type === "customer") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
+        let channelPrefix = `${type}-${interaction.user.username}`;
 
-        let supportRoleId = (type === "customer") ? CONFIG.ROLES.SUPPORT_CUSTOMER : CONFIG.ROLES.SUPPORT_TICKET_REPORT;
-        let channelPrefix = "";
-
-        if (type === "ticket") channelPrefix = `ticket-${interaction.user.username}`;
-        else if (type === "report") channelPrefix = `report-${interaction.user.username}`;
-        else if (type === "customer") channelPrefix = `support-${interaction.user.username}`;
-
-        const panelId = `${type}-${Date.now()}`;
-
+        // 🛡️ পারমিশন ফিল্টার: সাধারণ মেম্বারদের থেকে টিকিট সম্পূর্ণ বন্ধ ও হাইড থাকবে
         const permissionOverwrites = [
-            { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: CONFIG.VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] }, 
-            { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory], deny: [PermissionFlagsBits.ManageChannels] }
+            { 
+                id: interaction.guild.id, 
+                deny: [PermissionFlagsBits.ViewChannel] 
+            },
+            { 
+                id: VERIFIED_ROLE_ID, 
+                deny: [PermissionFlagsBits.ViewChannel] 
+            }, 
+            // টিকিট ওনার দেখতে ও লিখতে পারবে
+            { 
+                id: interaction.user.id, 
+                allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory], 
+                deny: [PermissionFlagsBits.ManageChannels] 
+            }
         ];
 
+        // 🎯 নির্দিষ্ট সাপোর্ট রোল থাকলে তাকে পারমিশন দেওয়া হবে
         if (interaction.guild.roles.cache.has(supportRoleId)) {
-            permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+            permissionOverwrites.push({ 
+                id: supportRoleId, 
+                allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] 
+            });
         }
-        if (interaction.guild.roles.cache.has(CONFIG.ROLES.ADMIN)) {
-            permissionOverwrites.push({ id: CONFIG.ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
+        
+        // 🎯 অ্যাডমিন রোলকে এখানে এক্সপ্লিসিটলি (Explicitly) দেখার ও লেখার ফুল অনুমতি দেওয়া হলো
+        if (interaction.guild.roles.cache.has(ROLES.ADMIN)) {
+            permissionOverwrites.push({ 
+                id: ROLES.ADMIN, 
+                allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] 
+            });
         }
 
         const privateChannel = await interaction.guild.channels.create({
             name: channelPrefix,
             type: 0,
             permissionOverwrites: permissionOverwrites
-        });
-
-        await db.collection("panels").doc(privateChannel.id).set({
-            panelId: panelId,
-            channelId: privateChannel.id,
-            ownerId: interaction.user.id,
-            type: type,
-            category: category,
-            claimedStaff: null,
-            status: "Open",
-            createdTime: admin.firestore.FieldValue.serverTimestamp()
         });
 
         const insideEmbed = new EmbedBuilder()
@@ -369,6 +389,9 @@ client.on("interactionCreate", async (interaction) => {
         if (interaction.guild.roles.cache.has(supportRoleId)) {
             mentionContent += ` | <@&${supportRoleId}>`;
         }
+        if (interaction.guild.roles.cache.has(ROLES.ADMIN)) {
+            mentionContent += ` | <@&${ROLES.ADMIN}>`;
+        }
 
         await privateChannel.send({
             content: mentionContent,
@@ -379,156 +402,232 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে! প্রবেশ করুন এখানে: ${privateChannel}`);
     }
 
-    // 🛟 CLAIM STAFF মেকানিজম আপডেট (সরাসরি মেসেজ লেখার পারমিশন যুক্ত করা হয়েছে)
+    // Claim Staff Handling
     if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
         const type = interaction.customId.split("_")[1];
-        let reqRole = (type === "customer") ? CONFIG.ROLES.SUPPORT_CUSTOMER : CONFIG.ROLES.SUPPORT_TICKET_REPORT;
+        let reqRole = (type === "customer") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
 
-        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(CONFIG.ROLES.ADMIN) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return interaction.reply({ content: "❌ এটি ক্লেইম করার পারমিশন আপনার নেই!", flags: [MessageFlags.Ephemeral] });
         }
 
-        const docRef = db.collection("panels").doc(interaction.channelId);
-        const doc = await docRef.get();
-        if (!doc.exists) return interaction.reply({ content: "তথ্য পাওয়া যায়নি।", flags: [MessageFlags.Ephemeral] });
-
-        if (doc.data().claimedStaff) {
-            return interaction.reply({ content: `⚠️ এটি ইতিমধ্যে <@${doc.data().claimedStaff}> ক্লেইম করেছেন।`, flags: [MessageFlags.Ephemeral] });
-        }
-
-        // 🎯 ক্লেইম করা স্টাফকে আলাদা করে চ্যানেল রাইটিং এবং ভিউ পারমিশন ইনজেক্ট করা হচ্ছে
         await interaction.channel.permissionOverwrites.edit(interaction.user.id, {
             ViewChannel: true,
             SendMessages: true,
             ReadMessageHistory: true
-        }).catch(err => console.error("স্টাফ পারমিশন আপডেট ব্যর্থ:", err));
+        }).catch(err => console.error(err));
 
-        await docRef.update({ claimedStaff: interaction.user.id, status: "Claimed" });
-        await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন। চ্যাটে আপনার রিপ্লাই অপশন আনলক হয়েছে।` });
+        await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
         return;
     }
 
+    // Close Ticket Handling
     if (interaction.isButton() && interaction.customId.startsWith("close_")) {
         const type = interaction.customId.split("_")[1];
-        const docRef = db.collection("panels").doc(interaction.channelId);
-        const doc = await docRef.get();
-        if (!doc.exists) return interaction.reply({ content: "ডাটাবেজে কোনো রেকর্ড পাওয়া যায়নি।", flags: [MessageFlags.Ephemeral] });
+        let reqRole = (type === "customer") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
 
-        const data = doc.data();
-        let reqRole = (type === "customer") ? CONFIG.ROLES.SUPPORT_CUSTOMER : CONFIG.ROLES.SUPPORT_TICKET_REPORT;
-
-        if (interaction.user.id !== data.ownerId && !interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(CONFIG.ROLES.ADMIN) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
             return interaction.reply({ content: "❌ আপনি এই চ্যানেলটি বন্ধ করতে পারবেন না।", flags: [MessageFlags.Ephemeral] });
         }
 
-        await interaction.reply("🔒 চ্যানেলটি বন্ধ করা হচ্ছে এবং ট্রান্সক্রিপ্ট নেওয়া হচ্ছে... ৫ সেকেন্ডের মধ্যে চ্যানেল ডিলিট হবে।");
+        await interaction.reply("🔒 চ্যানেলটি বন্ধ করা হচ্ছে... ৫ সেকেন্ডের মধ্যে চ্যানেল ডিলিট হবে।");
 
-        let transcriptText = `--- Transcript for ${data.panelId} ---\n`;
+        let transcriptText = `--- Transcript for Channel ---\n`;
         const fetchedMessages = await interaction.channel.messages.fetch({ limit: 100 });
         fetchedMessages.reverse().forEach(m => {
             transcriptText += `[${m.createdAt.toISOString()}] ${m.author.tag}: ${m.content}\n`;
         });
 
-        const logChannel = interaction.guild.channels.cache.get(CONFIG.LOG_CHANNEL_ID);
+        const logChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
         if (logChannel) {
-            const logEmbed = new EmbedBuilder()
-                .setTitle(`📑 Channel Closed: ${data.panelId}`)
-                .addFields(
-                    { name: "Owner", value: `<@${data.ownerId}>`, inline: true },
-                    { name: "Type", value: data.type.toUpperCase(), inline: true },
-                    { name: "Category", value: data.category, inline: true },
-                    { name: "Closed By", value: `${interaction.user.tag}`, inline: true }
-                )
-                .setColor("Orange");
-
+            const logEmbed = new EmbedBuilder().setTitle(`📑 Channel Closed: ${interaction.channel.name}`).setColor("Orange");
             await logChannel.send({
                 embeds: [logEmbed],
-                files: [{ attachment: Buffer.from(transcriptText, "utf-8"), name: `transcript-${data.panelId}.txt` }]
+                files: [{ attachment: Buffer.from(transcriptText, "utf-8"), name: `transcript-${interaction.channel.name}.txt` }]
             });
         }
 
-        await docRef.update({ status: "Closed", closeTime: admin.firestore.FieldValue.serverTimestamp() });
         setTimeout(async () => {
             await interaction.channel.delete().catch(() => {});
         }, 5000);
     }
 });
 
-// ================================
-// 🛠️ PART 5 - Prefix Setup Commands & Sync Recovery
-// ================================
+// Manual Setup Commands
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild) return;
+    if (message.guild.id !== ALLOWED_GUILD_ID) return;
 
-    const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.guild.ownerId === message.author.id || message.member.roles.cache.has(CONFIG.ROLES.ADMIN);
-
+    const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.guild.ownerId === message.author.id || message.member.roles.cache.has(ROLES.ADMIN);
     if (!isServerAdmin) return;
 
     if (message.content === "!setup") {
-        return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
+        return message.channel.send({
+            embeds: [createVerificationEmbed()],
+            components: [verificationRow]
+        });
     }
-    
-    if (message.content === "!ticket" && message.channelId === CONFIG.CHANNELS.TICKET_PANEL) {
+    if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) {
         return message.channel.send(getTicketPanel());
     }
-    
-    if (message.content === "!report" && message.channelId === CONFIG.CHANNELS.REPORT_PANEL) {
+    if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) {
         return message.channel.send(getReportPanel());
     }
-    
-    if (message.content === "!customer" && message.channelId === CONFIG.CHANNELS.CUSTOMER_PANEL) {
+    if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) {
         return message.channel.send(getCustomerPanel());
     }
 });
 
-client.on("voiceStateUpdate", async () => {
-    const guild = client.guilds.cache.get(CONFIG.ALLOWED_GUILD_ID);
-    if (!guild || !guild.members.me) return;
-    if (!guild.members.me.voice.channel) {
-        await connectVoice(guild);
+// ================================
+// 🚀 PART 3 - Welcome Embed + Database System
+// ================================
+
+// Welcome Embed
+function createWelcomeEmbed(member) {
+    return new EmbedBuilder()
+        .setColor("#00AAFF")
+        .setTitle("🎉 নতুন সদস্য Join করেছে!")
+        .setThumbnail(member.user.displayAvatarURL({ dynamic: true }))
+        .setDescription(`✨ স্বাগতম ${member} আমাদের সার্ভারে!\n\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️`)
+        .addFields(
+            { name: "👤 Username", value: member.user.tag, inline: true },
+            { name: "🆔 User ID", value: member.user.id, inline: true },
+            { name: "⏰ Joined Server", value: `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>`, inline: true },
+            { name: "👥 Total Members", value: `${member.guild.memberCount}`, inline: true }
+        )
+        .setTimestamp();
+}
+
+// ================================
+// 📂 Database Functions
+// ================================
+
+function getSavedMembers() {
+    try {
+        if (!fs.existsSync(DATA_FILE)) {
+            fs.writeFileSync(DATA_FILE, JSON.stringify([]), "utf8");
+            return [];
+        }
+        const data = fs.readFileSync(DATA_FILE, "utf8");
+        return JSON.parse(data);
+    } catch (err) {
+        console.error("Database Read Error:", err);
+        return [];
     }
+}
+
+function saveMembers(memberIds) {
+    try {
+        fs.writeFileSync(DATA_FILE, JSON.stringify(memberIds, null, 2), "utf8");
+    } catch (err) {
+        console.error("Database Save Error:", err);
+    }
+}
+
+function addMember(memberId) {
+    const members = getSavedMembers();
+    if (!members.includes(memberId)) {
+        members.push(memberId);
+        saveMembers(members);
+    }
+}
+
+function removeMember(memberId) {
+    const members = getSavedMembers();
+    const filtered = members.filter(id => id !== memberId);
+    saveMembers(filtered);
+}
+
+// Member Leave হলে Database Update
+client.on("guildMemberRemove", (member) => {
+    if (member.guild.id !== ALLOWED_GUILD_ID) return;
+    removeMember(member.id);
 });
+
+// ================================
+// 🚀 PART 4 - Ready Event + Recovery + Voice Join
+// ================================
 
 client.once("ready", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`);
     setBotPresence();
 
-    const guild = client.guilds.cache.get(CONFIG.ALLOWED_GUILD_ID);
-    if (!guild) return console.log("⚠️ Guild not found!");
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (!guild) {
+        console.log("⚠️ Guild not found!");
+        return;
+    }
 
     await connectVoice(guild);
-    const welcomeChannel = guild.channels.cache.get(CONFIG.WELCOME_CHANNEL_ID);
+    const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
 
     try {
-        console.log("🔍 Firebase & Offline Sync checking initiated...");
+        console.log("🔍 Checking for missed members while offline...");
         const currentMembers = await guild.members.fetch();
-        const savedMembers = await getSavedMembersFromFirebase();
+        const savedMembers = getSavedMembers();
 
-        if (savedMembers.length > 0 && welcomeChannel) {
-            const missedMembers = currentMembers.filter(member => !savedMembers.includes(member.id) && !member.user.bot);
-            if (missedMembers.size > 0) {
+        if (savedMembers.length > 0) {
+            const missedMembers = currentMembers.filter(member =>
+                !savedMembers.includes(member.id) && !member.user.bot
+            );
+
+            if (missedMembers.size > 0 && welcomeChannel) {
+                console.log(`📡 Found ${missedMembers.size} missed members.`);
                 for (const [, member] of missedMembers) {
                     await welcomeChannel.send({
-                        content: `🎉 স্বাগতম ${member}\n\n🤖 বট অফলাইনে থাকার সময় আপনি সার্ভারে Join করেছিলেন।`,
+                        content: `🎉 স্বাগতম ${member}\n\n🤖 বট অফলাইনে থাকার সময় আপনি সার্ভারে Join করেছিলেন।`,
                         embeds: [createWelcomeEmbed(member)]
                     }).catch(() => {});
                 }
             }
         }
 
-        for (const [id, member] of currentMembers) {
-            if (!member.user.bot) await addMemberToFirebase(id);
-        }
-        console.log("✅ Firebase Database synced successfully.");
+        const memberIds = currentMembers.filter(member => !member.user.bot).map(member => member.id);
+        saveMembers(memberIds);
+        console.log("✅ Database synced successfully.");
+        console.log(`👥 Total Members: ${memberIds.length}`);
     } catch (err) {
         console.error("Recovery Error:", err);
     }
 });
 
+// Voice Reconnect
+client.on("voiceStateUpdate", async () => {
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (!guild) return;
+    const me = guild.members.me;
+    if (!me) return;
+
+    if (!me.voice.channel) {
+        console.log("🔄 Reconnecting to Voice Channel...");
+        await connectVoice(guild);
+    }
+});
+
+// ================================
+// 🚀 PART 5 - Member Join + Auto Login
+// ================================
+
+client.on("guildMemberAdd", async (member) => {
+    if (member.guild.id !== ALLOWED_GUILD_ID) return;
+    addMember(member.id);
+
+    const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
+    if (welcomeChannel) {
+        await welcomeChannel.send({
+            content: `🎉 স্বাগতম ${member}!`,
+            embeds: [createWelcomeEmbed(member)]
+        }).catch(() => {});
+    }
+});
+
 function startBot() {
     client.login(TOKEN).catch(err => {
-        console.error("❌ Login Failed! Retrying in 5 seconds...", err);
+        console.error("❌ Login Failed!");
+        console.error(err);
+        console.log("🔄 Retrying in 5 seconds...");
         setTimeout(startBot, 5000);
     });
 }
+
 startBot();
