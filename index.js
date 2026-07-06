@@ -15,7 +15,7 @@ const {
     ActivityType,
     StringSelectMenuBuilder,
     PermissionFlagsBits,
-    MessageFlags // Ephemeral Flags-এর জন্য যুক্ত করা হয়েছে
+    MessageFlags
 } = require("discord.js");
 
 const {
@@ -24,12 +24,10 @@ const {
     VoiceConnectionStatus
 } = require("@discordjs/voice");
 
-// Render Environment Variables থেকে ডেটা রিড করা
 const TOKEN = process.env.TOKEN;
 const FIREBASE_PROJECT_ID = process.env.FIREBASE_PROJECT_ID;
 const FIREBASE_CLIENT_EMAIL = process.env.FIREBASE_CLIENT_EMAIL;
 
-// Base64 এনকোডেড প্রাইভেট কি ডিকোড করার মেকানিজম (Render-এর জন্য সবচেয়ে নিরাপদ)
 let decryptedPrivateKey;
 if (process.env.FIREBASE_PRIVATE_KEY_B64) {
     decryptedPrivateKey = Buffer.from(process.env.FIREBASE_PRIVATE_KEY_B64, 'base64').toString('utf8');
@@ -38,7 +36,6 @@ if (process.env.FIREBASE_PRIVATE_KEY_B64) {
     process.exit(1);
 }
 
-// Firebase Initialization
 admin.initializeApp({
     credential: admin.credential.cert({
         projectId: FIREBASE_PROJECT_ID,
@@ -48,7 +45,6 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
-// Express Keep Alive (Render-এর জন্য বাধ্যতামূলক)
 const app = express();
 app.get("/", (req, res) => res.send("Bot is running perfectly on Render!"));
 const PORT = process.env.PORT || 3000;
@@ -59,20 +55,18 @@ app.listen(PORT, () => console.log(`🌐 Web server running on port ${PORT}`));
 // ================================
 const CONFIG = {
     ALLOWED_GUILD_ID: "1488101970425155584",
-    VERIFIED_ROLE_ID: "1488333841402691664",
+    VERIFIED_ROLE_ID: "1488333841402691664", 
     VERIFY_CHANNEL_NAME: "verify",
     WELCOME_CHANNEL_NAME: "welcome",
     WELCOME_CHANNEL_ID: "1488339169821593731",
     LOG_CHANNEL_ID: "1488340400673656973",
     VOICE_CHANNEL_ID: "1523230098193383595",
     
-    // Roles (আইডিগুলো ভালো করে চেক করে নেবেন)
     ROLES: {
         ADMIN: "148832568372973568",
         SUPPORT_TICKET_REPORT: "1488333580705861765",
         SUPPORT_CUSTOMER: "1488335064873046086"
     },
-    // Target Setup Channels
     CHANNELS: {
         TICKET_PANEL: "1488339982627115118",
         REPORT_PANEL: "1488340441115004999",
@@ -93,13 +87,9 @@ const client = new Client({
     partials: [Partials.Channel, Partials.GuildMember]
 });
 
-// Anti-Crash Handler (এরর আসলেও বট অফলাইন হবে না)
 process.on("unhandledRejection", (err) => console.error("[Unhandled Rejection]", err));
 process.on("uncaughtException", (err) => console.error("[Uncaught Exception]", err));
 
-// ================================
-// 🔊 Voice Auto Join & Presence
-// ================================
 function setBotPresence() {
     client.user.setPresence({
         activities: [{ name: "Security & Management", type: ActivityType.Watching }],
@@ -126,9 +116,6 @@ async function connectVoice(guild) {
     }
 }
 
-// ================================
-// 📂 Firebase Sync Functions
-// ================================
 async function addMemberToFirebase(memberId) {
     await db.collection("members").doc(memberId).set({ joined: true });
 }
@@ -186,14 +173,6 @@ client.on("guildMemberAdd", async (member) => {
     if (member.guild.id !== CONFIG.ALLOWED_GUILD_ID) return;
     try {
         await addMemberToFirebase(member.id);
-        const verifyChannel = member.guild.channels.cache.find(ch => ch.name === CONFIG.VERIFY_CHANNEL_NAME);
-        if (verifyChannel) {
-            await verifyChannel.send({
-                content: `স্বাগতম <@${member.id}>!`,
-                embeds: [createVerificationEmbed()],
-                components: [verificationRow]
-            });
-        }
         const welcomeChannel = member.guild.channels.cache.get(CONFIG.WELCOME_CHANNEL_ID);
         if (welcomeChannel) {
             await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [createWelcomeEmbed(member)] });
@@ -351,17 +330,15 @@ client.on("interactionCreate", async (interaction) => {
 
         const panelId = `${type}-${Date.now()}`;
 
-        // 🛡️ রোল ক্যাশিং সেফটি ফিল্টার (যাতে ভুল আইডির জন্য ক্র্যাশ না করে)
         const permissionOverwrites = [
             { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+            { id: CONFIG.VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] }, 
             { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory], deny: [PermissionFlagsBits.ManageChannels] }
         ];
 
-        // সাপোর্ট রোল যদি ভ্যালিড হয় তবেই পারমিশনে যোগ হবে
         if (interaction.guild.roles.cache.has(supportRoleId)) {
             permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
         }
-        // অ্যাডমিন রোল যদি ভ্যালিড হয় তবেই পারমিশনে যোগ হবে
         if (interaction.guild.roles.cache.has(CONFIG.ROLES.ADMIN)) {
             permissionOverwrites.push({ id: CONFIG.ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
         }
@@ -388,7 +365,6 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription(`স্বাগতম ${interaction.user}! আমাদের সাপোর্ট টিম খুব শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n**ক্যাটাগরি:** ${category.toUpperCase().replace("_", " ")}`)
             .setColor("Random");
 
-        // মেনশন কন্টেন্ট তৈরি
         let mentionContent = `${interaction.user}`;
         if (interaction.guild.roles.cache.has(supportRoleId)) {
             mentionContent += ` | <@&${supportRoleId}>`;
@@ -403,6 +379,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে! প্রবেশ করুন এখানে: ${privateChannel}`);
     }
 
+    // 🛟 CLAIM STAFF মেকানিজম আপডেট (সরাসরি মেসেজ লেখার পারমিশন যুক্ত করা হয়েছে)
     if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer") ? CONFIG.ROLES.SUPPORT_CUSTOMER : CONFIG.ROLES.SUPPORT_TICKET_REPORT;
@@ -419,8 +396,15 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ content: `⚠️ এটি ইতিমধ্যে <@${doc.data().claimedStaff}> ক্লেইম করেছেন।`, flags: [MessageFlags.Ephemeral] });
         }
 
+        // 🎯 ক্লেইম করা স্টাফকে আলাদা করে চ্যানেল রাইটিং এবং ভিউ পারমিশন ইনজেক্ট করা হচ্ছে
+        await interaction.channel.permissionOverwrites.edit(interaction.user.id, {
+            ViewChannel: true,
+            SendMessages: true,
+            ReadMessageHistory: true
+        }).catch(err => console.error("স্টাফ পারমিশন আপডেট ব্যর্থ:", err));
+
         await docRef.update({ claimedStaff: interaction.user.id, status: "Claimed" });
-        await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
+        await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন। চ্যাটে আপনার রিপ্লাই অপশন আনলক হয়েছে।` });
         return;
     }
 
