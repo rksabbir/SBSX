@@ -14,7 +14,8 @@ const {
     EmbedBuilder,
     ActivityType,
     StringSelectMenuBuilder,
-    PermissionFlagsBits
+    PermissionFlagsBits,
+    MessageFlags // Ephemeral Flags-এর জন্য যুক্ত করা হয়েছে
 } = require("discord.js");
 
 const {
@@ -65,13 +66,13 @@ const CONFIG = {
     LOG_CHANNEL_ID: "1488340400673656973",
     VOICE_CHANNEL_ID: "1523230098193383595",
     
-    // Roles
+    // Roles (আইডিগুলো ভালো করে চেক করে নেবেন)
     ROLES: {
         ADMIN: "148832568372973568",
         SUPPORT_TICKET_REPORT: "1488333580705861765",
         SUPPORT_CUSTOMER: "1488335064873046086"
     },
-    // Target Setup Channels (যে চ্যানেলে কমান্ড দিলে কাজ করবে)
+    // Target Setup Channels
     CHANNELS: {
         TICKET_PANEL: "1488339982627115118",
         REPORT_PANEL: "1488340441115004999",
@@ -92,7 +93,7 @@ const client = new Client({
     partials: [Partials.Channel, Partials.GuildMember]
 });
 
-// Anti-Crash Handler
+// Anti-Crash Handler (এরর আসলেও বট অফলাইন হবে না)
 process.on("unhandledRejection", (err) => console.error("[Unhandled Rejection]", err));
 process.on("uncaughtException", (err) => console.error("[Uncaught Exception]", err));
 
@@ -283,14 +284,14 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() || interaction.isStringSelectMenu()) {
         const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
         if (cooldowns.has(cooldownKey)) {
-            return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন! অনুগ্রহ করে একটু অপেক্ষা করুন।", ephemeral: true });
+            return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন! অনুগ্রহ করে একটু অপেক্ষা করুন।", flags: [MessageFlags.Ephemeral] });
         }
         cooldowns.set(cooldownKey, true);
         setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const role = interaction.guild.roles.cache.get(CONFIG.VERIFIED_ROLE_ID);
         if (!role) return interaction.editReply("❌ Verification role পাওয়া যায়নি।");
         if (interaction.member.roles.cache.has(CONFIG.VERIFIED_ROLE_ID)) {
@@ -317,7 +318,7 @@ client.on("interactionCreate", async (interaction) => {
         if (type) {
             const hasActive = await hasActivePanelChannel(interaction.user.id, type);
             if (hasActive) {
-                return interaction.reply({ content: `⚠️ আপনার ইতিমধ্যে একটি ওপেন ${type} চ্যানেল রয়েছে।`, ephemeral: true });
+                return interaction.reply({ content: `⚠️ আপনার ইতিমধ্যে একটি ওপেন ${type} চ্যানেল রয়েছে।`, flags: [MessageFlags.Ephemeral] });
             }
 
             const ephemeralEmbed = new EmbedBuilder()
@@ -328,12 +329,12 @@ client.on("interactionCreate", async (interaction) => {
             const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder().setCustomId(buttonId).setLabel(`Create ${type.toUpperCase()}`).setStyle(ButtonStyle.Success)
             );
-            return interaction.reply({ embeds: [ephemeralEmbed], components: [row], ephemeral: true });
+            return interaction.reply({ embeds: [ephemeralEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
         }
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("create_")) {
-        await interaction.deferReply({ ephemeral: true });
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const dataArr = interaction.customId.split("_");
         const type = dataArr[1];
         const category = dataArr.slice(2).join("_");
@@ -341,21 +342,29 @@ client.on("interactionCreate", async (interaction) => {
         const hasActive = await hasActivePanelChannel(interaction.user.id, type);
         if (hasActive) return interaction.editReply(`⚠️ আপনার অলরেডি একটি অ্যাক্টিভ ${type} চ্যানেল আছে।`);
 
-        let supportRole = CONFIG.ROLES.SUPPORT_TICKET_REPORT;
+        let supportRoleId = (type === "customer") ? CONFIG.ROLES.SUPPORT_CUSTOMER : CONFIG.ROLES.SUPPORT_TICKET_REPORT;
         let channelPrefix = "";
 
         if (type === "ticket") channelPrefix = `ticket-${interaction.user.username}`;
         else if (type === "report") channelPrefix = `report-${interaction.user.username}`;
-        else if (type === "customer") { channelPrefix = `support-${interaction.user.username}`; supportRole = CONFIG.ROLES.SUPPORT_CUSTOMER; }
+        else if (type === "customer") channelPrefix = `support-${interaction.user.username}`;
 
         const panelId = `${type}-${Date.now()}`;
 
+        // 🛡️ রোল ক্যাশিং সেফটি ফিল্টার (যাতে ভুল আইডির জন্য ক্র্যাশ না করে)
         const permissionOverwrites = [
             { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory], deny: [PermissionFlagsBits.ManageChannels] },
-            { id: supportRole, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] },
-            { id: CONFIG.ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] }
+            { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory], deny: [PermissionFlagsBits.ManageChannels] }
         ];
+
+        // সাপোর্ট রোল যদি ভ্যালিড হয় তবেই পারমিশনে যোগ হবে
+        if (interaction.guild.roles.cache.has(supportRoleId)) {
+            permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+        }
+        // অ্যাডমিন রোল যদি ভ্যালিড হয় তবেই পারমিশনে যোগ হবে
+        if (interaction.guild.roles.cache.has(CONFIG.ROLES.ADMIN)) {
+            permissionOverwrites.push({ id: CONFIG.ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
+        }
 
         const privateChannel = await interaction.guild.channels.create({
             name: channelPrefix,
@@ -379,8 +388,14 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription(`স্বাগতম ${interaction.user}! আমাদের সাপোর্ট টিম খুব শীঘ্রই আপনার সাথে যোগাযোগ করবে।\n\n**ক্যাটাগরি:** ${category.toUpperCase().replace("_", " ")}`)
             .setColor("Random");
 
+        // মেনশন কন্টেন্ট তৈরি
+        let mentionContent = `${interaction.user}`;
+        if (interaction.guild.roles.cache.has(supportRoleId)) {
+            mentionContent += ` | <@&${supportRoleId}>`;
+        }
+
         await privateChannel.send({
-            content: `${interaction.user} | <@&${supportRole}>`,
+            content: mentionContent,
             embeds: [uiFooter(insideEmbed)],
             components: [getChannelControlRow(type)]
         });
@@ -392,16 +407,16 @@ client.on("interactionCreate", async (interaction) => {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer") ? CONFIG.ROLES.SUPPORT_CUSTOMER : CONFIG.ROLES.SUPPORT_TICKET_REPORT;
 
-        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(CONFIG.ROLES.ADMIN)) {
-            return interaction.reply({ content: "❌ এটি ক্লেইম করার পারমিশন আপনার নেই!", ephemeral: true });
+        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(CONFIG.ROLES.ADMIN) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            return interaction.reply({ content: "❌ এটি ক্লেইম করার পারমিশন আপনার নেই!", flags: [MessageFlags.Ephemeral] });
         }
 
         const docRef = db.collection("panels").doc(interaction.channelId);
         const doc = await docRef.get();
-        if (!doc.exists) return interaction.reply({ content: "তথ্য পাওয়া যায়নি।", ephemeral: true });
+        if (!doc.exists) return interaction.reply({ content: "তথ্য পাওয়া যায়নি।", flags: [MessageFlags.Ephemeral] });
 
         if (doc.data().claimedStaff) {
-            return interaction.reply({ content: `⚠️ এটি ইতিমধ্যে <@${doc.data().claimedStaff}> ক্লেইম করেছেন।`, ephemeral: true });
+            return interaction.reply({ content: `⚠️ এটি ইতিমধ্যে <@${doc.data().claimedStaff}> ক্লেইম করেছেন।`, flags: [MessageFlags.Ephemeral] });
         }
 
         await docRef.update({ claimedStaff: interaction.user.id, status: "Claimed" });
@@ -413,13 +428,13 @@ client.on("interactionCreate", async (interaction) => {
         const type = interaction.customId.split("_")[1];
         const docRef = db.collection("panels").doc(interaction.channelId);
         const doc = await docRef.get();
-        if (!doc.exists) return interaction.reply({ content: "ডাটাবেজে কোনো রেকর্ড পাওয়া যায়নি।", ephemeral: true });
+        if (!doc.exists) return interaction.reply({ content: "ডাটাবেজে কোনো রেকর্ড পাওয়া যায়নি।", flags: [MessageFlags.Ephemeral] });
 
         const data = doc.data();
         let reqRole = (type === "customer") ? CONFIG.ROLES.SUPPORT_CUSTOMER : CONFIG.ROLES.SUPPORT_TICKET_REPORT;
 
-        if (interaction.user.id !== data.ownerId && !interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(CONFIG.ROLES.ADMIN)) {
-            return interaction.reply({ content: "❌ আপনি এই চ্যানেলটি বন্ধ করতে পারবেন না।", ephemeral: true });
+        if (interaction.user.id !== data.ownerId && !interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(CONFIG.ROLES.ADMIN) && !interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+            return interaction.reply({ content: "❌ আপনি এই চ্যানেলটি বন্ধ করতে পারবেন না।", flags: [MessageFlags.Ephemeral] });
         }
 
         await interaction.reply("🔒 চ্যানেলটি বন্ধ করা হচ্ছে এবং ট্রান্সক্রিপ্ট নেওয়া হচ্ছে... ৫ সেকেন্ডের মধ্যে চ্যানেল ডিলিট হবে।");
@@ -461,27 +476,22 @@ client.on("interactionCreate", async (interaction) => {
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild) return;
 
-    // ওনার বা Administrator পারমিশন চেক করা (রোল আইডির ঝামেলা এড়াতে)
     const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.guild.ownerId === message.author.id || message.member.roles.cache.has(CONFIG.ROLES.ADMIN);
 
     if (!isServerAdmin) return;
 
-    // !setup Command (For Verification Panel)
     if (message.content === "!setup") {
         return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
     }
     
-    // !ticket command (শুধুমাত্র নির্দিষ্ট টিকেট প্যানেল চ্যানেলে কাজ করবে)
     if (message.content === "!ticket" && message.channelId === CONFIG.CHANNELS.TICKET_PANEL) {
         return message.channel.send(getTicketPanel());
     }
     
-    // !report command (শুধুমাত্র নির্দিষ্ট রিপোর্ট প্যানেল চ্যানেলে কাজ করবে)
     if (message.content === "!report" && message.channelId === CONFIG.CHANNELS.REPORT_PANEL) {
         return message.channel.send(getReportPanel());
     }
     
-    // !customer command (শুধুমাত্র নির্দিষ্ট কাস্টমার প্যানেল চ্যানেলে কাজ করবে)
     if (message.content === "!customer" && message.channelId === CONFIG.CHANNELS.CUSTOMER_PANEL) {
         return message.channel.send(getCustomerPanel());
     }
