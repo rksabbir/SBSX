@@ -184,7 +184,7 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
 }
 
 // ================================
-// 🛒 Order Status Embed Builder
+// 🛒 Order Status Embed Builder (গোপন নম্বর মাস্কিং সহ)
 // ================================
 function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
     let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
@@ -205,8 +205,18 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         .setTimestamp()
         .setFooter({ text: "Order Update System" });
 
-    if (txnId) embed.addFields({ name: "💳 Transaction ID", value: `\`${txnId}\``, inline: true });
-    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
+    // ✅ এখানে ট্রানজেকশন আইডি বা গোপন নম্বরটি মাঝখান থেকে লুকাতে `****` ফরম্যাট করা হয়েছে
+    if (txnId) {
+        let maskedTxnId = txnId;
+        if (txnId.length > 4) {
+            maskedTxnId = txnId.substring(0, 2) + "****" + txnId.substring(txnId.length - 2);
+        } else {
+            maskedTxnId = "****";
+        }
+        embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
+    }
+    
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্তスタッフ", value: `${staff}`, inline: true });
     return embed;
 }
 
@@ -473,7 +483,7 @@ async function getDynamicTicketPanel() {
     const { options, customDescription, customImage } = await fetchFirebasePanelData("ticket");
     
     const defaultDesc = `🛑 **Premium Support & Development Center** 🛑\n\n` +
-                        `> আমাদের অফিসিয়াল মেম্বারদের জন্য ডেভেলপমেন্ট এবং কাস্টম প্রিমিয়াম সাপোর্ট প্যানেল।\n\n` +
+                        `> আমাদের অফিসিয়াল মেম্বারদের জন্য কাস্টম সাপোর্ট প্যানেল।\n\n` +
                         `✨ **পরিষেবাসমূহ:**\n` +
                         `┌ 🛠️ কাস্টম বট এবং সিস্টেম ডেভেলপমেন্ট\n` +
                         `├ ⚡ হাই-স্পিড সার্ভার কনফিগারেশন সাপোর্ট\n` +
@@ -506,7 +516,7 @@ async function getDynamicReportPanel() {
                         `├ 👤 মেম্বার কমপ্লেন (User Violations)\n` +
                         `└ 💼 স্টাফ অপব্যবহার (Staff Abuse Reports)\n\n` +
                         `📌 **নিয়মাবলী:**\n` +
-                        `যেকোনো অন্যায়ের বিরুদ্ধে অভিযোগ করতে ড্রপডাউন ব্যবহার করুন। আপনার দেওয়া স্ক্রিনশট বা প্রুফ গোপন রাখা হবে এবং এডমিন প্যানেল সরাসরি একশন নিবেন।`;
+                        `যেকোনো অন্যায়ের বিরুদ্ধে অভিযোগ করতে ড্রপডাউন ব্যবহার করুন।`;
 
     const embed = new EmbedBuilder()
         .setTitle("🚨 SERVER COMPLAINT & REPORT PANEL")
@@ -527,13 +537,7 @@ async function getDynamicCustomerPanel() {
     const { options, customDescription, customImage } = await fetchFirebasePanelData("customer");
     
     const defaultDesc = `💬 **General Customer Care & Help Counter** 💬\n\n` +
-                        `> সার্ভারের সাধারণ মেম্বারদের যেকোনো সমস্যা বা জিজ্ঞাসার জন্য ওয়ান-স্টপ সলিউশন।\n\n` +
-                        `❓ **আমাদের সাহায্য ক্ষেত্র:**\n` +
-                        `┌ ℹ️ সার্ভার ফিচার সম্পর্কিত যেকোনো সাধারণ তথ্য\n` +
-                        `├ 🤝 পার্টনারশিপ বা কোলাবোরেশন আবেদন\n` +
-                        `└ 📢 প্রমোশন বা কাস্টম প্রপোজাল ইনফো\n\n` +
-                        `📌 **কিভাবে সাহায্য পাবেন?**\n` +
-                        `ড্রপডাউন থেকে আপনার প্রশ্নের বিষয়বস্তুটি সিলেক্ট করুন। আমাদের কাস্টমার কেয়ার প্রতিনিধি খুব দ্রুত আপনার সাথে যোগাযোগ করবে।`;
+                        `> সার্ভারের সাধারণ মেম্বারদের যেকোনো সমস্যা বা জিজ্ঞাসার জন্য ওয়ান-স্টপ সলিউশন।`;
 
     const embed = new EmbedBuilder()
         .setTitle("💬 GENERAL CUSTOMER SUPPORT CENTER")
@@ -554,14 +558,7 @@ async function getDynamicPaymentPanel() {
     const { options, customDescription, customImage } = await fetchFirebasePanelData("payment");
     
     const defaultDesc = `💳 **Premium Store & Automatic Payment Gateway** 💳\n\n` +
-                        `> আমাদের যেকোনো প্রিমিয়াম সার্ভিস, লাইসেন্স বা মেম্বারশিপ নেওয়ার ডিজিটাল শপ।\n\n` +
-                        `🛍️ **অর্ডার করার নিয়ম:**\n` +
-                        `┌ 1️⃣ নিচে দেওয়া ড্রপডাউন মেনু থেকে আপনার প্রোডাক্ট বেছে নিন।\n` +
-                        `├ 2️⃣ বট আপনাকে একটি ইনস্ট্যান্ট গেটওয়ে লিঙ্ক ও পেমেন্ট ডিটেইলস দেবে।\n` +
-                        `├ 3️⃣ পেমেন্ট শেষে ট্রানজেকশন আইডি (TxnID) কোডটি সাবমিট করুন।\n` +
-                        `└ 4️⃣ সিস্টেম অটোমেটিক আপনার নামে একটি প্রিমিয়াম অর্ডার চ্যানেল খুলে দেবে।\n\n` +
-                        `🔥 **নিরাপত্তা নিশ্চয়তা:**\n` +
-                        `এটি সম্পূর্ণ সুরক্ষিত ও অটোমেটেড ট্র্যাকিং সিস্টেম, যা সরাসরি ডাটাবেজের সাথে সিঙ্ক করা।`;
+                        `> আমাদের যেকোনো প্রিমিয়াম সার্ভিস, লাইসেন্স বা মেম্বারশিপ নেওয়ার ডিজিটাল শপ।`;
 
     const embed = new EmbedBuilder()
         .setTitle("🛍️ AUTOMATED SHOP & PAYMENT PANELS")
