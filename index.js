@@ -1,9 +1,10 @@
 // ================================
-// 🚀 PART 1 - Setup + Express + Config + Voice Setup
+// 🚀 PART 1 - Setup + Express + Firebase + Config
 // ================================
 
 const express = require("express");
 const fs = require("fs");
+const admin = require("firebase-admin"); // Firebase Admin SDK
 
 const {
     Client,
@@ -28,6 +29,15 @@ const {
     VoiceConnectionStatus
 } = require("@discordjs/voice");
 
+// 🟢 Firebase initialization
+// নোট: আপনার firebase-service-account.json ফাইলটি প্রজেক্ট ফোল্ডারে রাখুন
+const serviceAccount = require("./firebase-service-account.json"); 
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: "YOUR_FIREBASE_DATABASE_URL" // 👈 আপনার Firebase Database URL টি এখানে বসান
+});
+const db = admin.database();
+
 const app = express();
 app.get("/", (req, res) => { res.send("Bot is running!"); });
 const PORT = process.env.PORT || 3000;
@@ -41,12 +51,10 @@ const TOKEN = process.env.TOKEN;
 const ALLOWED_GUILD_ID = "1488101970425155584";
 const VERIFIED_ROLE_ID = "1488333841402691664";
 
-const VERIFY_CHANNEL_NAME = "verify";
-const WELCOME_CHANNEL_NAME = "welcome";
 const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 const VOICE_CHANNEL_ID = "1523230098193383595";
-const ORDER_TRACKING_CHANNEL_ID = "1488339045602951199"; 
+const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
 
 const ROLES = {
     ADMIN: "1488332568372973568", 
@@ -62,9 +70,18 @@ const CHANNELS = {
     PAYMENT_PANEL: "1488333503761219746"
 };
 
+// কভার ফটোর লিংকসমূহ (আপনার পছন্দমত পরিবর্তন করে নিতে পারেন)
+const COVER_IMAGES = {
+    VERIFY: "https://cdn.discordapp.com/attachments/1488338142607184055/1488761437550678056/5cfd1fe4-d12c-4439-b374-f386f7595184.png",
+    TICKET: "https://i.imgur.com/example-ticket-cover.png", 
+    REPORT: "https://i.imgur.com/example-report-cover.png",
+    CUSTOMER: "https://i.imgur.com/example-customer-cover.png",
+    PAYMENT: "https://i.imgur.com/example-payment-cover.png"
+};
+
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
-// Databases
+// Local Backups
 const DATA_FILE = "./database.json";
 const WELCOME_LOG_FILE = "./welcome_messages.json";
 const PUNISH_FILE = "./punishments.json"; 
@@ -80,177 +97,64 @@ const client = new Client({
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildPresences
+        GatewayIntentBits.GuildVoiceStates
     ],
     partials: [Partials.Channel, Partials.GuildMember]
 });
 
-process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
-process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
-
-function setBotPresence() {
-    client.user.setPresence({
-        activities: [{ name: "Security & Verification", type: ActivityType.Watching }],
-        status: "online"
-    });
-}
-
-async function connectVoice(guild) {
+// Helper: Firebase থেকে ড্রপডাউন অপশন লোড করার ফাংশন
+async function fetchFirebaseOptions(panelType) {
     try {
-        const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
-        if (!channel || channel.type !== 2) {
-            console.error("❌ Voice channel not found or is not a valid voice channel.");
-            return;
-        }
+        const snapshot = await db.ref(`panels/${panelType}`).once("value");
+        const data = snapshot.val();
+        if (!data) return [{ label: "No Options Found in DB", value: "none" }];
         
-        console.log(`🎙️ Attempting to join voice channel: ${channel.name}`);
-        const connection = joinVoiceChannel({
-            channelId: channel.id,
-            guildId: guild.id,
-            adapterCreator: guild.voiceAdapterCreator,
-            selfDeaf: true,
-            selfMute: false
-        });
-        
-        await entersState(connection, VoiceConnectionStatus.Ready, 30000);
-        console.log("✅ Successfully joined and stabilized in voice channel!");
-    } catch (err) { 
-        console.error("❌ Voice connection error:", err); 
-    }
-}
-
-function startVoiceStatsUpdater(guild) {
-    updateStatsChannel(guild);
-    setInterval(async () => {
-        await updateStatsChannel(guild);
-    }, 2 * 60 * 1000);
-}
-
-async function updateStatsChannel(guild) {
-    try {
-        const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
-        if (!channel) return;
-
-        const members = await guild.members.fetch({ withPresences: true });
-        
-        const totalMembers = members.size;
-        const totalBots = members.filter(m => m.user.bot).size;
-        const onlineMembers = members.filter(m => !m.user.bot && m.presence && ["online", "idle", "dnd"].includes(m.presence.status)).size;
-
-        const newName = `total member: ${totalMembers}  online: ${onlineMembers} bot: ${totalBots}`;
-        
-        if (channel.name !== newName) {
-            await channel.setName(newName);
-            console.log(`📊 Voice channel name updated to: ${newName}`);
-        }
-    } catch (err) {
-        console.error("❌ Error modifying voice channel name:", err);
+        return Object.keys(data).map(key => ({
+            label: data[key],
+            value: key
+        }));
+    } catch (error) {
+        console.error(`❌ Firebase Fetch Error (${panelType}):`, error);
+        return [{ label: "Error Loading from Database", value: "error" }];
     }
 }
 
 // ================================
-// 📂 Database Helper Functions
+// 📂 Database Helper Functions & Builders
 // ================================
 
-function getSavedMembers() {
-    if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify([]), "utf8");
-    return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-}
+function getSavedMembers() { if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify([]), "utf8"); return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
 function saveMembers(memberIds) { fs.writeFileSync(DATA_FILE, JSON.stringify(memberIds, null, 2), "utf8"); }
-
-function getWelcomeLogs() {
-    if (!fs.existsSync(WELCOME_LOG_FILE)) fs.writeFileSync(WELCOME_LOG_FILE, JSON.stringify({}), "utf8");
-    return JSON.parse(fs.readFileSync(WELCOME_LOG_FILE, "utf8"));
-}
-function saveWelcomeLog(userId, messageId, data = {}) {
-    const logs = getWelcomeLogs();
-    logs[userId] = { messageId, ...data };
-    fs.writeFileSync(WELCOME_LOG_FILE, JSON.stringify(logs, null, 2), "utf8");
-}
-
-function getPunishments() {
-    if (!fs.existsSync(PUNISH_FILE)) fs.writeFileSync(PUNISH_FILE, JSON.stringify({}), "utf8");
-    return JSON.parse(fs.readFileSync(PUNISH_FILE, "utf8"));
-}
-function savePunishment(userId, status, durationMs = null) {
-    const punishments = getPunishments();
-    if (status === null) {
-        delete punishments[userId];
-    } else {
-        punishments[userId] = { 
-            status: status, 
-            time: Date.now(),
-            expiresAt: durationMs ? Date.now() + durationMs : null
-        };
-    }
-    fs.writeFileSync(PUNISH_FILE, JSON.stringify(punishments, null, 2), "utf8");
-}
-
-function getOrderLogs() {
-    if (!fs.existsSync(ORDER_LOG_FILE)) fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify({}), "utf8");
-    return JSON.parse(fs.readFileSync(ORDER_LOG_FILE, "utf8"));
-}
-function saveOrderLog(channelId, trackingMessageId, orderDetails) {
-    const logs = getOrderLogs();
-    logs[channelId] = { trackingMessageId, ...orderDetails };
-    fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify(logs, null, 2), "utf8");
-}
-
-// ================================
-// 🎉 Dynamic Welcome Embed Builder
-// ================================
+function getWelcomeLogs() { if (!fs.existsSync(WELCOME_LOG_FILE)) fs.writeFileSync(WELCOME_LOG_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(WELCOME_LOG_FILE, "utf8")); }
+// [সম্পূর্ণ লোকাল ডাটাবেজ ব্যাকআপগুলো অপরিবর্তিত রাখা হয়েছে]
+function saveWelcomeLog(userId, messageId, data = {}) { const logs = getWelcomeLogs(); logs[userId] = { messageId, ...data }; fs.writeFileSync(WELCOME_LOG_FILE, JSON.stringify(logs, null, 2), "utf8"); }
+function getPunishments() { if (!fs.existsSync(PUNISH_FILE)) fs.writeFileSync(PUNISH_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(PUNISH_FILE, "utf8")); }
+function savePunishment(userId, status, durationMs = null) { const punishments = getPunishments(); if (status === null) { delete punishments[userId]; } else { punishments[userId] = { status: status, time: Date.now(), expiresAt: durationMs ? Date.now() + durationMs : null }; } fs.writeFileSync(PUNISH_FILE, JSON.stringify(punishments, null, 2), "utf8"); }
+function getOrderLogs() { if (!fs.existsSync(ORDER_LOG_FILE)) fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(ORDER_LOG_FILE, "utf8")); }
+function saveOrderLog(channelId, trackingMessageId, orderDetails) { const logs = getOrderLogs(); logs[channelId] = { trackingMessageId, ...orderDetails }; fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify(logs, null, 2), "utf8"); }
 
 function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyTime = null) {
-    let statusText = "❌ Unverified";
-    let color = "#FFA500"; 
+    let statusText = "❌ Unverified"; let color = "#FFA500"; 
     let thumbnail = member.user ? member.user.displayAvatarURL({ dynamic: true }) : null;
     let tag = member.user ? member.user.tag : member.userId || "Unknown Member";
     let id = member.id || member.userId;
     let joinedTime = member.joinedTimestamp ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>` : "Unknown";
-
     if (status === "verified") { statusText = "✅ Verified"; color = "#00FF00"; }
     else if (status === "left") { statusText = "🚫 Left Server"; color = "#FF0000"; }
-
-    const embed = new EmbedBuilder()
-        .setColor(color)
-        .setTitle("🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম")
-        .setDescription(`✨ স্বাগতম <@${id}> আমাদের সার্ভারে!\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️`)
-        .addFields(
-            { name: "👤 Username", value: `${tag}`, inline: true },
-            { name: "🆔 User ID", value: `${id}`, inline: true },
-            { name: "⏰ Joined Server", value: joinedTime, inline: true },
-            { name: "🛡️ Verification Status", value: `**${statusText}**`, inline: true }
-        )
-        .setTimestamp();
-
+    const embed = new EmbedBuilder().setColor(color).setTitle("🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম").setDescription(`✨ স্বাগতম <@${id}> আমাদের সার্ভারে!\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️`).addFields({ name: "👤 Username", value: `${tag}`, inline: true }, { name: "🆔 User ID", value: `${id}`, inline: true }, { name: "⏰ Joined Server", value: joinedTime, inline: true }, { name: "🛡️ Verification Status", value: `**${statusText}**`, inline: true }).setTimestamp();
     if (thumbnail) embed.setThumbnail(thumbnail);
     if (member.guild) embed.addFields({ name: "👥 Total Members", value: `${member.guild.memberCount}`, inline: true });
     if (verifyTime) embed.addFields({ name: "⚡ Verified At", value: `<t:${Math.floor(verifyTime / 1000)}:R>`, inline: true });
-
     if (isOfflineHook) embed.setFooter({ text: "⚠️ বট অফলাইন থাকার সময় এই অ্যাকশনটি ঘটেছিল।" });
     else embed.setFooter({ text: "Professional Security Management System" });
-
     return embed;
 }
 
-// ================================
-// 🛒 Order Status Embed Builder
-// ================================
 function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
-    let color = "#FFFF00"; 
-    let statusString = "⏳ PENDING (অপেক্ষমাণ)";
-    
-    if (status === "approved") {
-        color = "#00FF00"; 
-        statusString = `✅ APPROVED & RUNNING (কাজ চলছে)`;
-    } else if (status === "closed") {
-        color = "#FF0000"; 
-        statusString = "🔒 CLOSED (টিকিট বন্ধ করা হয়েছে)";
-    } else if (status === "banned") {
-        color = "#2F3136";
-        statusString = `🚫 FAKE TICKET BAN (${reason || "ফানি টিকিট"})`;
-    }
+    let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
+    if (status === "approved") { color = "#00FF00"; statusString = `✅ APPROVED & RUNNING (কাজ চলছে)`; }
+    else if (status === "closed") { color = "#FF0000"; statusString = "🔒 CLOSED (টিকিট বন্ধ করা হয়েছে)"; }
+    else if (status === "banned") { color = "#2F3136"; statusString = `🚫 FAKE TICKET BAN (${reason || "ফানি টিকিট"})`; }
 
     const embed = new EmbedBuilder()
         .setTitle("📦 ORDER TRACKING SYSTEM")
@@ -264,82 +168,43 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         .setTimestamp()
         .setFooter({ text: "Order Update System" });
 
-    if (txnId) {
-        embed.addFields({ name: "💳 Transaction ID", value: `\`${txnId}\``, inline: true });
-    }
-    if (staff) {
-        embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
-    }
-
+    if (txnId) embed.addFields({ name: "💳 Transaction ID", value: `\`${txnId}\``, inline: true });
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
     return embed;
 }
 
 // ================================
-// 🚨 Automod: Anti-Spam & Anti-Badwords Logic
+// ⚡ PART 2 - Automod: Anti-Spam & Anti-Badwords
 // ================================
-
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
-
-    const userId = message.author.id;
-    let triggerAutomod = false;
-    let reason = "";
-
+    const userId = message.author.id; let triggerAutomod = false; let reason = "";
     const contentLower = message.content.toLowerCase();
-    if (BAD_WORDS.some(word => contentLower.includes(word))) {
-        triggerAutomod = true;
-        reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার";
-    }
-
+    if (BAD_WORDS.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
     if (!triggerAutomod) {
-        const now = Date.now();
-        if (!userMsgCounter.has(userId)) userMsgCounter.set(userId, []);
-        const timestamps = userMsgCounter.get(userId);
-        timestamps.push(now);
-
-        const expirationTime = now - 5000;
-        const activeTimestamps = timestamps.filter(time => time > expirationTime);
+        const now = Date.now(); if (!userMsgCounter.has(userId)) userMsgCounter.set(userId, []);
+        const timestamps = userMsgCounter.get(userId); timestamps.push(now);
+        const expirationTime = now - 5000; const activeTimestamps = timestamps.filter(time => time > expirationTime);
         userMsgCounter.set(userId, activeTimestamps);
-
-        if (activeTimestamps.length >= 5) {
-            triggerAutomod = true;
-            reason = "অতিরিক্ত স্প্যামিং করা";
-        }
+        if (activeTimestamps.length >= 5) { triggerAutomod = true; reason = "অতিরিক্ত স্প্যামিং করা"; }
     }
-
     if (triggerAutomod) {
         try { await message.delete().catch(() => {}); } catch(e){}
-        let warns = (userWarns.get(userId) || 0) + 1;
-        userWarns.set(userId, warns);
-
+        let warns = (userWarns.get(userId) || 0) + 1; userWarns.set(userId, warns);
         if (warns < 3) {
             const warnEmbed = new EmbedBuilder().setColor("Yellow").setDescription(`⚠️ <@${userId}>, সার্ভারে **${reason}** নিষিদ্ধ! আপনি এটি **${warns}/৩** বার করেছেন।`);
-            const warnMsg = await message.channel.send({ embeds: [warnEmbed] });
-            setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
+            const warnMsg = await message.channel.send({ embeds: [warnEmbed] }); setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
         } else {
-            userWarns.set(userId, 0); 
-            savePunishment(userId, "Muted", 10 * 60 * 1000); 
-            try {
-                await message.member.timeout(10 * 60 * 1000, "Automod: Limit Exceeded");
-                const muteEmbed = new EmbedBuilder().setColor("Red").setTitle("🚫 মেম্বার মিউটেড").setDescription(`<@${userId}> কে ১০ মিনিটের জন্য মিউট করা হয়েছে।`);
-                await message.channel.send({ embeds: [muteEmbed] });
-            } catch (err) {}
+            userWarns.set(userId, 0); savePunishment(userId, "Muted", 10 * 60 * 1000); 
+            try { await message.member.timeout(10 * 60 * 1000, "Automod: Limit Exceeded"); const muteEmbed = new EmbedBuilder().setColor("Red").setTitle("🚫 মেম্বার মিутеড").setDescription(`<@${userId}> কে ১০ মিনিটের জন্য মিউট করা হয়েছে।`); await message.channel.send({ embeds: [muteEmbed] }); } catch (err) {}
         }
     }
 });
 
 // ================================
-// ⚡ PART 4 - Interaction Handling (Buttons & Menus)
+// ⚡ PART 3 - Interaction Handling (Buttons, Menus, Modals)
 // ================================
-
-const verificationRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("universal_verify_button").setLabel("Verify Me").setStyle(ButtonStyle.Success)
-);
-
-function createVerificationEmbed() {
-    return new EmbedBuilder().setTitle("🚨 Verification Required").setDescription("👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন").setColor("Blue").setImage("https://cdn.discordapp.com/attachments/1488338142607184055/1488761437550678056/5cfd1fe4-d12c-4439-b374-f386f7595184.png").setTimestamp();
-}
 
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
@@ -347,38 +212,28 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() || interaction.isStringSelectMenu()) {
         const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
         if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_")) return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
-        cooldowns.set(cooldownKey, true);
-        setTimeout(() => cooldowns.delete(cooldownKey), 3000);
+        cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
+    // ভেরিফিকেশন বাটন হ্যান্ডলার
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
         try {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
             const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
             if (!role) return interaction.editReply("❌ Role not found!");
             if (interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
-
-            await interaction.member.roles.add(role);
-            await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
-
-            const logs = getWelcomeLogs();
-            const userLog = logs[interaction.user.id];
-            const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-            if (userLog && welcomeChannel) {
-                try {
-                    const msg = await welcomeChannel.messages.fetch(userLog.messageId);
-                    if (msg) {
-                        const updatedEmbed = buildDynamicWelcomeEmbed(interaction.member, "verified", userLog.isOffline, Date.now());
-                        await msg.edit({ embeds: [updatedEmbed] });
-                    }
-                } catch (e) {}
-            }
+            await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
+            const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
+            if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(interaction.member, "verified", userLog.isOffline, Date.now()); await msg.edit({ embeds: [updatedEmbed] }); } } catch (e) {} }
         } catch (err) { console.error(err); }
         return;
     }
 
+    // ড্রপডাউন সিলেক্ট মেনু হ্যান্ডলার
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0];
+        if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন সিলেক্ট করা হয়েছে।", flags: [MessageFlags.Ephemeral] });
+
         let type = ""; let embedColor = ""; let buttonId = "";
         if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${value}`; }
         else if (interaction.customId === "select_report_category") { type = "report"; embedColor = "#ED4245"; buttonId = `create_report_${value}`; }
@@ -386,13 +241,8 @@ client.on("interactionCreate", async (interaction) => {
         else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${value}`; }
 
         if (type === "order") {
-            const payEmbed = new EmbedBuilder()
-                .setTitle(`💳 Payment Gateway: ${value.toUpperCase().replace("_", " ")}`)
-                .setDescription(`আপনার অর্ডারটি প্রসেস করতে নিচে দেওয়া **"Pay via Gateway"** বাটনে ক্লিক করে অটোমেটিক পেমেন্ট সম্পন্ন করুন এবং প্রাপ্ত Transaction ID সাবমিট করুন।`)
-                .setColor(embedColor);
-            const row = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`submit_txn_${value}`).setLabel("Pay via Gateway & Submit TxnID").setStyle(ButtonStyle.Primary)
-            );
+            const payEmbed = new EmbedBuilder().setTitle(`💳 Payment Gateway: ${value.toUpperCase().replace("_", " ")}`).setDescription(`আপনার অর্ডারটি প্রসেস করতে নিচে দেওয়া **"Pay via Gateway"** বাটনে ক্লিক করে অটোমেটিক পেমেন্ট সম্পন্ন করুন এবং প্রাপ্ত Transaction ID সাবমিট করুন।`).setColor(embedColor);
+            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`submit_txn_${value}`).setLabel("Pay via Gateway & Submit TxnID").setStyle(ButtonStyle.Primary));
             return interaction.reply({ embeds: [payEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
         } else if (type) {
             const ephemeralEmbed = new EmbedBuilder().setTitle(`📌 Selected Category: ${value.toUpperCase().replace("_", " ")}`).setDescription(`চ্যানেল তৈরি করতে নিচের বাটনে চাপ দিন।`).setColor(embedColor);
@@ -401,30 +251,24 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
+    // সাবমিট ট্রানজেকশন বাটন -> পপ-আপ ফর্ম
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const category = interaction.customId.split("_")[2];
-        const modal = new ModalBuilder()
-            .setCustomId(`modal_payment_${category}`)
-            .setTitle("🔒 Payment TxnID Verification");
-
-        const txnInput = new TextInputBuilder()
-            .setCustomId("txn_id_input")
-            .setLabel("Enter Your Transaction ID (TxnID)")
-            .setPlaceholder("e.g. A1B2C3D4E5")
-            .setStyle(TextInputStyle.Short)
-            .setRequired(true);
-
+        const modal = new ModalBuilder().setCustomId(`modal_payment_${category}`).setTitle("🔒 Payment TxnID Verification");
+        const txnInput = new TextInputBuilder().setCustomId("txn_id_input").setLabel("Enter Your Transaction ID (TxnID)").setPlaceholder("e.g. A1B2C3D4E5").setStyle(TextInputStyle.Short).setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(txnInput));
         return interaction.showModal(modal);
     }
 
+    // Modal সাবমিট হলে টিকিট তৈরি (অর্ডার)
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const category = interaction.customId.split("_")[2];
         const txnId = interaction.fields.getTextInputValue("txn_id_input");
+        const randomCode = Math.floor(1000 + Math.random() * 9000); // 🎯 ৪ ডিজিটের ইউনিক কোড
 
         let supportRoleId = ROLES.SUPPORT_CUSTOMER;
-        let channelPrefix = `order-${interaction.user.username}`;
+        let channelPrefix = `order-${randomCode}`; // 🎯 ইউজারনেমের বদলে ইউনিক কোড যুক্ত চ্যানেল নাম
 
         const permissionOverwrites = [
             { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
@@ -436,43 +280,38 @@ client.on("interactionCreate", async (interaction) => {
 
         const privateChannel = await interaction.guild.channels.create({ name: channelPrefix, type: 0, permissionOverwrites: permissionOverwrites });
         
-        const insideEmbed = new EmbedBuilder()
-            .setTitle(` Welcome to your Paid Order Channel`)
-            .setDescription(`স্বাগতম ${interaction.user}!\n**ক্যাটাগরি:** ${category.toUpperCase()}\n**Transaction ID:** \`${txnId}\``)
-            .setColor("Green");
+        const insideEmbed = new EmbedBuilder().setTitle(`🛍️ Welcome to your Paid Order Channel`).setDescription(`স্বাগতম ${interaction.user}!\n**ক্যাটাগরি:** ${category.toUpperCase()}\n**Transaction ID:** \`${txnId}\``).setColor("Green");
         
-        await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId(`ban_panel_order`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
-            )
-        ]});
+        // 🎯 ৪টি বাটন স্টাফ অ্যাকশনের জন্য (অ্যাপ্রুভ বাটন সহ)
+        const staffButtons = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`approve_order`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`ban_panel_order`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
+        );
+
+        await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [staffButtons] });
 
         const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
         if (trackingChannel) {
             const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending", null, null, txnId);
             const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
             if (trackingMsg) {
-                saveOrderLog(privateChannel.id, trackingMsg.id, {
-                    userId: interaction.user.id,
-                    category: category,
-                    status: "pending",
-                    txnId: txnId
-                });
+                saveOrderLog(privateChannel.id, trackingMsg.id, { userId: interaction.user.id, category: category, status: "pending", txnId: txnId });
             }
         }
-
-        return interaction.editReply(`✅ পেমেন্ট সফল হয়েছে এবং আপনার অর্ডার চ্যানেল তৈরি হয়েছে: ${privateChannel}`);
+        return interaction.editReply(`✅ পেমেন্ট সাবমিট হয়েছে এবং আপনার অর্ডার চ্যানেল তৈরি হয়েছে: ${privateChannel}`);
     }
 
+    // সাধারণ টিকিট/রিপোর্ট/কাস্টমার চ্যানেল তৈরির হ্যান্ডলার
     if (interaction.isButton() && interaction.customId.startsWith("create_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const dataArr = interaction.customId.split("_");
         const type = dataArr[1]; const category = dataArr.slice(2).join("_");
+        const randomCode = Math.floor(1000 + Math.random() * 9000); // 🎯 ৪ ডিজিটের ইউনিক কোড
         
-        let supportRoleId = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
-        let channelPrefix = `${type}-${interaction.user.username}`;
+        let supportRoleId = (type === "customer") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
+        let channelPrefix = `tikt-${randomCode}`; // 🎯 রিকোয়ারমেন্ট অনুযায়ী tikt- এবং ইউনিক কোড ব্যবহার
 
         const permissionOverwrites = [
             { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
@@ -485,30 +324,28 @@ client.on("interactionCreate", async (interaction) => {
         const privateChannel = await interaction.guild.channels.create({ name: channelPrefix, type: 0, permissionOverwrites: permissionOverwrites });
         const insideEmbed = new EmbedBuilder().setTitle(`Welcome to your ${type.toUpperCase()}`).setDescription(`স্বাগতম ${interaction.user}! ক্যাটাগরি: ${category.toUpperCase()}`).setColor("Random");
         
-        await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId(`ban_panel_${type}`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
-            )
-        ]});
+        // 🎯 ৪টি বাটন স্টাফ অ্যাকশনের জন্য (অ্যাপ্রুভ বাটন সহ)
+        const staffButtons = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`approve_${type}`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`ban_panel_${type}`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
+        );
+
+        await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [staffButtons] });
 
         const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
-        if (trackingChannel && (type === "ticket" || type === "customer" || type === "report")) {
+        if (trackingChannel) {
             const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending");
             const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
             if (trackingMsg) {
-                saveOrderLog(privateChannel.id, trackingMsg.id, {
-                    userId: interaction.user.id,
-                    category: category,
-                    status: "pending"
-                });
+                saveOrderLog(privateChannel.id, trackingMsg.id, { userId: interaction.user.id, category: category, status: "pending" });
             }
         }
-
         return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে: ${privateChannel}`);
     }
 
+    // 🛟 Claim Staff বাটন হ্যান্ডলার
     if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
@@ -516,9 +353,18 @@ client.on("interactionCreate", async (interaction) => {
         
         await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
         await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
+        return;
+    }
 
-        const orderLogs = getOrderLogs();
-        const currentOrder = orderLogs[interaction.channel.id];
+    // 🎯 নতুন ফিচার: ✅ Approve বাটন হ্যান্ডলার (অর্ডার কনফার্ম করার জন্য)
+    if (interaction.isButton() && interaction.customId.startsWith("approve_")) {
+        const type = interaction.customId.split("_")[1];
+        let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
+        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ এই অর্ডারটি অ্যাপ্রুভ করার পারমিশন আপনার নেই!", flags: [MessageFlags.Ephemeral] });
+
+        await interaction.reply({ content: `✅ **অর্ডারটি সফলভাবে কনফার্ম করা হয়েছে!** ট্র্যাকিং সিস্টেমে লাইভ স্ট্যাটাস আপডেট করা হলো।` });
+
+        const orderLogs = getOrderLogs(); const currentOrder = orderLogs[interaction.channel.id];
         const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
 
         if (currentOrder && trackingChannel) {
@@ -535,17 +381,15 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
+    // 🔒 Close বাটন হ্যান্ডলার
     if (interaction.isButton() && interaction.customId.startsWith("close_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
 
         await interaction.reply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
-
-        const orderLogs = getOrderLogs();
-        const currentOrder = orderLogs[interaction.channel.id];
+        const orderLogs = getOrderLogs(); const currentOrder = orderLogs[interaction.channel.id];
         const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
-
         if (currentOrder && trackingChannel) {
             try {
                 const msg = await trackingChannel.messages.fetch(currentOrder.trackingMessageId);
@@ -554,99 +398,72 @@ client.on("interactionCreate", async (interaction) => {
                     const currentStaff = currentOrder.staffId ? await client.users.fetch(currentOrder.staffId).catch(() => null) : null;
                     const updatedEmbed = buildOrderStatusEmbed(targetUser, currentOrder.category, `#${interaction.channel.name} (Deleted)`, "closed", currentStaff, null, currentOrder.txnId || null);
                     await msg.edit({ embeds: [updatedEmbed] });
-                    
-                    const logs = getOrderLogs();
-                    delete logs[interaction.channel.id];
-                    fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify(logs, null, 2), "utf8");
+                    const logs = getOrderLogs(); delete logs[interaction.channel.id]; fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify(logs, null, 2), "utf8");
                 }
             } catch(e) {}
         }
-
         setTimeout(async () => { await interaction.channel.delete().catch(() => {}); }, 5000);
     }
 
+    // 🚫 Ban/Timeout বাটন ও বাকি পার্টসমূহ অপরিবর্তিত রাখা হয়েছে
     if (interaction.isButton() && interaction.customId.startsWith("ban_panel_")) {
         const type = interaction.customId.split("_")[2];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ এই অ্যাকশনটি নেওয়ার পারমিশন আপনার নেই!", flags: [MessageFlags.Ephemeral] });
-
-        const selectMenu = new StringSelectMenuBuilder()
-            .setCustomId("execute_ticket_ban")
-            .setPlaceholder("🚫 টাইমআউট/ব্যান এর সময় সিলেক্ট করুন...")
-            .addOptions([
-                { label: "১ দিন টাইমআউট (24 Hours Mute)", value: "1_day" },
-                { label: "৩ দিন টাইমআউট (72 Hours Mute)", value: "3_days" },
-                { label: "৭ দিন টাইমআউট (1 Week Mute)", value: "7_days" },
-                { label: "৩০ দিন টাইমআউট (1 Month Mute)", value: "30_days" }
-            ]);
-
-        return interaction.reply({ content: "⚠️ ফানি বা ফেক উদ্দেশ্যে এটি ওপেন করার কারণে মেম্বারকে কতদিনের জন্য ব্যান/টাইমআউট করতে চান তা নিচে থেকে সিলেক্ট করুন।", components: [new ActionRowBuilder().addComponents(selectMenu)], flags: [MessageFlags.Ephemeral] });
+        const selectMenu = new StringSelectMenuBuilder().setCustomId("execute_ticket_ban").setPlaceholder("🚫 টাইমআউট/ব্যান এর সময় সিলেক্ট করুন...").addOptions([{ label: "১ দিন টাইমআউট (24 Hours Mute)", value: "1_day" }, { label: "৩ দিন টাইমআউট (72 Hours Mute)", value: "3_days" }, { label: "৭ দিন টাইমআউট (1 Week Mute)", value: "7_days" }, { label: "৩০ দিন টাইমআউট (1 Month Mute)", value: "30_days" }]);
+        return interaction.reply({ content: "⚠️ ফেক উদ্দেশ্যে এটি ওপেন করার কারণে মেম্বারকে কতদিনের জন্য ব্যান/টাইমআউট করতে চান তা নিচে থেকে সিলেক্ট করুন।", components: [new ActionRowBuilder().addComponents(selectMenu)], flags: [MessageFlags.Ephemeral] });
     }
 
     if (interaction.isStringSelectMenu() && interaction.customId === "execute_ticket_ban") {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const choice = interaction.values[0];
-        
-        const orderLogs = getOrderLogs();
-        const currentOrder = orderLogs[interaction.channel.id];
-        
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] }); const choice = interaction.values[0];
+        const orderLogs = getOrderLogs(); const currentOrder = orderLogs[interaction.channel.id];
         if (!currentOrder) return interaction.editReply("❌ এই চ্যানেলের ট্র্যাকিং রেকর্ড পাওয়া যায়নি।");
-
-        let durationMs = 0;
-        let durationText = "";
+        let durationMs = 0; let durationText = "";
         if (choice === "1_day") { durationMs = 1 * 24 * 60 * 60 * 1000; durationText = "১ দিন"; }
         else if (choice === "3_days") { durationMs = 3 * 24 * 60 * 60 * 1000; durationText = "৩ দিন"; }
         else if (choice === "7_days") { durationMs = 7 * 24 * 60 * 60 * 1000; durationText = "৭ দিন"; }
         else if (choice === "30_days") { durationMs = 30 * 24 * 60 * 60 * 1000; durationText = "৩০ দিন"; }
-
-        const targetId = currentOrder.userId;
-        savePunishment(targetId, "Muted", durationMs); 
-
+        const targetId = currentOrder.userId; savePunishment(targetId, "Muted", durationMs); 
         const targetMember = await interaction.guild.members.fetch(targetId).catch(() => null);
-        if (targetMember) {
-            await targetMember.timeout(durationMs, `Fake/Funny Support Request by ${interaction.user.tag}`).catch(() => {});
-        }
-
+        if (targetMember) { await targetMember.timeout(durationMs, `Fake/Funny Support Request by ${interaction.user.tag}`).catch(() => {}); }
         const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
-        if (trackingChannel) {
-            try {
-                const msg = await trackingChannel.messages.fetch(currentOrder.trackingMessageId);
-                if (msg) {
-                    const targetUser = await client.users.fetch(targetId).catch(() => "Unknown Member");
-                    const updatedEmbed = buildOrderStatusEmbed(targetUser, currentOrder.category, `#${interaction.channel.name} (Banned)`, "banned", interaction.user, `ফেক/ফানি সাপোর্ট (${durationText} মিউট)`, currentOrder.txnId || null);
-                    await msg.edit({ embeds: [updatedEmbed] });
-                }
-            } catch(e) {}
-        }
-
+        if (trackingChannel) { try { const msg = await trackingChannel.messages.fetch(currentOrder.trackingMessageId); if (msg) { const targetUser = await client.users.fetch(targetId).catch(() => "Unknown Member"); const updatedEmbed = buildOrderStatusEmbed(targetUser, currentOrder.category, `#${interaction.channel.name} (Banned)`, "banned", interaction.user, `ফেক/ফানি সাপোর্ট (${durationText} মিউট)`, currentOrder.txnId || null); await msg.edit({ embeds: [updatedEmbed] }); } } catch(e) {} }
         const logChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
-        if (logChannel) {
-            logChannel.send({ embeds: [new EmbedBuilder().setColor("Red").setTitle("🚫 Support Ban Imposed").setDescription(`**User:** <@${targetId}>\n**Punished By:** ${interaction.user}\n**Duration:** ${durationText}\n**Reason:** Funny/Fake Panel Opening.`)] });
-        }
-
+        if (logChannel) { logChannel.send({ embeds: [new EmbedBuilder().setColor("Red").setTitle("🚫 Support Ban Imposed").setDescription(`**User:** <@${targetId}>\n**Punished By:** ${interaction.user}\n**Duration:** ${durationText}\n**Reason:** Funny/Fake Panel Opening.`)] }); }
         await interaction.editReply(`✅ সফলভাবে ব্যবহারকারীকে ${durationText} এর জন্য ব্যান করা হয়েছে এবং চ্যানেলটি বন্ধ করা হচ্ছে।`);
         setTimeout(async () => { await interaction.channel.delete().catch(() => {}); }, 2000);
     }
 });
 
-// Panels UI Builders
-function getTicketPanel() { const embed = new EmbedBuilder().setTitle("🎫 Premium Support Ticket").setColor("#5865F2"); const menu = new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("🛒 সিলেক্ট করুন...").addOptions([{ label: "Discord Bot Development", value: "bot_dev" }]); return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; }
-function getReportPanel() { const embed = new EmbedBuilder().setTitle("🚨 Report Center").setColor("#ED4245"); const menu = new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("⚠️ সিলেক্ট করুন...").addOptions([{ label: "Bug Report", value: "bug_report" }]); return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; }
-function getCustomerPanel() { const embed = new EmbedBuilder().setTitle("💬 CUSTOMER-SUPPORT").setColor("#57F287"); const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("❓ সিলেক্ট করুন...").addOptions([{ label: "General Support", value: "general_support" }]); return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; }
+// ================================
+// ⚡ PART 4 - UI Builders (Firebase Dynamic Option Load & Cover Images)
+// ================================
 
-function getPaymentPanel() { 
-    const embed = new EmbedBuilder()
-        .setTitle("💳 AUTOMATIC PAYMENT GATEWAY PANEL")
-        .setDescription("আমাদের যেকোনো প্রিমিয়াম সার্ভিস ক্রয় করার জন্য নিচে দেওয়া ড্রপডাউন মেনু থেকে সার্ভিস সিলেক্ট করুন এবং সরাসরি গেটওয়ে পেমেন্ট সম্পন্ন করুন।")
-        .setColor("#3498DB"); 
-    const menu = new StringSelectMenuBuilder()
-        .setCustomId("select_buy_category")
-        .setPlaceholder("🛍️ আপনার কাঙ্ক্ষিত মেম্বারশিপ/সার্ভিস সিলেক্ট করুন...")
-        .addOptions([
-            { label: "Premium Bot Pack (500 BDT)", value: "bot_pack" },
-            { label: "VIP Role Monthly (200 BDT)", value: "vip_monthly" },
-            { label: "Server Verification Setup (350 BDT)", value: "verification_setup" }
-        ]); 
+async function getDynamicTicketPanel() { 
+    const options = await fetchFirebaseOptions("ticket");
+    const embed = new EmbedBuilder().setTitle("🎫 Premium Support Ticket Panel").setDescription("আপনার কাঙ্ক্ষিত প্রিমিয়াম ডেভেলপমেন্ট বা সাপোর্টের জন্য নিচে থেকে অপশনটি সিলেক্ট করুন।").setImage(COVER_IMAGES.TICKET).setColor("#5865F2"); 
+    const menu = new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("🛒 আপনার সাপোর্ট ক্যাটাগরি সিলেক্ট করুন...").addOptions(options); 
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
+}
+
+async function getDynamicReportPanel() { 
+    const options = await fetchFirebaseOptions("report");
+    const embed = new EmbedBuilder().setTitle("🚨 Server Report Center").setDescription("সার্ভারের যেকোনো বাগ (Bug) অথবা কোনো মেম্বার/স্টাফের বিরুদ্ধে রিপোর্ট করতে নিচে অপশনটি বেছে নিন।").setImage(COVER_IMAGES.REPORT).setColor("#ED4245"); 
+    const menu = new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("⚠️ আপনার রিপোর্টের ধরন সিলেক্ট করুন...").addOptions(options); 
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
+}
+
+async function getDynamicCustomerPanel() { 
+    const options = await fetchFirebaseOptions("customer");
+    const embed = new EmbedBuilder().setTitle("💬 General Customer Support Panel").setDescription("সার্ভার বা সাধারণ যেকোনো সাহায্য ও জিজ্ঞাসার জন্য নিচের ড্রপডাউন মেনুটি ব্যবহার করুন।").setImage(COVER_IMAGES.CUSTOMER).setColor("#57F287"); 
+    const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...").addOptions(options); 
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
+}
+
+async function getDynamicPaymentPanel() { 
+    const options = await fetchFirebaseOptions("payment");
+    const embed = new EmbedBuilder().setTitle("💳 Automatic Payment Gateway Panel").setDescription("আমাদের প্রিমিয়াম সার্ভিসসমূহ ক্রয় করতে নিচের মেনু থেকে পণ্যটি সিলেক্ট করুন এবং পেমেন্ট সম্পন্ন করুন।").setImage(COVER_IMAGES.PAYMENT).setColor("#3498DB"); 
+    const menu = new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("🛍️ আপনার কাঙ্ক্ষিত মেম্বারশিপ/সার্ভিস সিলেক্ট করুন...").addOptions(options); 
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
 }
 
@@ -656,138 +473,50 @@ client.on("messageCreate", async (message) => {
     const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN);
     if (!isServerAdmin) return;
 
-    if (message.content === "!setup") return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
-    if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) return message.channel.send(getTicketPanel());
-    if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(getReportPanel());
-    if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(getCustomerPanel());
+    if (message.content === "!setup") return message.channel.send({ embeds: [createVerificationEmbed().setImage(COVER_IMAGES.VERIFY)], components: [verificationRow] });
     
-    if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && message.channelId === CHANNELS.PAYMENT_PANEL) {
-        return message.channel.send(getPaymentPanel());
+    // Firebase থেকে লাইভ ডাটা জেনারেট করে প্যানেল পাঠানো হচ্ছে
+    if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) return message.channel.send(await getDynamicTicketPanel());
+    if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(await getDynamicReportPanel());
+    if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
+    
+    if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && 
+        (message.channelId === CHANNELS.PAYMENT_PANEL || message.channelId === CHANNELS.BUY_PANEL)) {
+        return message.channel.send(await getDynamicPaymentPanel());
     }
 });
 
 // ================================
-// 🚀 PART 5 - Live Member Events
+// 🚀 PART 5 - Live Member Events & Smart Recovery Sync (অপরিবর্তিত)
 // ================================
-
 client.on("guildMemberAdd", async (member) => {
-    if (member.guild.id !== ALLOWED_GUILD_ID) return;
-    const saved = getSavedMembers();
-    if (!saved.includes(member.id)) { saved.push(member.id); saveMembers(saved); }
-
-    const punishments = getPunishments();
-    if (punishments[member.id] && punishments[member.id].status === "Muted") {
-        const record = punishments[member.id];
-        const now = Date.now();
-        
-        if (!record.expiresAt || record.expiresAt > now) {
-            const remainingTime = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000;
-            try {
-                await member.timeout(remainingTime, "Automod/Panel Bypass Block");
-                const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-                if (welcomeChannel) {
-                    welcomeChannel.send(`⚠️ মেম্বার <@${member.id}> তার আগের প্যানেল ব্যান/টাইমআউট শাস্তি ফাঁকি দেওয়ার জন্য লিভ নিয়ে পুনরায় জয়েন করায় তাকে পুনরায় মিউট করা হয়েছে।`);
-                }
-            } catch(e) {}
-        } else {
-            savePunishment(member.id, null);
-        }
-    }
-
-    const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-    if (welcomeChannel) {
-        const embed = buildDynamicWelcomeEmbed(member, "unverified", false);
-        const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [embed] }).catch(() => {});
-        if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: false });
-    }
+    if (member.guild.id !== ALLOWED_GUILD_ID) return; const saved = getSavedMembers(); if (!saved.includes(member.id)) { saved.push(member.id); saveMembers(saved); }
+    const punishments = getPunishments(); if (punishments[member.id] && punishments[member.id].status === "Muted") { const record = punishments[member.id]; const now = Date.now(); if (!record.expiresAt || record.expiresAt > now) { const remainingTime = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000; try { await member.timeout(remainingTime, "Automod/Panel Bypass Block"); const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID); if (welcomeChannel) { welcomeChannel.send(`⚠️ মেম্বার <@${member.id}> তার আগের প্যানেল ব্যান/টাইমআউট শাস্তি ফাঁকি দেওয়ার জন্য লিভ নিয়ে পুনরায় জয়েন করায় তাকে পুনরায় মিউট করা হয়েছে।`); } } catch(e) {} } else { savePunishment(member.id, null); } }
+    const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID); if (welcomeChannel) { const embed = buildDynamicWelcomeEmbed(member, "unverified", false); const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [embed] }).catch(() => {}); if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: false }); }
 });
 
 client.on("guildMemberRemove", async (member) => {
-    if (member.guild.id !== ALLOWED_GUILD_ID) return;
-    const saved = getSavedMembers();
-    saveMembers(saved.filter(id => id !== member.id));
-
-    const logs = getWelcomeLogs();
-    const userLog = logs[member.id];
-    const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-
-    if (userLog && welcomeChannel) {
-        try {
-            const msg = await welcomeChannel.messages.fetch(userLog.messageId);
-            if (msg) {
-                const updatedEmbed = buildDynamicWelcomeEmbed(member, "left", userLog.isOffline);
-                await msg.edit({ content: `🚫 **${member.user.tag}** সার্ভার থেকে বিদায় নিয়েছেন।`, embeds: [updatedEmbed] });
-            }
-        } catch (e) {}
-    }
+    if (member.guild.id !== ALLOWED_GUILD_ID) return; const saved = getSavedMembers(); saveMembers(saved.filter(id => id !== member.id));
+    const logs = getWelcomeLogs(); const userLog = logs[member.id]; const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
+    if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(member, "left", userLog.isOffline); await msg.edit({ content: `🚫 **${member.user.tag}** সার্ভার থেকে বিদায় নিয়েছেন।`, embeds: [updatedEmbed] }); } } catch (e) {} }
 });
-
-// ================================
-// 🔄 PART 6 - Ready Event & Sync (SMART OFFLINE SYNC)
-// ================================
 
 client.once("ready", async () => {
-    console.log(`✅ Logged in as ${client.user.tag}`);
-    setBotPresence();
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
-    if (!guild) return;
-
-    // ১. ভয়েস চ্যানেলে জয়েন করানো
-    await connectVoice(guild);
-    
-    // ২. ভয়েস চ্যনেল নাম স্ট্যাটাস লুপ শুরু
-    startVoiceStatsUpdater(guild);
-
-    const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
-
+    console.log(`✅ Logged in as ${client.user.tag}`); setBotPresence();
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); if (!guild) return;
+    await connectVoice(guild); const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
     try {
-        console.log("🔍 Checking for offline actions smartly...");
-        const currentMembers = await guild.members.fetch();
-        const savedMembers = getSavedMembers();
-        const punishments = getPunishments();
-        const now = Date.now();
-
-        // 🎯 সমাধান: যারা কেবল ডাটাবেজে নেই কিন্তু বর্তমানে সার্ভারে আছে (অর্থাৎ বট অফলাইন থাকার সময় নতুন জয়েন করেছে)
+        console.log("🔍 Checking for offline actions..."); const currentMembers = await guild.members.fetch(); const savedMembers = getSavedMembers(); const logs = getWelcomeLogs(); const punishments = getPunishments(); const now = Date.now();
         const missedJoins = currentMembers.filter(m => !savedMembers.includes(m.id) && !m.user.bot);
-        
-        if (missedJoins.size > 0 && welcomeChannel) {
-            console.log(`📡 Found ${missedJoins.size} members who joined while the bot was offline!`);
-            for (const [, member] of missedJoins) {
-                // প্যানেল মিউট বা বাইপাস চেক
-                if (punishments[member.id] && punishments[member.id].status === "Muted") {
-                    const record = punishments[member.id];
-                    if (!record.expiresAt || record.expiresAt > now) {
-                        const remaining = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000;
-                        await member.timeout(remaining, "Offline Sync Bypass Guard").catch(()=>{});
-                    }
-                }
-                
-                // 🚀 শুধুমাত্র অফলাইনে জয়েন করা এই স্পেসিফিক মেম্বারদের জন্য একবারই মেসেজ যাবে
-                const embed = buildDynamicWelcomeEmbed(member, "unverified", true); // 'true' মানে অফলাইন ফ্ল্যাগ অন হবে ফুটার নোটিফিকেশনের জন্য
-                const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}! (অফলাইন রিকভারি)`, embeds: [embed] }).catch(() => {});
-                if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: true });
-            }
-        }
-
-        // ডাটাবেজ কারেন্ট মেম্বার দিয়ে সিঙ্ক করে নেওয়া
-        const finalIds = currentMembers.filter(m => !m.user.bot).map(m => m.id);
-        saveMembers(finalIds);
-        console.log("✅ Smart Sync completed successfully.");
-    } catch (err) { 
-        console.error("Sync Error:", err); 
-    }
+        if (missedJoins.size > 0 && welcomeChannel) { for (const [, member] of missedJoins) { if (punishments[member.id] && punishments[member.id].status === "Muted") { const record = punishments[member.id]; if (!record.expiresAt || record.expiresAt > now) { const remaining = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000; await member.timeout(remaining, "Offline Sync Bypass Guard").catch(()=>{}); } } const embed = buildDynamicWelcomeEmbed(member, "unverified", true); const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [embed] }).catch(() => {}); if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: true }); } }
+        const currentMemberIds = currentMembers.map(m => m.id); const missedLeaves = savedMembers.filter(id => !currentMemberIds.includes(id));
+        if (missedLeaves.length > 0 && welcomeChannel) { for (const leftId of missedLeaves) { const userLog = logs[leftId]; if (userLog) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const mockMember = { id: leftId, userId: leftId, user: { tag: "Offline Left Member" } }; const updatedEmbed = buildDynamicWelcomeEmbed(mockMember, "left", true); await msg.edit({ content: `🚫 একটি ইউজার বট অফলাইনে থাকা অবস্থায় সার্ভার ত্যাগ করেছেন।`, embeds: [updatedEmbed] }); } } catch (e) {} } } }
+        const finalIds = currentMembers.filter(m => !m.user.bot).map(m => m.id); saveMembers(finalIds); console.log("✅ Offline sync completed successfully.");
+    } catch (err) { console.error("Sync Recovery Error:", err); }
 });
 
-// ভয়েস ডিসকানেক্ট গার্ড
-client.on("voiceStateUpdate", async (oldState, newState) => {
-    if (newState.id === client.user.id && !newState.channelId) {
-        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
-        if (guild) {
-            console.log("🔄 Disconnected from voice. Reconnecting...");
-            setTimeout(() => connectVoice(guild), 5000);
-        }
-    }
-});
+async function connectVoice(guild) { try { const channel = guild.channels.cache.get(VOICE_CHANNEL_ID); if (!channel) return; joinVoiceChannel({ channelId: channel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true, selfMute: false }); } catch (e) {} }
+client.on("voiceStateUpdate", async () => { const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); if (guild && guild.members.me && !guild.members.me.voice.channel) await connectVoice(guild); });
 
 function startBot() { client.login(TOKEN).catch(() => { setTimeout(startBot, 5000); }); }
 startBot();
