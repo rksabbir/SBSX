@@ -66,6 +66,8 @@ const VOICE_CHANNEL_ID = "1523230098193383595";
 
 // অর্ডার ট্র্যাকিং চ্যানেল আইডি
 const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
+// নতুন অর্ডার গাইড চ্যানেল আইডি
+const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 
 const ROLES = {
     ADMIN: "1488332568372973568", 
@@ -126,7 +128,7 @@ async function fetchFirebasePanelData(panelType) {
         const customImage = data.image || null;
 
         const options = Object.keys(data)
-            .filter(key => key !== "description" && key !== "image")
+            .filter(key => key !== "description" && key !== "image" && key !== "title")
             .map(key => ({
                 label: data[key],
                 value: key
@@ -136,13 +138,14 @@ async function fetchFirebasePanelData(panelType) {
             options.push({ label: "No Options Found in DB", value: "none" });
         }
 
-        return { options, customDescription, customImage };
+        return { options, customDescription, customImage, fullData: data };
     } catch (error) {
         console.error(`❌ Firebase Panel Data Fetch Error (${panelType}):`, error);
         return { 
             options: [{ label: "Error Loading from Database", value: "error" }], 
             customDescription: null, 
-            customImage: null 
+            customImage: null,
+            fullData: {}
         };
     }
 }
@@ -221,7 +224,7 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
 }
 
 // ================================
-// 🚨 Automod Rules
+// 🚨 Automod Rules + Anti-Link System
 // ================================
 
 client.on("messageCreate", async (message) => {
@@ -229,6 +232,26 @@ client.on("messageCreate", async (message) => {
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
     const userId = message.author.id; let triggerAutomod = false; let reason = "";
     const contentLower = message.content.toLowerCase();
+
+    // 🔗 [FEATURE]: Anti-Link Spam & Verification Suggestion System
+    const linkRegex = /(https?:\/\/[^\s]+)/g;
+    if (linkRegex.test(message.content)) {
+        try { await message.delete().catch(() => {}); } catch(e){}
+        const linkWarn = await message.channel.send(`⚠️ <@${userId}>, সার্ভারে কোনো প্রকার লিংক ছড়ানো সম্পূর্ণ নিষিদ্ধ!`);
+        setTimeout(() => linkWarn.delete().catch(() => {}), 5000);
+        return;
+    }
+
+    if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
+        try {
+            const snapshot = await db.ref("settings/verification_link").once("value");
+            const dbLink = snapshot.val() || "ভেরিফিকেশন প্যানেল চেক করুন।";
+            return message.reply(`👋 আপনি কি সার্ভার লিংক বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের ভেরিফিকেশন গাইড/লিংক: ${dbLink}`);
+        } catch (err) {
+            console.error("Firebase Link Load Error:", err);
+        }
+    }
+
     if (BAD_WORDS.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
     if (!triggerAutomod) {
         const now = Date.now(); if (!userMsgCounter.has(userId)) userMsgCounter.set(userId, []);
@@ -479,6 +502,30 @@ client.on("interactionCreate", async (interaction) => {
 // ⚡ PART 4 - Live UI Panels Templates (বড় ও লম্বালম্বি প্রফেশনাল ডিজাইন)
 // ================================
 
+// 📦 [FEATURE]: Dynamic Order Guide Panel Builder From Firebase
+async function getDynamicOrderGuidePanel() {
+    const { customDescription, customImage, fullData } = await fetchFirebasePanelData("order_guide");
+    
+    const defaultTitle = "📦 HOW TO ORDER & SYSTEM GUIDE";
+    const defaultDesc = `🛒 **আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী** 🛒\n\n` +
+                        `> অত্যন্ত সহজে এবং প্রফেশনাল উপায়ে আমাদের থেকে সার্ভিস পারচেজ করুন।\n\n` +
+                        `📌 **ধাপসমূহ:**\n` +
+                        `১. প্রথমে পেমেন্ট প্যানেল থেকে আপনার প্রয়োজনীয় প্যাকেজ নির্বাচন করুন।\n` +
+                        `২. প্রদর্শিত পেমেন্ট গেটওয়েতে টাকা পাঠিয়ে **Transaction ID (TxnID)** সংগ্রহ করুন।\n` +
+                        `৩. বাটনে ক্লিক করে TxnID সাবমিট করলে একটি সম্পূর্ণ অটোমেটিক সিকিউর চ্যানেল তৈরি হবে।\n\n` +
+                        `⚠️ **জরুরী নোট:** ফায়ারবেস ডেটা চেঞ্জ করার সাথে সাথেই এই প্যানেলের বিবরণ স্বয়ংক্রিয়ভাবে বদলে যাবে।`;
+
+    const embed = new EmbedBuilder()
+        .setTitle(fullData.title || defaultTitle)
+        .setDescription(customDescription || defaultDesc)
+        .setColor("#FFAA00")
+        .setTimestamp()
+        .setFooter({ text: "Order Guide System • Live Sync Active", iconURL: client.user.displayAvatarURL() });
+
+    if (customImage) embed.setImage(customImage);
+    return { embeds: [embed] };
+}
+
 async function getDynamicTicketPanel() { 
     const { options, customDescription, customImage } = await fetchFirebasePanelData("ticket");
     
@@ -537,7 +584,7 @@ async function getDynamicCustomerPanel() {
     const { options, customDescription, customImage } = await fetchFirebasePanelData("customer");
     
     const defaultDesc = `💬 **General Customer Care & Help Counter** 💬\n\n` +
-                        `> সার্ভারের সাধারণ মেম্বারদের যেকোনো সমস্যা বা জিজ্ঞাসার জন্য ওয়ান-স্টপ সলিউশন।`;
+                        `> সার্ভারের সাধারণ মেম্বারদের যেকোনো সমস্যা বা জিজ্ঞাসার জন্য ওয়ান-স্টপ সリューション।`;
 
     const embed = new EmbedBuilder()
         .setTitle("💬 GENERAL CUSTOMER SUPPORT CENTER")
@@ -587,6 +634,11 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(await getDynamicReportPanel());
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
     
+    // 📢 [FEATURE]: Manual initialization of the Order Guide Channel Panel
+    if (message.content === "!guide" && message.channelId === ORDER_GUIDE_CHANNEL_ID) {
+        return message.channel.send(await getDynamicOrderGuidePanel());
+    }
+
     if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && 
         (message.channelId === CHANNELS.PAYMENT_PANEL || message.channelId === CHANNELS.BUY_PANEL)) {
         return message.channel.send(await getDynamicPaymentPanel());
@@ -637,7 +689,18 @@ function listenToFirebaseUpdates() {
             }
         }
 
-        // 4. Payment Panel Auto-Update (BUY_PANEL এবং PAYMENT_PANEL দুই জায়গাই চেক করবে)
+        // 4. Order Guide Panel Realtime Auto-Update (New Feature Sync)
+        const guideChan = guild.channels.cache.get(ORDER_GUIDE_CHANNEL_ID);
+        if (guideChan) {
+            const messages = await guideChan.messages.fetch({ limit: 20 });
+            const botMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0 && m.components.length === 0);
+            if (botMsg) {
+                const updatedData = await getDynamicOrderGuidePanel();
+                await botMsg.edit(updatedData).catch(() => {});
+            }
+        }
+
+        // 5. Payment Panel Auto-Update (BUY_PANEL এবং PAYMENT_PANEL দুই জায়গাই চেক করবে)
         const checkPaymentChannels = [CHANNELS.PAYMENT_PANEL, CHANNELS.BUY_PANEL];
         for (const chanId of checkPaymentChannels) {
             const payChan = guild.channels.cache.get(chanId);
