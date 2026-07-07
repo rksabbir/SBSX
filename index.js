@@ -212,7 +212,7 @@ client.on("messageCreate", async (message) => {
         const timestamps = userMsgCounter.get(userId); timestamps.push(now);
         const expirationTime = now - 5000; const activeTimestamps = timestamps.filter(time => time > expirationTime);
         userMsgCounter.set(userId, activeTimestamps);
-        if (activeTimestamps.length >= 5) { triggerAutomod = true; reason = "অতিরিক্ত局部 স্প্যামিং করা"; }
+        if (activeTimestamps.length >= 5) { triggerAutomod = true; reason = "অতিরিক্ত স্প্যামিং করা"; }
     }
     if (triggerAutomod) {
         try { await message.delete().catch(() => {}); } catch(e){}
@@ -517,7 +517,7 @@ client.on("guildMemberRemove", async (member) => {
     if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(member, "left", userLog.isOffline); await msg.edit({ content: `🚫 **${member.user.tag}** সার্ভার থেকে বিদায় নিয়েছেন।`, embeds: [updatedEmbed] }); } } catch (e) {} }
 });
 
-// 🛠️ discord.js v14 রিকমেন্ডেড 'clientReady' ইভেন্ট ব্যবহার
+// 🛠️ ডুপ্লিকেট স্বাগতম মেসেজ ফিক্স করা হলো (FIXED ⚙️)
 client.once("clientReady", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`); 
     setBotPresence();
@@ -525,14 +525,63 @@ client.once("clientReady", async () => {
     if (!guild) return;
     await connectVoice(guild); 
     const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
+    
     try {
-        console.log("🔍 Checking for offline actions..."); const currentMembers = await guild.members.fetch(); const savedMembers = getSavedMembers(); const logs = getWelcomeLogs(); const punishments = getPunishments(); const now = Date.now();
+        console.log("🔍 Checking for offline actions..."); 
+        const currentMembers = await guild.members.fetch(); 
+        const savedMembers = getSavedMembers(); 
+        const logs = getWelcomeLogs(); 
+        const punishments = getPunishments(); 
+        const now = Date.now();
+        
+        // প্রথমবার বা ফাইল খালি থাকলে বর্তমান সার্ভার মেম্বারদের দিয়ে সরাসরি ডাটাবেজ ফাইল আপডেট করে নেওয়া হচ্ছে
+        if (savedMembers.length === 0) {
+            const initialIds = currentMembers.filter(m => !m.user.bot).map(m => m.id);
+            saveMembers(initialIds);
+            console.log("✅ Initialized clean database with current guild members.");
+            return;
+        }
+
         const missedJoins = currentMembers.filter(m => !savedMembers.includes(m.id) && !m.user.bot);
-        if (missedJoins.size > 0 && welcomeChannel) { for (const [, member] of missedJoins) { if (punishments[member.id] && punishments[member.id].status === "Muted") { const record = punishments[member.id]; if (!record.expiresAt || record.expiresAt > now) { const remaining = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000; await member.timeout(remaining, "Offline Sync Bypass Guard").catch(()=>{}); } } const embed = buildDynamicWelcomeEmbed(member, "unverified", true); const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [embed] }).catch(() => {}); if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: true }); } }
-        const currentMemberIds = currentMembers.map(m => m.id); const missedLeaves = savedMembers.filter(id => !currentMemberIds.includes(id));
-        if (missedLeaves.length > 0 && welcomeChannel) { for (const leftId of missedLeaves) { const userLog = logs[leftId]; if (userLog) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const mockMember = { id: leftId, userId: leftId, user: { tag: "Offline Left Member" } }; const updatedEmbed = buildDynamicWelcomeEmbed(mockMember, "left", true); await msg.edit({ content: `🚫 একটি ইউজার বট অফলাইনে থাকা অবস্থায় সার্ভার ত্যাগ করেছেন।`, embeds: [updatedEmbed] }); } } catch (e) {} } } }
-        const finalIds = currentMembers.filter(m => !m.user.bot).map(m => m.id); saveMembers(finalIds); console.log("✅ Offline sync completed successfully.");
-    } catch (err) { console.error("Sync Recovery Error:", err); }
+        if (missedJoins.size > 0 && welcomeChannel) { 
+            for (const [, member] of missedJoins) { 
+                if (punishments[member.id] && punishments[member.id].status === "Muted") { 
+                    const record = punishments[member.id]; 
+                    if (!record.expiresAt || record.expiresAt > now) { 
+                        const remaining = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000; 
+                        await member.timeout(remaining, "Offline Sync Bypass Guard").catch(()=>{}); 
+                    } 
+                } 
+                const embed = buildDynamicWelcomeEmbed(member, "unverified", true); 
+                const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [embed] }).catch(() => {}); 
+                if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: true }); 
+            } 
+        }
+        
+        const currentMemberIds = currentMembers.map(m => m.id); 
+        const missedLeaves = savedMembers.filter(id => !currentMemberIds.includes(id));
+        if (missedLeaves.length > 0 && welcomeChannel) { 
+            for (const leftId of missedLeaves) { 
+                const userLog = logs[leftId]; 
+                if (userLog) { 
+                    try { 
+                        const msg = await welcomeChannel.messages.fetch(userLog.messageId); 
+                        if (msg) { 
+                            const mockMember = { id: leftId, userId: leftId, user: { tag: "Offline Left Member" } }; 
+                            const updatedEmbed = buildDynamicWelcomeEmbed(mockMember, "left", true); 
+                            await msg.edit({ content: `🚫 একটি ইউজার বট অফলাইনে থাকা অবস্থায় সার্ভার ত্যাগ করেছেন।`, embeds: [updatedEmbed] }); 
+                        } 
+                    } catch (e) {} 
+                } 
+            } 
+        }
+        
+        const finalIds = currentMembers.filter(m => !m.user.bot).map(m => m.id); 
+        saveMembers(finalIds); 
+        console.log("✅ Offline sync completed successfully.");
+    } catch (err) { 
+        console.error("Sync Recovery Error:", err); 
+    }
 });
 
 client.on("voiceStateUpdate", async () => { 
@@ -541,7 +590,7 @@ client.on("voiceStateUpdate", async () => {
 });
 
 // ================================
-// 🛠️ মিসিং ফাংশনসমূহ যোগ করা হলো (FIXED ⚙️)
+// 🛠️ প্রয়োজনীয় ইউটিলিটি ফাংশনসমূহ
 // ================================
 
 function setBotPresence() { 
