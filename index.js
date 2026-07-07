@@ -82,7 +82,7 @@ const CHANNELS = {
     PAYMENT_PANEL: "1488333503761219746" 
 };
 
-// 🖼️ প্রতিটি প্যানেলের জন্য প্রি-সেট কভার ফটো (ভেরিফাই বাদে বাকিগুলো আপনার প্রয়োজন মতো পরিবর্তন করতে পারেন)
+// 🖼️ প্রতিটি প্যানেলের জন্য প্রি-সেট কভার ফটো
 const COVER_IMAGES = {
     VERIFY: "https://cdn.discordapp.com/attachments/1488338142607184055/1488761437550678056/5cfd1fe4-d12c-4439-b374-f386f7595184.png",
     TICKET: "https://cdn.discordapp.com/attachments/1488338142607184055/1488761437550678056/5cfd1fe4-d12c-4439-b374-f386f7595184.png", 
@@ -117,7 +117,7 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// Helper: Firebase থেকে লাইভ ড্রপডাউন অপশন নিয়ে আসার জন্য অ্যাসিনক্রোনাস ফাংশন
+// Helper: Firebase থেকে লাইভ ড্রপডাউন অপশন নিয়ে আসার জন্য ফাংশন
 async function fetchFirebaseOptions(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
@@ -212,7 +212,7 @@ client.on("messageCreate", async (message) => {
         const timestamps = userMsgCounter.get(userId); timestamps.push(now);
         const expirationTime = now - 5000; const activeTimestamps = timestamps.filter(time => time > expirationTime);
         userMsgCounter.set(userId, activeTimestamps);
-        if (activeTimestamps.length >= 5) { triggerAutomod = true; reason = "অতিরিক্ত স্প্যামিং করা"; }
+        if (activeTimestamps.length >= 5) { triggerAutomod = true; reason = "অতিরিক্ত局部 স্প্যামিং করা"; }
     }
     if (triggerAutomod) {
         try { await message.delete().catch(() => {}); } catch(e){}
@@ -291,7 +291,7 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const category = interaction.customId.split("_")[2];
         const txnId = interaction.fields.getTextInputValue("txn_id_input");
-        const randomCode = Math.floor(1000 + Math.random() * 9000); // 🎯 সিকিউর ইউনিক ৪ ডিজিট আইডি
+        const randomCode = Math.floor(1000 + Math.random() * 9000); 
 
         let supportRoleId = ROLES.SUPPORT_CUSTOMER;
         let channelPrefix = `order-${randomCode}`; 
@@ -307,7 +307,6 @@ client.on("interactionCreate", async (interaction) => {
         const privateChannel = await interaction.guild.channels.create({ name: channelPrefix, type: 0, permissionOverwrites: permissionOverwrites });
         const insideEmbed = new EmbedBuilder().setTitle(`🛍️ Welcome to your Paid Order Channel`).setDescription(`স্বাগতম ${interaction.user}!\n**ক্যাটাগরি:** ${category.toUpperCase()}\n**Transaction ID:** \`${txnId}\``).setColor("Green");
         
-        // 🎯 স্টাফ কন্ট্রোলের ৪টি বাটন (অ্যাপ্রুভ সহ)
         const staffButtons = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`approve_order`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
@@ -332,7 +331,7 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const dataArr = interaction.customId.split("_");
         const type = dataArr[1]; const category = dataArr.slice(2).join("_");
-        const randomCode = Math.floor(1000 + Math.random() * 9000); // 🎯 সিকিউর ইউনিক ৪ ডিজিট আইডি
+        const randomCode = Math.floor(1000 + Math.random() * 9000); 
         
         let supportRoleId = (type === "customer") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
         let channelPrefix = `tikt-${randomCode}`; 
@@ -348,7 +347,6 @@ client.on("interactionCreate", async (interaction) => {
         const privateChannel = await interaction.guild.channels.create({ name: channelPrefix, type: 0, permissionOverwrites: permissionOverwrites });
         const insideEmbed = new EmbedBuilder().setTitle(`Welcome to your ${type.toUpperCase()}`).setDescription(`স্বাগতম ${interaction.user}! ক্যাটাগরি: ${category.toUpperCase()}`).setColor("Random");
         
-        // 🎯 স্টাফ কন্ট্রোলের ৪টি বাটন (অ্যাপ্রুভ সহ)
         const staffButtons = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`approve_${type}`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
@@ -378,7 +376,6 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
-    // 🎯 Approve বাটন অ্যাকশন (অর্ডার/টিকিট কনফর্ম বা রানিং করা)
     if (interaction.isButton() && interaction.customId.startsWith("approve_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
@@ -520,10 +517,14 @@ client.on("guildMemberRemove", async (member) => {
     if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(member, "left", userLog.isOffline); await msg.edit({ content: `🚫 **${member.user.tag}** সার্ভার থেকে বিদায় নিয়েছেন।`, embeds: [updatedEmbed] }); } } catch (e) {} }
 });
 
-client.once("ready", async () => {
-    console.log(`✅ Logged in as ${client.user.tag}`); setBotPresence();
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); if (!guild) return;
-    await connectVoice(guild); const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
+// 🛠️ discord.js v14 রিকমেন্ডেড 'clientReady' ইভেন্ট ব্যবহার
+client.once("clientReady", async () => {
+    console.log(`✅ Logged in as ${client.user.tag}`); 
+    setBotPresence();
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
+    if (!guild) return;
+    await connectVoice(guild); 
+    const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
     try {
         console.log("🔍 Checking for offline actions..."); const currentMembers = await guild.members.fetch(); const savedMembers = getSavedMembers(); const logs = getWelcomeLogs(); const punishments = getPunishments(); const now = Date.now();
         const missedJoins = currentMembers.filter(m => !savedMembers.includes(m.id) && !m.user.bot);
@@ -534,7 +535,43 @@ client.once("ready", async () => {
     } catch (err) { console.error("Sync Recovery Error:", err); }
 });
 
-client.on("voiceStateUpdate", async () => { const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); if (guild && guild.members.me && !guild.members.me.voice.channel) await connectVoice(guild); });
+client.on("voiceStateUpdate", async () => { 
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
+    if (guild && guild.members.me && !guild.members.me.voice.channel) await connectVoice(guild); 
+});
 
-function startBot() { client.login(TOKEN).catch(() => { setTimeout(startBot, 5000); }); }
+// ================================
+// 🛠️ মিসিং ফাংশনসমূহ যোগ করা হলো (FIXED ⚙️)
+// ================================
+
+function setBotPresence() { 
+    client.user.setPresence({ 
+        activities: [{ name: "Security & Verification", type: ActivityType.Watching }], 
+        status: "online" 
+    }); 
+}
+
+async function connectVoice(guild) { 
+    try { 
+        const channel = guild.channels.cache.get(VOICE_CHANNEL_ID); 
+        if (!channel) return; 
+        joinVoiceChannel({ 
+            channelId: channel.id, 
+            guildId: guild.id, 
+            adapterCreator: guild.voiceAdapterCreator, 
+            selfDeaf: true, 
+            selfMute: false 
+        }); 
+    } catch (e) {
+        console.error("❌ Voice Connect Error:", e);
+    } 
+}
+
+function startBot() { 
+    client.login(TOKEN).catch((err) => { 
+        console.error("❌ Login Failed, retrying in 5s...", err);
+        setTimeout(startBot, 5000); 
+    }); 
+}
+
 startBot();
