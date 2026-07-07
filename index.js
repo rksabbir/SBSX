@@ -74,13 +74,15 @@ const cooldowns = new Map();
 const userMsgCounter = new Map(); 
 const userWarns = new Map(); 
 
+// 🎯 অতিরিক্ত Intent যুক্ত করা হয়েছে যাতে সঠিক মেম্বার ও অনলাইন স্ট্যাটাস কাউন্ট করা যায়
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildVoiceStates
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildPresences
     ],
     partials: [Partials.Channel, Partials.GuildMember]
 });
@@ -108,6 +110,35 @@ async function connectVoice(guild) {
         });
         await entersState(connection, VoiceConnectionStatus.Ready, 30000);
     } catch (err) { console.error("Voice error:", err); }
+}
+
+// 🎯 ভয়েস চ্যানেলের নাম ২ মিনিট পর পর আপডেট করার নতুন ফাংশন
+function startVoiceStatsUpdater(guild) {
+    setInterval(async () => {
+        try {
+            const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
+            if (!channel) return;
+
+            // সব মেম্বারদের ক্যাশ বা ফেচ করে নেওয়া হচ্ছে সঠিক হিসাবের জন্য
+            const members = await guild.members.fetch({ withPresences: true });
+            
+            const totalMembers = members.size;
+            const totalBots = members.filter(m => m.user.bot).size;
+            
+            // অনলাইন, আইডল (idle), বা ডু নট ডিস্টার্ব (dnd) মুডে থাকা ইউজারদের অনলাইন ধরা হবে
+            const onlineMembers = members.filter(m => !m.user.bot && m.presence && ["online", "idle", "dnd"].includes(m.presence.status)).size;
+
+            // ভয়েস চ্যানেলের নতুন নাম তৈরি (আপনার পছন্দ অনুযায়ী ফরম্যাট পরিবর্তন করতে পারেন)
+            const newName = `Total: ${totalMembers} | Online: ${onlineMembers} | Bots: ${totalBots}`;
+            
+            if (channel.name !== newName) {
+                await channel.setName(newName);
+                console.log(`📊 Voice channel stats updated: ${newName}`);
+            }
+        } catch (err) {
+            console.error("Error updating voice channel stats:", err);
+        }
+    }, 2 * 60 * 1000); // ২ মিনিট (১২০,০০০ মিলিসেকেন্ড) পর পর রান হবে
 }
 
 // ================================
@@ -704,11 +735,15 @@ client.once("ready", async () => {
     if (!guild) return;
 
     await connectVoice(guild);
+    
+    // 🎯 বট রেডি হওয়ার পর ভয়েস স্ট্যাটাস আপডেট লুপ চালু করা হলো
+    startVoiceStatsUpdater(guild);
+
     const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
 
     try {
         console.log("🔍 Checking for offline actions...");
-        const currentMembers = await guild.members.fetch();
+        const currentMembers = await guild.members.fetch({ withPresences: true });
         const savedMembers = getSavedMembers();
         const logs = getWelcomeLogs();
         const punishments = getPunishments();
