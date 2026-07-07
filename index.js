@@ -24,25 +24,22 @@ const {
 } = require("discord.js");
 
 const {
-    joinVoiceChannel,
-    entersState,
-    VoiceConnectionStatus
+    joinVoiceChannel
 } = require("@discordjs/voice");
 
-// 🟢 Render Environment Variable (KeyValue) থেকে ফাইল ছাড়া সরাসরি অবজেক্ট লোড করার স্মার্ট সিস্টেম
+// 🟢 Render Environment Variable থেকে সরাসরি অবজেক্ট লোড
 let serviceAccount;
 try {
     if (process.env.FIREBASE_CONFIG) {
         serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
     } else {
-        // কম্পিউটারে লোকাল টেস্ট করার ব্যাকআপ অপশন
         serviceAccount = require("./firebase-service-account.json");
     }
 } catch (e) {
     console.error("❌ Firebase Config Load Error:", e);
 }
 
-// ডাটাবেজ ইউআরএল ও ফায়ারবেস ইনিশিয়ালাইজেশন
+// ফায়ারবেস ইনিশিয়ালাইজেশন
 const firebaseURL = process.env.FIREBASE_DB_URL || "YOUR_FIREBASE_DATABASE_URL";
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
@@ -82,7 +79,6 @@ const CHANNELS = {
     PAYMENT_PANEL: "1488333503761219746" 
 };
 
-// 🖼️ প্রতিটি প্যানেলের জন্য প্রি-সেট কভার ফটো
 const COVER_IMAGES = {
     VERIFY: "https://cdn.discordapp.com/attachments/1488338142607184055/1488761437550678056/5cfd1fe4-d12c-4439-b374-f386f7595184.png",
     TICKET: "https://cdn.discordapp.com/attachments/1488338142607184055/1488761437550678056/5cfd1fe4-d12c-4439-b374-f386f7595184.png", 
@@ -117,7 +113,7 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// Helper: Firebase থেকে লাইভ ড্রপডাউন অপশন নিয়ে আসার জন্য ফাংশন
+// 🔄 Helper: Firebase থেকে লাইভ ড্রপডাউন অপশন নিয়ে আসার ফাংশন
 async function fetchFirebaseOptions(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
@@ -228,7 +224,7 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================================
-// ⚡ PART 3 - Interaction Handling (Buttons & Menus)
+// ⚡ PART 3 - Interaction Handling (Live Firebase Dropdown Logic Included)
 // ================================
 
 const verificationRow = new ActionRowBuilder().addComponents(
@@ -245,6 +241,7 @@ client.on("interactionCreate", async (interaction) => {
         cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
+    // ভেরিফিকেশন বাটন ক্লিক হ্যান্ডলার
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
         try {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -258,9 +255,10 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
+    // 🔥 LIVE DROPDOWN SELECTION: ড্রপডাউন সিলেক্ট করলে ফায়ারবেস থেকে লাইভ অপশন ভেরিফাই করে সাবমিট হবে
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0];
-        if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
+        if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন বা ডাটাবেজ এরর!", flags: [MessageFlags.Ephemeral] });
 
         let type = ""; let embedColor = ""; let buttonId = "";
         if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${value}`; }
@@ -453,7 +451,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ================================
-// ⚡ PART 4 - Live UI Panels (Dynamic Load from Firebase)
+// ⚡ PART 4 - Live UI Panels (Dynamic Realtime Load from Firebase)
 // ================================
 
 async function getDynamicTicketPanel() { 
@@ -495,7 +493,6 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) return message.channel.send(await getDynamicTicketPanel());
     if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(await getDynamicReportPanel());
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
-    
     if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && message.channelId === CHANNELS.PAYMENT_PANEL) {
         return message.channel.send(await getDynamicPaymentPanel());
     }
@@ -517,7 +514,6 @@ client.on("guildMemberRemove", async (member) => {
     if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(member, "left", userLog.isOffline); await msg.edit({ content: `🚫 **${member.user.tag}** সার্ভার থেকে বিদায় নিয়েছেন।`, embeds: [updatedEmbed] }); } } catch (e) {} }
 });
 
-// 🛠️ ডুপ্লিকেট স্বাগতম মেসেজ ফিক্স করা হলো (FIXED ⚙️)
 client.once("clientReady", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`); 
     setBotPresence();
@@ -534,7 +530,6 @@ client.once("clientReady", async () => {
         const punishments = getPunishments(); 
         const now = Date.now();
         
-        // প্রথমবার বা ফাইল খালি থাকলে বর্তমান সার্ভার মেম্বারদের দিয়ে সরাসরি ডাটাবেজ ফাইল আপডেট করে নেওয়া হচ্ছে
         if (savedMembers.length === 0) {
             const initialIds = currentMembers.filter(m => !m.user.bot).map(m => m.id);
             saveMembers(initialIds);
