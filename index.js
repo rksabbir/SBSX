@@ -27,7 +27,7 @@ const {
     joinVoiceChannel
 } = require("@discordjs/voice");
 
-// 🟢 Render Environment Variable থেকে সরাসরি অবজেক্ট লোড
+// Render Environment Variable থেকে সরাসরি অবজেক্ট লোড
 let serviceAccount;
 try {
     if (process.env.FIREBASE_CONFIG) {
@@ -63,7 +63,9 @@ const VERIFIED_ROLE_ID = "1488333841402691664";
 const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 const VOICE_CHANNEL_ID = "1523230098193383595";
-const ORDER_TRACKING_CHANNEL_ID = "1488339045602951199"; 
+
+// ✅ আপনার দেওয়া নতুন অর্ডার ট্র্যাকিং চ্যানেল আইডি এখানে বসানো হয়েছে
+const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
 
 const ROLES = {
     ADMIN: "1488332568372973568", 
@@ -113,7 +115,7 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// 🔄 Helper: Firebase থেকে লাইভ ড্রপডাউন অপশন নিয়ে আসার ফাংশন
+// Firebase ড্রপডাউন অপশন নিয়ে আসার ফাংশন
 async function fetchFirebaseOptions(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
@@ -224,7 +226,7 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================================
-// ⚡ PART 3 - Interaction Handling (Live Firebase Dropdown Logic Included)
+// ⚡ PART 3 - Interaction Handling
 // ================================
 
 const verificationRow = new ActionRowBuilder().addComponents(
@@ -241,7 +243,6 @@ client.on("interactionCreate", async (interaction) => {
         cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
-    // ভেরিফিকেশন বাটন ক্লিক হ্যান্ডলার
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
         try {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -255,10 +256,9 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
-    // 🔥 LIVE DROPDOWN SELECTION: ড্রপডাউন সিলেক্ট করলে ফায়ারবেস থেকে লাইভ অপশন ভেরিফাই করে সাবমিট হবে
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0];
-        if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন বা ডাটাবেজ এরর!", flags: [MessageFlags.Ephemeral] });
+        if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
 
         let type = ""; let embedColor = ""; let buttonId = "";
         if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${value}`; }
@@ -451,7 +451,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ================================
-// ⚡ PART 4 - Live UI Panels (Dynamic Realtime Load from Firebase)
+// ⚡ PART 4 - Live UI Panels Templates
 // ================================
 
 async function getDynamicTicketPanel() { 
@@ -499,6 +499,63 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================================
+// 🔥 REALTIME FIREBASE SYNC TO DISCORD (LIVE EDIT CODES)
+// ================================
+
+function listenToFirebaseUpdates() {
+    db.ref("panels").on("value", async (snapshot) => {
+        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+        if (!guild) return;
+
+        console.log("🔄 Firebase Realtime Data changed! Updating panels in Discord channels...");
+
+        // 1. Ticket Panel Auto-Update
+        const ticketChan = guild.channels.cache.get(CHANNELS.TICKET_PANEL);
+        if (ticketChan) {
+            const messages = await ticketChan.messages.fetch({ limit: 20 });
+            const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_product_ticket");
+            if (botMsg) {
+                const updatedData = await getDynamicTicketPanel();
+                await botMsg.edit(updatedData).catch(() => {});
+            }
+        }
+
+        // 2. Report Panel Auto-Update
+        const reportChan = guild.channels.cache.get(CHANNELS.REPORT_PANEL);
+        if (reportChan) {
+            const messages = await reportChan.messages.fetch({ limit: 20 });
+            const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_report_category");
+            if (botMsg) {
+                const updatedData = await getDynamicReportPanel();
+                await botMsg.edit(updatedData).catch(() => {});
+            }
+        }
+
+        // 3. Customer Panel Auto-Update
+        const custChan = guild.channels.cache.get(CHANNELS.CUSTOMER_PANEL);
+        if (custChan) {
+            const messages = await custChan.messages.fetch({ limit: 20 });
+            const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_customer_category");
+            if (botMsg) {
+                const updatedData = await getDynamicCustomerPanel();
+                await botMsg.edit(updatedData).catch(() => {});
+            }
+        }
+
+        // 4. Payment Panel Auto-Update
+        const payChan = guild.channels.cache.get(CHANNELS.PAYMENT_PANEL);
+        if (payChan) {
+            const messages = await payChan.messages.fetch({ limit: 20 });
+            const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_buy_category");
+            if (botMsg) {
+                const updatedData = await getDynamicPaymentPanel();
+                await botMsg.edit(updatedData).catch(() => {});
+            }
+        }
+    });
+}
+
+// ================================
 // 🚀 PART 5 - Live Member Events & Smart Sync Recovery
 // ================================
 
@@ -517,6 +574,10 @@ client.on("guildMemberRemove", async (member) => {
 client.once("clientReady", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`); 
     setBotPresence();
+    
+    // লাইভ রিয়েল-টাইম ফায়ারবেস লিসেনার চালু করা হলো
+    listenToFirebaseUpdates();
+
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
     if (!guild) return;
     await connectVoice(guild); 
