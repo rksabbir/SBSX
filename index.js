@@ -64,7 +64,7 @@ const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 const VOICE_CHANNEL_ID = "1523230098193383595";
 
-// ✅ আপনার দেওয়া নতুন অর্ডার ট্র্যাকিং চ্যানেল আইডি এখানে বসানো হয়েছে
+// আপনার দেওয়া নতুন অর্ডার ট্র্যাকিং চ্যানেল আইডি
 const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
 
 const ROLES = {
@@ -77,7 +77,7 @@ const CHANNELS = {
     TICKET_PANEL: "1488339982627115118",
     REPORT_PANEL: "1488340441115004999",
     CUSTOMER_PANEL: "1488340017938960484",
-    BUY_PANEL: "1488339666368462858",
+    BUY_PANEL: "1488339666368462858", // 👈 আপনার কাঙ্ক্ষিত চ্যানেল আইডি
     PAYMENT_PANEL: "1488333503761219746" 
 };
 
@@ -493,7 +493,10 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) return message.channel.send(await getDynamicTicketPanel());
     if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(await getDynamicReportPanel());
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
-    if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && message.channelId === CHANNELS.PAYMENT_PANEL) {
+    
+    // ✅ ফিক্সড: এখন BUY_PANEL (1488339666368462858) অথবা PAYMENT_PANEL দুই জায়গাতেই এই কমান্ডটি কাজ করবে।
+    if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && 
+        (message.channelId === CHANNELS.PAYMENT_PANEL || message.channelId === CHANNELS.BUY_PANEL)) {
         return message.channel.send(await getDynamicPaymentPanel());
     }
 });
@@ -542,14 +545,17 @@ function listenToFirebaseUpdates() {
             }
         }
 
-        // 4. Payment Panel Auto-Update
-        const payChan = guild.channels.cache.get(CHANNELS.PAYMENT_PANEL);
-        if (payChan) {
-            const messages = await payChan.messages.fetch({ limit: 20 });
-            const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_buy_category");
-            if (botMsg) {
-                const updatedData = await getDynamicPaymentPanel();
-                await botMsg.edit(updatedData).catch(() => {});
+        // 4. Payment Panel Auto-Update (BUY_PANEL এবং PAYMENT_PANEL দুই জায়গাই চেক করবে)
+        const checkPaymentChannels = [CHANNELS.PAYMENT_PANEL, CHANNELS.BUY_PANEL];
+        for (const chanId of checkPaymentChannels) {
+            const payChan = guild.channels.cache.get(chanId);
+            if (payChan) {
+                const messages = await payChan.messages.fetch({ limit: 20 });
+                const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_buy_category");
+                if (botMsg) {
+                    const updatedData = await getDynamicPaymentPanel();
+                    await botMsg.edit(updatedData).catch(() => {});
+                }
             }
         }
     });
