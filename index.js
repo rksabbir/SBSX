@@ -59,7 +59,7 @@ const CHANNELS = {
     REPORT_PANEL: "1488340441115004999",
     CUSTOMER_PANEL: "1488340017938960484",
     BUY_PANEL: "1488339666368462858",
-    PAYMENT_PANEL: "1488333503761219746" // 🎯 আপনার দেওয়া নতুন পেমেন্ট প্যানেল আইডি
+    PAYMENT_PANEL: "1488333503761219746"
 };
 
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
@@ -74,7 +74,6 @@ const cooldowns = new Map();
 const userMsgCounter = new Map(); 
 const userWarns = new Map(); 
 
-// 🎯 অতিরিক্ত Intent যুক্ত করা হয়েছে যাতে সঠিক মেম্বার ও অনলাইন স্ট্যাটাস কাউন্ট করা যায়
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -100,7 +99,12 @@ function setBotPresence() {
 async function connectVoice(guild) {
     try {
         const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
-        if (!channel) return;
+        if (!channel || channel.type !== 2) {
+            console.error("❌ Voice channel not found or is not a valid voice channel.");
+            return;
+        }
+        
+        console.log(`🎙️ Attempting to join voice channel: ${channel.name}`);
         const connection = joinVoiceChannel({
             channelId: channel.id,
             guildId: guild.id,
@@ -108,37 +112,41 @@ async function connectVoice(guild) {
             selfDeaf: true,
             selfMute: false
         });
+        
         await entersState(connection, VoiceConnectionStatus.Ready, 30000);
-    } catch (err) { console.error("Voice error:", err); }
+        console.log("✅ Successfully joined and stabilized in voice channel!");
+    } catch (err) { 
+        console.error("❌ Voice connection error:", err); 
+    }
 }
 
-// 🎯 ভয়েস চ্যানেলের নাম ২ মিনিট পর পর আপডেট করার নতুন ফাংশন
 function startVoiceStatsUpdater(guild) {
+    updateStatsChannel(guild);
     setInterval(async () => {
-        try {
-            const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
-            if (!channel) return;
+        await updateStatsChannel(guild);
+    }, 2 * 60 * 1000);
+}
 
-            // সব মেম্বারদের ক্যাশ বা ফেচ করে নেওয়া হচ্ছে সঠিক হিসাবের জন্য
-            const members = await guild.members.fetch({ withPresences: true });
-            
-            const totalMembers = members.size;
-            const totalBots = members.filter(m => m.user.bot).size;
-            
-            // অনলাইন, আইডল (idle), বা ডু নট ডিস্টার্ব (dnd) মুডে থাকা ইউজারদের অনলাইন ধরা হবে
-            const onlineMembers = members.filter(m => !m.user.bot && m.presence && ["online", "idle", "dnd"].includes(m.presence.status)).size;
+async function updateStatsChannel(guild) {
+    try {
+        const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
+        if (!channel) return;
 
-            // ভয়েস চ্যানেলের নতুন নাম তৈরি (আপনার পছন্দ অনুযায়ী ফরম্যাট পরিবর্তন করতে পারেন)
-            const newName = `Total: ${totalMembers} | Online: ${onlineMembers} | Bots: ${totalBots}`;
-            
-            if (channel.name !== newName) {
-                await channel.setName(newName);
-                console.log(`📊 Voice channel stats updated: ${newName}`);
-            }
-        } catch (err) {
-            console.error("Error updating voice channel stats:", err);
+        const members = await guild.members.fetch({ withPresences: true });
+        
+        const totalMembers = members.size;
+        const totalBots = members.filter(m => m.user.bot).size;
+        const onlineMembers = members.filter(m => !m.user.bot && m.presence && ["online", "idle", "dnd"].includes(m.presence.status)).size;
+
+        const newName = `total member: ${totalMembers}  online: ${onlineMembers} bot: ${totalBots}`;
+        
+        if (channel.name !== newName) {
+            await channel.setName(newName);
+            console.log(`📊 Voice channel name updated to: ${newName}`);
         }
-    }, 2 * 60 * 1000); // ২ মিনিট (১২০,০০০ মিলিসেকেন্ড) পর পর রান হবে
+    } catch (err) {
+        console.error("❌ Error modifying voice channel name:", err);
+    }
 }
 
 // ================================
@@ -375,10 +383,9 @@ client.on("interactionCreate", async (interaction) => {
         if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${value}`; }
         else if (interaction.customId === "select_report_category") { type = "report"; embedColor = "#ED4245"; buttonId = `create_report_${value}`; }
         else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${value}`; }
-        else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${value}`; } // 🎯 পেমেন্ট রিডাইরেকশন গেটওয়ে ট্রিগার
+        else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${value}`; }
 
         if (type === "order") {
-            // 🎯 গেটওয়ে এবং ট্রানজেকশন প্যানেল জেনারেট
             const payEmbed = new EmbedBuilder()
                 .setTitle(`💳 Payment Gateway: ${value.toUpperCase().replace("_", " ")}`)
                 .setDescription(`আপনার অর্ডারটি প্রসেস করতে নিচে দেওয়া **"Pay via Gateway"** বাটনে ক্লিক করে অটোমেটিক পেমেন্ট সম্পন্ন করুন এবং প্রাপ্ত Transaction ID সাবমিট করুন।`)
@@ -394,7 +401,6 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
-    // 🎯 Transaction Modal পপআপ যখন কাস্টমার Pay বাটনে চাপ দিবে
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const category = interaction.customId.split("_")[2];
         const modal = new ModalBuilder()
@@ -412,7 +418,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    // 🎯 Modal সাবমিট হ্যান্ডলার (অটোমেটিক চ্যানেল তৈরি এবং ট্র্যাকিং সিস্টেমে TxnID সেভ)
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const category = interaction.customId.split("_")[2];
@@ -433,7 +438,7 @@ client.on("interactionCreate", async (interaction) => {
         
         const insideEmbed = new EmbedBuilder()
             .setTitle(` Welcome to your Paid Order Channel`)
-            .setDescription(`স্বাগতম ${interaction.user}!\n**ক্যাটাগরি:** ${category.toUpperCase()}\n**Transaction ID:** \`${txnId}\` (অটোমেটিক ডাটাবেজে ভেরিফিকেশনের জন্য পাঠানো হয়েছে)`)
+            .setDescription(`স্বাগতম ${interaction.user}!\n**ক্যাটাগরি:** ${category.toUpperCase()}\n**Transaction ID:** \`${txnId}\``)
             .setColor("Green");
         
         await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [
@@ -461,7 +466,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`✅ পেমেন্ট সফল হয়েছে এবং আপনার অর্ডার চ্যানেল তৈরি হয়েছে: ${privateChannel}`);
     }
 
-    // টিকিট/রিপোর্ট/কাস্টমার চ্যানেল ক্রিয়েট হওয়া
     if (interaction.isButton() && interaction.customId.startsWith("create_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const dataArr = interaction.customId.split("_");
@@ -505,7 +509,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে: ${privateChannel}`);
     }
 
-    // স্টাফ ক্লেইম করলে
     if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
@@ -532,7 +535,6 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
-    // টিকিট ক্লোজ করলে
     if (interaction.isButton() && interaction.customId.startsWith("close_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
@@ -563,7 +565,6 @@ client.on("interactionCreate", async (interaction) => {
         setTimeout(async () => { await interaction.channel.delete().catch(() => {}); }, 5000);
     }
 
-    // Ban/Timeout প্যানেল বাটন ক্লিক হ্যান্ডলার
     if (interaction.isButton() && interaction.customId.startsWith("ban_panel_")) {
         const type = interaction.customId.split("_")[2];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
@@ -582,7 +583,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "⚠️ ফানি বা ফেক উদ্দেশ্যে এটি ওপেন করার কারণে মেম্বারকে কতদিনের জন্য ব্যান/টাইমআউট করতে চান তা নিচে থেকে সিলেক্ট করুন।", components: [new ActionRowBuilder().addComponents(selectMenu)], flags: [MessageFlags.Ephemeral] });
     }
 
-    // ড্রপডাউন থেকে সিলেক্ট করার পর মেম্বারকে ব্যান ও ডেটাবেজে সেভ করার হ্যান্ডলার
     if (interaction.isStringSelectMenu() && interaction.customId === "execute_ticket_ban") {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const choice = interaction.values[0];
@@ -629,12 +629,11 @@ client.on("interactionCreate", async (interaction) => {
     }
 });
 
-// Panels UI Builders For Prefix Commands
+// Panels UI Builders
 function getTicketPanel() { const embed = new EmbedBuilder().setTitle("🎫 Premium Support Ticket").setColor("#5865F2"); const menu = new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("🛒 সিলেক্ট করুন...").addOptions([{ label: "Discord Bot Development", value: "bot_dev" }]); return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; }
 function getReportPanel() { const embed = new EmbedBuilder().setTitle("🚨 Report Center").setColor("#ED4245"); const menu = new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("⚠️ সিলেক্ট করুন...").addOptions([{ label: "Bug Report", value: "bug_report" }]); return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; }
 function getCustomerPanel() { const embed = new EmbedBuilder().setTitle("💬 CUSTOMER-SUPPORT").setColor("#57F287"); const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("❓ সিলেক্ট করুন...").addOptions([{ label: "General Support", value: "general_support" }]); return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; }
 
-// 🎯 নতুন পেমেন্ট গেটওয়ে প্যানেল মেকার ফাংশন
 function getPaymentPanel() { 
     const embed = new EmbedBuilder()
         .setTitle("💳 AUTOMATIC PAYMENT GATEWAY PANEL")
@@ -662,14 +661,13 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(getReportPanel());
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(getCustomerPanel());
     
-    // 🎯 নতুন কমান্ড হ্যান্ডলার পেমেন্ট প্যানেলের জন্য
     if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && message.channelId === CHANNELS.PAYMENT_PANEL) {
         return message.channel.send(getPaymentPanel());
     }
 });
 
 // ================================
-// 🚀 PART 5 - Live Member Events (Join & Leave + Anti-Bypass Guard)
+// 🚀 PART 5 - Live Member Events
 // ================================
 
 client.on("guildMemberAdd", async (member) => {
@@ -725,7 +723,7 @@ client.on("guildMemberRemove", async (member) => {
 });
 
 // ================================
-// 🔄 PART 6 - Ready Event + Offline Bot Auto Recovery Sync
+// 🔄 PART 6 - Ready Event & Sync (SMART OFFLINE SYNC)
 // ================================
 
 client.once("ready", async () => {
@@ -734,24 +732,28 @@ client.once("ready", async () => {
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
     if (!guild) return;
 
+    // ১. ভয়েস চ্যানেলে জয়েন করানো
     await connectVoice(guild);
     
-    // 🎯 বট রেডি হওয়ার পর ভয়েস স্ট্যাটাস আপডেট লুপ চালু করা হলো
+    // ২. ভয়েস চ্যনেল নাম স্ট্যাটাস লুপ শুরু
     startVoiceStatsUpdater(guild);
 
     const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
 
     try {
-        console.log("🔍 Checking for offline actions...");
-        const currentMembers = await guild.members.fetch({ withPresences: true });
+        console.log("🔍 Checking for offline actions smartly...");
+        const currentMembers = await guild.members.fetch();
         const savedMembers = getSavedMembers();
-        const logs = getWelcomeLogs();
         const punishments = getPunishments();
         const now = Date.now();
 
+        // 🎯 সমাধান: যারা কেবল ডাটাবেজে নেই কিন্তু বর্তমানে সার্ভারে আছে (অর্থাৎ বট অফলাইন থাকার সময় নতুন জয়েন করেছে)
         const missedJoins = currentMembers.filter(m => !savedMembers.includes(m.id) && !m.user.bot);
+        
         if (missedJoins.size > 0 && welcomeChannel) {
+            console.log(`📡 Found ${missedJoins.size} members who joined while the bot was offline!`);
             for (const [, member] of missedJoins) {
+                // প্যানেল মিউট বা বাইপাস চেক
                 if (punishments[member.id] && punishments[member.id].status === "Muted") {
                     const record = punishments[member.id];
                     if (!record.expiresAt || record.expiresAt > now) {
@@ -759,39 +761,32 @@ client.once("ready", async () => {
                         await member.timeout(remaining, "Offline Sync Bypass Guard").catch(()=>{});
                     }
                 }
-                const embed = buildDynamicWelcomeEmbed(member, "unverified", true);
-                const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [embed] }).catch(() => {});
+                
+                // 🚀 শুধুমাত্র অফলাইনে জয়েন করা এই স্পেসিফিক মেম্বারদের জন্য একবারই মেসেজ যাবে
+                const embed = buildDynamicWelcomeEmbed(member, "unverified", true); // 'true' মানে অফলাইন ফ্ল্যাগ অন হবে ফুটার নোটিফিকেশনের জন্য
+                const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}! (অফলাইন রিকভারি)`, embeds: [embed] }).catch(() => {});
                 if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: true });
             }
         }
 
-        const currentMemberIds = currentMembers.map(m => m.id);
-        const missedLeaves = savedMembers.filter(id => !currentMemberIds.includes(id));
-        if (missedLeaves.length > 0 && welcomeChannel) {
-            for (const leftId of missedLeaves) {
-                const userLog = logs[leftId];
-                if (userLog) {
-                    try {
-                        const msg = await welcomeChannel.messages.fetch(userLog.messageId);
-                        if (msg) {
-                            const mockMember = { id: leftId, userId: leftId, user: { tag: "Offline Left Member" } };
-                            const updatedEmbed = buildDynamicWelcomeEmbed(mockMember, "left", true);
-                            await msg.edit({ content: `🚫 একটি ইউজার বট অফলাইনে থাকা অবস্থায় সার্ভার ত্যাগ করেছেন।`, embeds: [updatedEmbed] });
-                        }
-                    } catch (e) {}
-                }
-            }
-        }
-
+        // ডাটাবেজ কারেন্ট মেম্বার দিয়ে সিঙ্ক করে নেওয়া
         const finalIds = currentMembers.filter(m => !m.user.bot).map(m => m.id);
         saveMembers(finalIds);
-        console.log("✅ Offline sync completed successfully.");
-    } catch (err) { console.error("Sync Recovery Error:", err); }
+        console.log("✅ Smart Sync completed successfully.");
+    } catch (err) { 
+        console.error("Sync Error:", err); 
+    }
 });
 
-client.on("voiceStateUpdate", async () => {
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
-    if (guild && guild.members.me && !guild.members.me.voice.channel) await connectVoice(guild);
+// ভয়েস ডিসকানেক্ট গার্ড
+client.on("voiceStateUpdate", async (oldState, newState) => {
+    if (newState.id === client.user.id && !newState.channelId) {
+        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+        if (guild) {
+            console.log("🔄 Disconnected from voice. Reconnecting...");
+            setTimeout(() => connectVoice(guild), 5000);
+        }
+    }
 });
 
 function startBot() { client.login(TOKEN).catch(() => { setTimeout(startBot, 5000); }); }
