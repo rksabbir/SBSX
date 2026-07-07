@@ -27,7 +27,7 @@ const {
     joinVoiceChannel
 } = require("@discordjs/voice");
 
-// Render Environment Variable থেকে সরাসরি অবজেক্ট লোড
+// ✅ আপনার আগের রেনডার Environment Variable থেকে সরাসরি অবজেক্ট লোড করার পারফেক্ট লজিক
 let serviceAccount;
 try {
     if (process.env.FIREBASE_CONFIG) {
@@ -64,7 +64,7 @@ const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 const VOICE_CHANNEL_ID = "1523230098193383595";
 
-// আপনার দেওয়া নতুন অর্ডার ট্র্যাকিং চ্যানেল আইডি
+// অর্ডার ট্র্যাকিং চ্যানেল আইডি
 const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
 
 const ROLES = {
@@ -77,7 +77,7 @@ const CHANNELS = {
     TICKET_PANEL: "1488339982627115118",
     REPORT_PANEL: "1488340441115004999",
     CUSTOMER_PANEL: "1488340017938960484",
-    BUY_PANEL: "1488339666368462858", // 👈 আপনার কাঙ্ক্ষিত চ্যানেল আইডি
+    BUY_PANEL: "1488339666368462858", 
     PAYMENT_PANEL: "1488333503761219746" 
 };
 
@@ -115,20 +115,35 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// Firebase ড্রপডাউন অপশন নিয়ে আসার ফাংশন
-async function fetchFirebaseOptions(panelType) {
+// Firebase থেকে অপশন, কাস্টম ডেসক্রিপশন এবং ইমেজ একসাথে নিয়ে আসার ফাংশন
+async function fetchFirebasePanelData(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
-        const data = snapshot.val();
-        if (!data) return [{ label: "No Options Found in DB", value: "none" }];
+        const data = snapshot.val() || {};
         
-        return Object.keys(data).map(key => ({
-            label: data[key],
-            value: key
-        }));
+        // ডেসক্রিপশন এবং ইমেজ ফায়ারবেস থেকে ফিল্টার করা হচ্ছে
+        const customDescription = data.description || null;
+        const customImage = data.image || null;
+
+        const options = Object.keys(data)
+            .filter(key => key !== "description" && key !== "image")
+            .map(key => ({
+                label: data[key],
+                value: key
+            }));
+
+        if (options.length === 0) {
+            options.push({ label: "No Options Found in DB", value: "none" });
+        }
+
+        return { options, customDescription, customImage };
     } catch (error) {
-        console.error(`❌ Firebase Options Fetch Error (${panelType}):`, error);
-        return [{ label: "Error Loading from Database", value: "error" }];
+        console.error(`❌ Firebase Panel Data Fetch Error (${panelType}):`, error);
+        return { 
+            options: [{ label: "Error Loading from Database", value: "error" }], 
+            customDescription: null, 
+            customImage: null 
+        };
     }
 }
 
@@ -451,33 +466,114 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ================================
-// ⚡ PART 4 - Live UI Panels Templates
+// ⚡ PART 4 - Live UI Panels Templates (বড় ও লম্বালম্বি প্রফেশনাল ডিজাইন)
 // ================================
 
 async function getDynamicTicketPanel() { 
-    const options = await fetchFirebaseOptions("ticket");
-    const embed = new EmbedBuilder().setTitle("🎫 Premium Support Ticket Panel").setDescription("আপনার কাঙ্ক্ষিত প্রিমিয়াম ডেভেলপমেন্ট বা সাপোর্টের জন্য নিচে থেকে অপশনটি সিলেক্ট করুন।").setImage(COVER_IMAGES.TICKET).setColor("#5865F2"); 
+    const { options, customDescription, customImage } = await fetchFirebasePanelData("ticket");
+    
+    const defaultDesc = `🛑 **Premium Support & Development Center** 🛑\n\n` +
+                        `> আমাদের অফিসিয়াল মেম্বারদের জন্য ডেভেলপমেন্ট এবং কাস্টম প্রিমিয়াম সাপোর্ট প্যানেল।\n\n` +
+                        `✨ **পরিষেবাসমূহ:**\n` +
+                        `┌ 🛠️ কাস্টম বট এবং সিস্টেম ডেভেলপমেন্ট\n` +
+                        `├ ⚡ হাই-স্পিড সার্ভার কনফিগারেশন সাপোর্ট\n` +
+                        `└ 🛡️ অ্যাডভান্সড সিকিউরিটি অ্যান্ড MANAGEMENT\n\n` +
+                        `📌 **নির্দেশনা:**\n` +
+                        `নিচের ড্রপডাউন মেনু থেকে আপনার কাঙ্ক্ষিত সাপোর্টের ধরন সিলেক্ট করুন। একটি সম্পূর্ণ আলাদা প্রাইভেট চ্যানেল তৈরি হবে যেখানে আমাদের ডেডিকেটেড স্টাফ টিম আপনাকে সাহায্য করবে।`;
+
+    const embed = new EmbedBuilder()
+        .setTitle("🎫 PREMIUM SUPPORT TICKET PANEL")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.TICKET)
+        .setColor("#5865F2")
+        .addFields(
+            { name: "⏰ কাজের সময়", value: "⏱️ ২৪/৭ ঘন্টা অনলাইন সাপোর্ট ব্যবস্থা", inline: false },
+            { name: "⚠️ সতর্কবার্তা", value: "ফানি বা ফেক কোনো টিকিট ওপেন করলে আইডি সরাসরি মিউট বা প্যানেল ব্যান হবে।", inline: false }
+        )
+        .setFooter({ text: "Premium Ticket System • Live Sync Active", iconURL: client.user.displayAvatarURL() });
+
     const menu = new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("🛒 আপনার সাপোর্ট ক্যাটাগরি সিলেক্ট করুন...").addOptions(options); 
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
 }
 
 async function getDynamicReportPanel() { 
-    const options = await fetchFirebaseOptions("report");
-    const embed = new EmbedBuilder().setTitle("🚨 Server Report Center").setDescription("সার্ভারের যেকোনো বাগ (Bug) অথবা কোনো মেম্বার/স্টাফের বিরুদ্ধে রিপোর্ট করতে নিচে অপশনটি বেছে নিন।").setImage(COVER_IMAGES.REPORT).setColor("#ED4245"); 
+    const { options, customDescription, customImage } = await fetchFirebasePanelData("report");
+    
+    const defaultDesc = `🚨 **Server Automated Report & Complaint Center** 🚨\n\n` +
+                        `> সার্ভারের সুশৃঙ্খল পরিবেশ বজায় রাখার জন্য আমাদের এই সিকিউরিটি জোন।\n\n` +
+                        `🛡️ **রিপোর্ট ক্যাটাগরি:**\n` +
+                        `┌ 🐛 সার্ভার বাগ (Server Bug Reports)\n` +
+                        `├ 👤 মেম্বার কমপ্লেন (User Violations)\n` +
+                        `└ 💼 স্টাফ অপব্যবহার (Staff Abuse Reports)\n\n` +
+                        `📌 **নিয়মাবলী:**\n` +
+                        `যেকোনো অন্যায়ের বিরুদ্ধে অভিযোগ করতে ড্রপডাউন ব্যবহার করুন। আপনার দেওয়া স্ক্রিনশট বা প্রুফ গোপন রাখা হবে এবং এডমিন প্যানেল সরাসরি একশন নিবেন।`;
+
+    const embed = new EmbedBuilder()
+        .setTitle("🚨 SERVER COMPLAINT & REPORT PANEL")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.REPORT)
+        .setColor("#ED4245")
+        .addFields(
+            { name: "⚖️ বিচার প্রক্রিয়া", value: "রিপোর্ট সাবমিট করার পর সর্বোচ্চ ১২ ঘন্টার মধ্যে একশন নেওয়া হবে।", inline: false },
+            { name: "🔒 গোপনীয়তা", value: "আপনার পরিচয় সম্পূর্ণ গোপন রাখা সুনিশ্চিত করা হবে।", inline: false }
+        )
+        .setFooter({ text: "Security System • Live Sync Active", iconURL: client.user.displayAvatarURL() });
+
     const menu = new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("⚠️ আপনার রিপোর্টের ধরন সিলেক্ট করুন...").addOptions(options); 
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
 }
 
 async function getDynamicCustomerPanel() { 
-    const options = await fetchFirebaseOptions("customer");
-    const embed = new EmbedBuilder().setTitle("💬 General Customer Support Panel").setDescription("সার্ভার বা সাধারণ যেকোনো সাহায্য ও জিজ্ঞাসার জন্য নিচের ড্রপডাউন মেনুটি ব্যবহার করুন।").setImage(COVER_IMAGES.CUSTOMER).setColor("#57F287"); 
+    const { options, customDescription, customImage } = await fetchFirebasePanelData("customer");
+    
+    const defaultDesc = `💬 **General Customer Care & Help Counter** 💬\n\n` +
+                        `> সার্ভারের সাধারণ মেম্বারদের যেকোনো সমস্যা বা জিজ্ঞাসার জন্য ওয়ান-স্টপ সলিউশন।\n\n` +
+                        `❓ **আমাদের সাহায্য ক্ষেত্র:**\n` +
+                        `┌ ℹ️ সার্ভার ফিচার সম্পর্কিত যেকোনো সাধারণ তথ্য\n` +
+                        `├ 🤝 পার্টনারশিপ বা কোলাবোরেশন আবেদন\n` +
+                        `└ 📢 প্রমোশন বা কাস্টম প্রপোজাল ইনফো\n\n` +
+                        `📌 **কিভাবে সাহায্য পাবেন?**\n` +
+                        `ড্রপডাউন থেকে আপনার প্রশ্নের বিষয়বস্তুটি সিলেক্ট করুন। আমাদের কাস্টমার কেয়ার প্রতিনিধি খুব দ্রুত আপনার সাথে যোগাযোগ করবে।`;
+
+    const embed = new EmbedBuilder()
+        .setTitle("💬 GENERAL CUSTOMER SUPPORT CENTER")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.CUSTOMER)
+        .setColor("#57F287")
+        .addFields(
+            { name: "👥 দায়িত্বপ্রাপ্ত টিম", value: "🛟 কাস্টমার কেয়ার এক্সিকিউটিভ", inline: true },
+            { name: "⚡ রেসপন্স টাইম", value: "⏱️ ৫ থেকে ১৫ মিনিট", inline: true }
+        )
+        .setFooter({ text: "Customer Support • Live Sync Active", iconURL: client.user.displayAvatarURL() });
+
     const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...").addOptions(options); 
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
 }
 
 async function getDynamicPaymentPanel() { 
-    const options = await fetchFirebaseOptions("payment");
-    const embed = new EmbedBuilder().setTitle("💳 Automatic Payment Gateway Panel").setDescription("আমাদের প্রিমিয়াম সার্ভিসসমূহ ক্রয় করতে নিচের মেনু থেকে পণ্যটি সিলেক্ট করুন এবং পেমেন্ট সম্পন্ন করুন।").setImage(COVER_IMAGES.PAYMENT).setColor("#3498DB"); 
+    const { options, customDescription, customImage } = await fetchFirebasePanelData("payment");
+    
+    const defaultDesc = `💳 **Premium Store & Automatic Payment Gateway** 💳\n\n` +
+                        `> আমাদের যেকোনো প্রিমিয়াম সার্ভিস, লাইসেন্স বা মেম্বারশিপ নেওয়ার ডিজিটাল শপ।\n\n` +
+                        `🛍️ **অর্ডার করার নিয়ম:**\n` +
+                        `┌ 1️⃣ নিচে দেওয়া ড্রপডাউন মেনু থেকে আপনার প্রোডাক্ট বেছে নিন।\n` +
+                        `├ 2️⃣ বট আপনাকে একটি ইনস্ট্যান্ট গেটওয়ে লিঙ্ক ও পেমেন্ট ডিটেইলস দেবে।\n` +
+                        `├ 3️⃣ পেমেন্ট শেষে ট্রানজেকশন আইডি (TxnID) কোডটি সাবমিট করুন।\n` +
+                        `└ 4️⃣ সিস্টেম অটোমেটিক আপনার নামে একটি প্রিমিয়াম অর্ডার চ্যানেল খুলে দেবে।\n\n` +
+                        `🔥 **নিরাপত্তা নিশ্চয়তা:**\n` +
+                        `এটি সম্পূর্ণ সুরক্ষিত ও অটোমেটেড ট্র্যাকিং সিস্টেম, যা সরাসরি ডাটাবেজের সাথে সিঙ্ক করা।`;
+
+    const embed = new EmbedBuilder()
+        .setTitle("🛍️ AUTOMATED SHOP & PAYMENT PANELS")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.PAYMENT)
+        .setColor("#3498DB")
+        .addFields(
+            { name: "💳 সাপোর্টেড পেমেন্ট", value: "🚀 বিকাশ, রকেট, নগদ এবং ইনস্ট্যান্ট গেটওয়ে সিস্টেম", inline: false },
+            { name: "🛡️ সেফটি নোট", value: "পেমেন্ট স্লিপ অথবা TxnID কারও সাথে শেয়ার করবেন না।", inline: false }
+        )
+        .setFooter({ text: "Automated Payment Bot • Live Sync Active", iconURL: client.user.displayAvatarURL() });
+
     const menu = new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("🛍️ আপনার কাঙ্ক্ষিত মেম্বারশিপ/সার্ভিস সিলেক্ট করুন...").addOptions(options); 
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
 }
@@ -494,7 +590,6 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(await getDynamicReportPanel());
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
     
-    // ✅ ফিক্সড: এখন BUY_PANEL (1488339666368462858) অথবা PAYMENT_PANEL দুই জায়গাতেই এই কমান্ডটি কাজ করবে।
     if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && 
         (message.channelId === CHANNELS.PAYMENT_PANEL || message.channelId === CHANNELS.BUY_PANEL)) {
         return message.channel.send(await getDynamicPaymentPanel());
@@ -502,7 +597,7 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================================
-// 🔥 REALTIME FIREBASE SYNC TO DISCORD (LIVE EDIT CODES)
+// 🔥 REALTIME FIREBASE SYNC TO DISCORD (AUTO UPDATE ON LIVE CHANGES)
 // ================================
 
 function listenToFirebaseUpdates() {
