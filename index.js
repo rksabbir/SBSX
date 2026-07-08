@@ -251,12 +251,12 @@ client.on("messageDelete", async (message) => {
 });
 
 // ================================
-// 🎮 Interaction Handler (FIXED)
+// 🎮 Interaction Handler (FIXED TICKET & VERIFY)
 // ================================
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
-    // 1️⃣ FIX: Universal Verification Button Handler
+    // 1️⃣ FIX: Verification Button Handler 
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
@@ -270,10 +270,10 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("✅ আপনি সফলভাবে ভেরিফাই হয়েছেন! সার্ভারে আপনাকে স্বাগতম।");
     }
 
-    // 2️⃣ FIX: Order Channel Staff Button Handlers
+    // 2️⃣ FIX: Ticket Channel Staff Button Handlers (No more Interaction Failed)
     if (interaction.isButton() && interaction.customId === "claim_order") {
         await interaction.deferReply();
-        return interaction.editReply(`🛟 এই অর্ডারটি এখন <@${interaction.user.id}> হ্যান্ডেল করছেন।`);
+        return interaction.editReply(`🛟 এই অর্ডার/টিকিটটি এখন স্টাফ <@${interaction.user.id}> হ্যান্ডেল করছেন।`);
     }
 
     if (interaction.isButton() && interaction.customId === "approve_order") {
@@ -289,7 +289,26 @@ client.on("interactionCreate", async (interaction) => {
                 { label: "⭐⭐⭐ Average", value: "3_stars" }
             ])
         );
-        return interaction.reply({ content: "🔒 **এই অর্ডার চ্যানেলটি বন্ধ করা হচ্ছে।** চ্যানেল ডিলিট হওয়ার আগে অনুগ্রহ করে রেটিং দিন:", components: [ratingRow] });
+        
+        // Create Transcript backup (Advanced logging) BEFORE deleting
+        try {
+            const logChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
+            if (logChannel) {
+                const fetchedMessages = await interaction.channel.messages.fetch({ limit: 100 });
+                let transcriptText = `--- TICKET BACKUP FOR #${interaction.channel.name} ---\n\n`;
+                Array.from(fetchedMessages.values()).reverse().forEach(msg => {
+                    transcriptText += `[${msg.createdAt.toLocaleString()}] ${msg.author.tag}: ${msg.content}\n`;
+                });
+                const fileName = `transcript-${interaction.channel.name}.txt`;
+                fs.writeFileSync(fileName, transcriptText, "utf-8");
+                await logChannel.send({ content: `📜 **#${interaction.channel.name}** এর চ্যাট ব্যাকআপ/টান্সক্রিপ্ট:`, files: [fileName] });
+                fs.unlinkSync(fileName);
+            }
+        } catch(e){}
+
+        await interaction.reply({ content: "🔒 **এই অর্ডার চ্যানেলটি ১৫ সেকেন্ডের মধ্যে ডিলিট হবে।** চলে যাওয়ার আগে কাস্টমারকে নিচে রেটিং দেওয়ার জন্য অনুরোধ করা হলো:", components: [ratingRow] });
+        setTimeout(async () => { await interaction.channel.delete().catch(()=>{}); }, 15000);
+        return;
     }
 
     // Modal Opening Trigger
@@ -347,10 +366,10 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply(`✅ অর্ডার চ্যানেল তৈরি হয়েছে: ${privateChannel}`);
     }
 
-    // Close & Feedback Logic
+    // Close Button from standard tickets
     if (interaction.isButton() && interaction.customId.startsWith("close_")) {
         const type = interaction.customId.split("_")[1];
-        if (type === "order") return; // হ্যান্ডেলড ওপরের সেকশনে
+        if (type === "order") return; 
         
         const ratingRow = new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`submit_feedback_${type}`).setPlaceholder("⭐ রেটিং দিন...").addOptions([
