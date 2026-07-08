@@ -54,7 +54,7 @@ admin.initializeApp({
 const db = admin.database();
 
 const app = express();
-app.get("/", (req, res) => { res.send("Bot is running perfectly with Realtime DB Sync!"); });
+app.get("/", (req, res) => { res.send("Bot is running perfectly with Realtime DB Sync & Original Commands!"); });
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
@@ -264,17 +264,132 @@ client.on("messageDelete", async (message) => {
     }
 });
 
-// Automod + Activity XP System
+// Automod + Activity XP System + ALL COMMANDS
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
-    if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
     
     const userId = message.author.id; 
-    let triggerAutomod = false; 
-    let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // 🛑 Caps-Lock Protection (৭০% এর বেশি বড় হাতের অক্ষর)
+    // ==========================================
+    // ⚙️ ORIGINAL PANEL SETUPS & TEXT COMMANDS
+    // ==========================================
+    if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) {
+        
+        // ১. মেম্বার সিঙ্ক ব্যাকআপ কমান্ড
+        if (contentLower === "!syncmembers") {
+            try {
+                await message.guild.members.fetch();
+                const finalIds = [...message.guild.members.cache.filter(m => !m.user.bot).keys()];
+                saveMembers(finalIds);
+                await message.reply("✅ মেম্বার ডাটাবেজ সফলভাবে সিঙ্ক করা হয়েছে!");
+            } catch (err) { console.error(err); }
+            return;
+        }
+
+        // ২. ভেরিফিকেশন প্যানেল (!setup)
+        if (contentLower === "!setup") {
+            await message.delete().catch(() => {});
+            const embed = createVerificationEmbed();
+            await message.channel.send({ embeds: [embed], components: [verificationRow] });
+            return;
+        }
+
+        // ৩. টিকিট প্যানেল (!ticket)
+        if (contentLower === "!ticket") {
+            await message.delete().catch(() => {});
+            const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("ticket");
+            const embed = new EmbedBuilder()
+                .setTitle(fullData.title || "🎫 PREMIUM SUPPORT TICKET PANEL")
+                .setDescription(customDescription || "নিচের ড্রপডাউন থেকে আপনার ক্যাটাগরি সিলেক্ট করুন।")
+                .setColor("#5865F2")
+                .setImage(customImage || COVER_IMAGES.TICKET);
+            
+            const row = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("Choose a support category...").addOptions(options)
+            );
+            await message.channel.send({ embeds: [embed], components: [row] });
+            return;
+        }
+
+        // ৪. রিপোর্ট প্যানেল (!report)
+        if (contentLower === "!report") {
+            await message.delete().catch(() => {});
+            const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("report");
+            const embed = new EmbedBuilder()
+                .setTitle(fullData.title || "🚨 SERVER COMPLAINT & REPORT PANEL")
+                .setDescription(customDescription || "কাউকে রিপোর্ট করতে নিচের অপশন সিলেক্ট করুন।")
+                .setColor("#ED4245")
+                .setImage(customImage || COVER_IMAGES.REPORT);
+            
+            const row = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("Choose a report category...").addOptions(options)
+            );
+            await message.channel.send({ embeds: [embed], components: [row] });
+            return;
+        }
+
+        // ৫. কাস্টমার প্যানেল (!customer)
+        if (contentLower === "!customer") {
+            await message.delete().catch(() => {});
+            const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("customer");
+            const embed = new EmbedBuilder()
+                .setTitle(fullData.title || "💬 GENERAL CUSTOMER SUPPORT CENTER")
+                .setDescription(customDescription || "যেকোনো সাধারণ সাহায্যের জন্য ড্রপডাউনটি ব্যবহার করুন।")
+                .setColor("#57F287")
+                .setImage(customImage || COVER_IMAGES.CUSTOMER);
+            
+            const row = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("Choose an inquiry type...").addOptions(options)
+            );
+            await message.channel.send({ embeds: [embed], components: [row] });
+            return;
+        }
+
+        // ৬. শপ ও পেমেন্ট প্যানেল (!payment / !buy)
+        if (contentLower === "!payment" || contentLower === "!buy") {
+            await message.delete().catch(() => {});
+            const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("payment");
+            const embed = new EmbedBuilder()
+                .setTitle(fullData.title || "🛍️ AUTOMATED SHOP & PAYMENT PANELS")
+                .setDescription(customDescription || "আমাদের সার্ভিস বা প্যাকেজ কিনতে নিচের ড্রপডাউন ব্যবহার করুন।")
+                .setColor("#9B59B6")
+                .setImage(customImage || COVER_IMAGES.PAYMENT);
+            
+            const row = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("Select a service to order...").addOptions(options)
+            );
+            await message.channel.send({ embeds: [embed], components: [row] });
+            return;
+        }
+
+        // ৭. অর্ডার গাইড প্যানেল (!guide)
+        if (contentLower === "!guide") {
+            await message.delete().catch(() => {});
+            const panels = globalFirebaseCache.panels || {};
+            const guideData = panels["order_guide"] || {};
+            
+            const embed = new EmbedBuilder()
+                .setTitle(guideData.title || "📦 HOW TO ORDER & SYSTEM GUIDE")
+                .setDescription(guideData.description || "আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী।")
+                .setColor("#FFFF00")
+                .setImage(guideData.image || COVER_IMAGES.PAYMENT);
+                
+            await message.channel.send({ embeds: [embed] });
+            return;
+        }
+    }
+
+    // হোয়াইটলিস্ট চেক (এডমিনদের জন্য অটোমড বাইপাস)
+    if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
+
+    // ==========================================
+    // 🚨 AUTOMOD SYSTEM
+    // ==========================================
+    let triggerAutomod = false; 
+    let reason = "";
+
+    // 🛑 Caps-Lock Protection
     const upperCount = message.content.replace(/[^A-Z]/g, "").length;
     const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
     if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
@@ -296,7 +411,6 @@ client.on("messageCreate", async (message) => {
             if (nextXp >= neededXp) {
                 nextXp -= neededXp;
                 nextLevel += 1;
-                
                 message.channel.send(`🎉 অভিনন্দন <@${userId}>! আপনি লেভেল **${nextLevel}** এ উন্নীত হয়েছেন।`).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
                 message.member.roles.add(LEVEL_ROLE_ID).catch(() => {});
             }
@@ -313,7 +427,7 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // লাইভ লিংক রেসপন্স (রিয়েল-টাইম ক্যাশ থেকে লোড হচ্ছে)
+    // লাইভ লিংক রেসপন্স
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
         const dbLink = (globalFirebaseCache.settings && globalFirebaseCache.settings.verification_link) || "কোনো লিংক ফায়ারবেসে পাওয়া যায়নি।";
         return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${dbLink}\``);
@@ -352,7 +466,7 @@ function createVerificationEmbed() { return new EmbedBuilder().setTitle("🚨 Ve
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
-    // ⭐ [সংশোধিত ও ফিক্সড]: রেটিং বাটনের ইন্টারঅ্যাকশন হ্যান্ডেলিং (সবার উপরে দ্রুত অ্যাকনলেজ রেসপন্স)
+    // রেটিং বাটনের ইন্টারঅ্যাকশন হ্যান্ডেলিং
     if (interaction.isButton() && interaction.customId.startsWith("rate_staff_")) {
         try {
             await interaction.deferUpdate().catch(() => {}); 
@@ -361,9 +475,7 @@ client.on("interactionCreate", async (interaction) => {
                 content: `❤️ রেটিং দেওয়ার জন্য আপনাকে ধন্যবাদ! আপনি আমাদের সাপোর্ট টিমকে **${rating} স্টার** দিয়েছেন।`, 
                 components: [] 
             });
-        } catch (err) {
-            console.error("Rating Button Error:", err);
-        }
+        } catch (err) { console.error(err); }
         return;
     }
 
@@ -389,7 +501,7 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
-    // Giveaway বাটনে ক্লিক ট্র্যাকিং
+    // Giveaway জয়েন লজিক
     if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
         const gwId = interaction.customId.split("_")[2];
         const participantRef = db.ref(`giveaways/${gwId}/participants/${interaction.user.id}`);
@@ -413,7 +525,6 @@ client.on("interactionCreate", async (interaction) => {
     // এডভান্সড টিকেট রেটিং ফিডব্যাক সিস্টেম
     if (interaction.isButton() && interaction.customId.startsWith("star_rating_")) {
         const [, , stars, staffId] = interaction.customId.split("_");
-        
         const modal = new ModalBuilder().setCustomId(`modal_feedback_${stars}_${staffId}`).setTitle("📝 Ticket Support Feedback");
         const commentInput = new TextInputBuilder().setCustomId("feedback_comment").setLabel("আপনার মূল্যবান মতামতটি লিখুন (ঐচ্ছিক)").setStyle(TextInputStyle.Paragraph).setRequired(false);
         modal.addComponents(new ActionRowBuilder().addComponents(commentInput));
@@ -442,7 +553,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // ড্রপডাউন সিলেকশন এবং কুপন মোডাল ট্রিগার (লাইভ ক্যাশ ভেরিফাইড)
+    // ড্রপডাউন সিলেকশন এবং কুপন মোডাল ট্রিগার
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -652,18 +763,14 @@ client.on("interactionCreate", async (interaction) => {
                             new ButtonBuilder().setCustomId("rate_staff_3").setLabel("⭐⭐⭐ ৩ স্টার").setStyle(ButtonStyle.Primary),
                             new ButtonBuilder().setCustomId("rate_staff_1").setLabel("⭐ ১ স্টার").setStyle(ButtonStyle.Danger)
                         );
-                        
                         await targetUserInstance.send({
-                            content: `👋 **AFIA YTAPP**\nআমাদের সাপোর্ট টিম আপনাকে কেমন সাহায্য করলো? নিচে ক্লিক করে রেটিং দিন। (আপনি এটি কেবল একবারই দিতে পারবেন)`,
+                            content: `👋 **AFIA YTAPP**\nআমাদের সাপোর্ট টিম আপনাকে কেমন সাহায্য করলো? নিচে ক্লিক করে রেটিং দিন।`,
                             components: [ratingRow]
-                        }).catch(() => console.log("ইউজারের DM বন্ধ থাকার কারণে মেসেজ পাঠানো যায়নি।"));
-
+                        }).catch(() => {});
                         await db.ref(`rating_history/${currentOrder.userId}`).set(true);
                     }
                 }
-            } catch (dmErr) {
-                console.error("DM বা রেটিং ট্র্যাকিং এরর:", dmErr);
-            }
+            } catch (dmErr) { console.error(dmErr); }
         }
 
         if (currentOrder && trackingChannel) {
@@ -688,7 +795,7 @@ client.on("interactionCreate", async (interaction) => {
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
 
         const orderLogs = getOrderLogs(); const currentOrder = orderLogs[interaction.channel.id];
-        if (!currentOrder) return interaction.reply({ content: "❌ এই চ্যানেলের অর্ডার তথ্য ট্র্যাক ফাইলে পাওয়া যায়নি!", flags: [MessageFlags.Ephemeral] });
+        if (!currentOrder) return interaction.reply({ content: "❌ অর্ডার ট্র্যাক ফাইলে পাওয়া যায়নি!", flags: [MessageFlags.Ephemeral] });
 
         const modal = new ModalBuilder().setCustomId(`modal_ban_reason_${currentOrder.userId}`).setTitle("🚫 Fake Ticket Ban Reason");
         const reasonInput = new TextInputBuilder().setCustomId("ban_reason_input").setLabel("ব্যান করার সঠিক কারণটি সংক্ষেপে লিখুন").setStyle(TextInputStyle.Paragraph).setRequired(true);
@@ -724,7 +831,7 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ========================================================
-// 👥 রিয়েল-টাইম ভয়েস স্টেট মেম্বার কাউন্টার (রেট-লিমিট ও লক প্রোটেকশনসহ)
+// 👥 রিয়েল-টাইম ভয়েস স্টেট মেম্বার কাউন্টার (লক-ফ্রি বাফার লজিক)
 // ========================================================
 let lastMemberCount = 0;
 let lastVcCount = 0;
@@ -734,75 +841,55 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
     if (!guild) return; 
 
-    // ১. ২৪/৭ কোরআন তিলাওয়াত বট ডিসকানেক্ট হলে পুনরায় জয়েন করানোর অটো-লজিক
     if (guild.members.me && !guild.members.me.voice.channel) {
         await connectVoice(guild); 
     }
 
-    // ২. রেট-লিমিট প্রটেক্টেড কাউন্টার লজিক
     try {
         const totalMembers = guild.memberCount; 
-
-        // পুরো সার্ভারের সব ভয়েস চ্যানেলে একটিভ থাকা মোট মেম্বার গণনা (বট বাদে)
         let totalVoiceUsers = 0;
         guild.voiceStates.cache.forEach((state) => {
-            if (state.channelId && !state.member?.user.bot) {
-                totalVoiceUsers++;
-            }
+            if (state.channelId && !state.member?.user.bot) { totalVoiceUsers++; }
         });
 
-        // যদি মেম্বার সংখ্যা এবং ভয়েস একটিভ সংখ্যা দুটোই আগের মতো থাকে, তবে কোনো এপিআই অ্যাকশন করবে না
         if (totalMembers === lastMemberCount && totalVoiceUsers === lastVcCount) return;
 
         const statsChannel = guild.channels.cache.get(STATS_VC_CHANNEL_ID); 
         if (statsChannel) {
             const now = Date.now();
-            // ডিসকর্ডের রেট-লিমিট (১০ মিনিটে ২ বার) এড়ানোর জন্য ৫ মিনিট (৩০০০০০ মিলিসেকেন্ড) পর পর চ্যানেলের নাম আপডেট করবে
             if (now - lastUpdateTIme > 5 * 60 * 1000) {
-                lastMemberCount = totalMembers;
-                lastVcCount = totalVoiceUsers;
-                lastUpdateTIme = now;
-
+                lastMemberCount = totalMembers; lastVcCount = totalVoiceUsers; lastUpdateTIme = now;
                 await statsChannel.setName(`👥 Members: ${totalMembers} | 🎙️ VC: ${totalVoiceUsers}`);
-                console.log(`📊 রিয়েল-টাইম কাউন্টার চ্যানেল আপডেট হয়েছে -> Members: ${totalMembers} | VC: ${totalVoiceUsers}`);
             } else {
-                // যদি ৫ মিনিটের কম সময়ে কেউ আসা/যাওয়া করে, তবে ব্যাকগ্রাউন্ডে ভেরিয়েবল আপডেট রাখবে কিন্তু নাম পরিবর্তন টাইম বাফার পর করবে
-                lastMemberCount = totalMembers;
-                lastVcCount = totalVoiceUsers;
+                lastMemberCount = totalMembers; lastVcCount = totalVoiceUsers;
             }
         }
-    } catch (error) {
-        console.error("❌ কাউন্টার চ্যানেল আপডেট করতে সমস্যা হয়েছে:", error);
-    }
+    } catch (error) { console.error(error); }
 });
 
 // ========================================================
 // 📡 PART 4 - Core Bot Events & Setup
 // ========================================================
 
-// d.js v14-v15 Deprecation ফিক্সড: clientReady ব্যবহার করা হয়েছে
 client.once("clientReady", async () => {
     console.log(`🚀 ${client.user.tag} হিসাবে সফলভাবে লগইন করা হয়েছে!`);
-    setBotPresence();
+    client.user.setPresence({ activities: [{ name: "Security & Verification", type: ActivityType.Watching }], status: "online" });
 
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
     if (guild) {
         await connectVoice(guild); 
         
-        // ⭐ অফলাইন রিকভারি এবং মেম্বার সিঙ্ক হুক (ডাবল ওয়েলকাম মেসেজ ফিক্সড)
+        // অফলাইন রিকভারি এবং মেম্বার সিঙ্ক হুক (ডাবল মেসেজ লক)
         try {
             await guild.members.fetch();
             const savedIds = getSavedMembers();
             const currentMembers = guild.members.cache.filter(m => !m.user.bot);
             const currentIds = [...currentMembers.keys()];
 
-            // শুধুমাত্র তারাই নতুন মেম্বার যারা বট অফলাইন থাকার সময় জয়েন করেছে এবং ডাটাবেজে একেবারেই নেই
             const newJoins = currentIds.filter(id => !savedIds.includes(id));
-            
             for (const newId of newJoins) {
                 const member = currentMembers.get(newId);
                 const logs = getWelcomeLogs();
-                // নিশ্চিত হওয়া হচ্ছে মেম্বারটি নতুন এবং তার আগে কোনো ডুপ্লিকেট ওয়েলকাম লগ নেই
                 if (member && !member.roles.cache.has(VERIFIED_ROLE_ID) && !logs[newId]) {
                     const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
                     if (welcomeChannel) {
@@ -813,11 +900,9 @@ client.once("clientReady", async () => {
                 }
             }
 
-            // বট অফলাইন থাকার সময় কেউ সার্ভার লিভ নিলে তার ট্র্যাকিং
             const leftUsers = savedIds.filter(id => !currentIds.includes(id));
             for (const leftId of leftUsers) {
-                const logs = getWelcomeLogs();
-                const userLog = logs[leftId];
+                const logs = getWelcomeLogs(); const userLog = logs[leftId];
                 const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
                 if (userLog && welcomeChannel) {
                     try {
@@ -830,12 +915,9 @@ client.once("clientReady", async () => {
                 }
             }
 
-            // বর্তমান সকল মেম্বার আইডি ডাটাবেজে সেভ করে সিঙ্ক রাখা হচ্ছে
             const finalIds = [...guild.members.cache.filter(m => !m.user.bot).keys()];
             saveMembers(finalIds);
-        } catch (err) {
-            console.error("Sync Recovery Error:", err);
-        }
+        } catch (err) { console.error(err); }
     }
 });
 
@@ -847,13 +929,10 @@ client.on("guildMemberAdd", async (member) => {
     if (punishments[member.id] && punishments[member.id].status === "Muted") {
         const remaining = punishments[member.id].expiresAt - Date.now();
         if (remaining > 0) { 
-            // TimeoutNegativeWarning ফিক্স: সময় মাইনাসে গেলে ১ সেকেন্ড ডিফল্ট সেভ করবে
             const safeRemaining = remaining < 1000 ? 1000 : remaining;
             await member.timeout(safeRemaining, "Muted status persistent across rejoin").catch(() => {}); 
             return; 
-        } else { 
-            savePunishment(member.id, null); 
-        }
+        } else { savePunishment(member.id, null); }
     }
 
     const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
@@ -882,75 +961,37 @@ client.on("guildMemberRemove", async (member) => {
     }
 });
 
-// রিয়েল-টাইม মেম্বার সিঙ্ক ইভেন্ট রিকভারি ব্যাকআপ কমান্ড
-client.on("messageCreate", async (message) => {
-    if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
-    if (message.content === "!syncmembers" && message.member.permissions.has(PermissionFlagsBits.Administrator)) {
-        try {
-            await message.guild.members.fetch();
-            const finalIds = [...message.guild.members.cache.filter(m => !m.user.bot).keys()];
-            saveMembers(finalIds);
-            await message.reply("✅ মেম্বার ডাটাবেজ সফলভাবে সিঙ্ক করা হয়েছে!");
-        } catch (err) {
-            console.error("Sync Recovery Error:", err);
-        }
-    }
-});
-
-function setBotPresence() { 
-    client.user.setPresence({ 
-        activities: [{ name: "Security & Verification", type: ActivityType.Watching }], 
-        status: "online" 
-    }); 
-}
-
-// 🕋 24/7 Quran Play Connection (Realtime DB Sync লুপসহ)
+// 🕋 24/7 Quran Play Connection
 async function connectVoice(guild) { 
     try { 
         const channel = guild.channels.cache.get(VOICE_CHANNEL_ID); 
         if (!channel) return; 
         
         const connection = joinVoiceChannel({ 
-            channelId: channel.id, 
-            guildId: guild.id, 
+            channelId: channel.id, guildId: guild.id, 
             adapterCreator: guild.voiceAdapterCreator, 
-            selfDeaf: true, 
-            selfMute: false 
+            selfDeaf: true, selfMute: false 
         }); 
         
         const player = createAudioPlayer(); 
-        
-        // অডিও রিসোর্স তৈরি ও ভলিউম সেটআপ
         const resource = createAudioResource(AUDIO_STREAM_URL, { inlineVolume: true });
-        resource.volume?.setVolume(0.8); // ভলিউম ৮০%
+        resource.volume?.setVolume(0.8);
 
         player.play(resource); 
         connection.subscribe(player); 
 
         player.on(AudioPlayerStatus.Idle, async () => { 
-            console.log("🔄 আল কোরআন তিলাওয়াত লাইভ লিংক থেকে পুনরায় লুপে প্লে হচ্ছে...");
-            
-            // লুপ হওয়ার সময় গ্লোবাল ক্যাশ থেকে লিংক রিলোড হবে
             if (globalFirebaseCache.settings && globalFirebaseCache.settings.quran_stream_url) {
                 AUDIO_STREAM_URL = globalFirebaseCache.settings.quran_stream_url;
             }
-
             const nextResource = createAudioResource(AUDIO_STREAM_URL, { inlineVolume: true });
             nextResource.volume?.setVolume(0.8);
             player.play(nextResource); 
         });
 
-        player.on('error', error => {
-            console.error('❌ Audio Player Error:', error.message);
-            setTimeout(() => connectVoice(guild), 5000); 
-        });
-
-    } catch (e) { console.error("❌ Voice Connect Error:", e); } 
+        player.on('error', () => { setTimeout(() => connectVoice(guild), 5000); });
+    } catch (e) { console.error(e); } 
 }
 
-function startBot() { 
-    if (!TOKEN) { console.error("❌ TOKEN Environment Variable পাওয়া যায়নি!"); process.exit(1); }
-    client.login(TOKEN);
-}
-
-startBot();
+if (!TOKEN) { console.error("❌ TOKEN missing!"); process.exit(1); }
+client.login(TOKEN);
