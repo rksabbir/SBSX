@@ -25,19 +25,26 @@ const {
 
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require("@discordjs/voice");
 
-// Firebase Configuration Setup
+// Firebase Configuration Setup via Environment Variables Only
 let serviceAccount;
 try {
     if (process.env.FIREBASE_CONFIG) {
+        // এনভায়রনমেন্ট ভ্যারিয়েবল থেকে স্ট্রিং JSON পার্স করা হচ্ছে
         serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
     } else {
-        serviceAccount = require("./firebase-service-account.json");
+        throw new Error("FIREBASE_CONFIG Environment Variable is missing!");
     }
 } catch (e) {
-    console.error("❌ Firebase Config Load Error:", e);
+    console.error("❌ Firebase Config Load Error (Check your Environment Variables):", e.message);
+    process.exit(1); // কনফিগারেশন ছাড়া ক্র্যাশ এড়াতে প্রসেস স্টপ করা হলো
 }
 
-const firebaseURL = process.env.FIREBASE_DB_URL || "YOUR_FIREBASE_DATABASE_URL";
+const firebaseURL = process.env.FIREBASE_DB_URL;
+if (!firebaseURL) {
+    console.error("❌ FIREBASE_DB_URL Environment Variable is missing!");
+    process.exit(1);
+}
+
 admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     databaseURL: firebaseURL
@@ -62,8 +69,8 @@ const LOG_CHANNEL_ID = "1488340400673656973";
 const VOICE_CHANNEL_ID = "1523230098193383595";
 const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
 const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
-const REVIEW_CHANNEL_ID = "1488340441115004999"; // রিভিউ পাঠানোর চ্যানেল
-const ANNOUNCEMENT_CHANNEL_ID = "1488339169821593731"; // সোশ্যাল মিডিয়া ও উইকলি গ্রোথ চ্যানেলের জন্য
+const REVIEW_CHANNEL_ID = "1488340441115004999"; 
+const ANNOUNCEMENT_CHANNEL_ID = "1488339169821593731"; 
 
 // stats channels (Feature 2)
 let STATS_TOTAL_MEMBERS_VC = "1523230098193383596"; 
@@ -104,7 +111,7 @@ const ORDER_LOG_FILE = "./order_tracking.json";
 const cooldowns = new Map();
 const userMsgCounter = new Map(); 
 const userWarns = new Map(); 
-const temporaryVoiceChannels = new Map(); // Feature 6 temp VCs
+const temporaryVoiceChannels = new Map(); 
 
 const client = new Client({
     intents: [
@@ -158,7 +165,7 @@ async function handleUserLeveling(message) {
     const snapshot = await userRef.once("value");
     let userData = snapshot.val() || { xp: 0, level: 1 };
 
-    userData.xp += Math.floor(Math.random() * 10) + 5; // Give 5-15 XP per message
+    userData.xp += Math.floor(Math.random() * 10) + 5; 
     let nextLevelXp = userData.level * 100;
 
     if (userData.xp >= nextLevelXp) {
@@ -166,7 +173,6 @@ async function handleUserLeveling(message) {
         userData.xp = 0;
         message.reply(`🎉 **অভিনন্দন <@${userId}>!** আপনি লেভেল **${userData.level}** এ পৌঁছে গেছেন! 🚀`).then(msg => setTimeout(() => msg.delete().catch(()=>{}), 5000));
         
-        // Reward role on specific levels
         if (userData.level >= 5) {
             const activeRole = message.guild.roles.cache.get("YOUR_REWARD_ROLE_ID");
             if (activeRole) await message.member.roles.add(activeRole).catch(()=>{});
@@ -279,12 +285,10 @@ client.on("messageDelete", async (message) => {
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
-    // [FEATURE 1] Bkash/Nagad Auto-Regex Payment Modal Request
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const category = interaction.customId.split("_")[2];
         const modal = new ModalBuilder().setCustomId(`modal_payment_${category}`).setTitle("🔒 Payment Verification");
         
-        // [FEATURE 13] Voucher Code System Input Included
         const txnInput = new TextInputBuilder().setCustomId("txn_id_input").setLabel("Enter Transaction ID (TxnID)").setPlaceholder("bKash/Nagad 10-char TxnID").setStyle(TextInputStyle.Short).setRequired(true);
         const voucherInput = new TextInputBuilder().setCustomId("voucher_input").setLabel("Have a Discount Coupon/Voucher? (Optional)").setPlaceholder("e.g. EID20").setStyle(TextInputStyle.Short).setRequired(false);
         
@@ -292,21 +296,17 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    // Payment Modal Submit
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const category = interaction.customId.split("_")[2];
         const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
         const voucherCode = interaction.fields.getTextInputValue("voucher_input").trim();
 
-        // [FEATURE 1] Bkash/Nagad Auto-Regex Check
-        // বিকাশের ট্রানজেকশন আইডি সাধারণত ১০ অক্ষরের আলফানিউমেরিক হয়ে থাকে (যেমন: BL3M9X7Z2)
         const txnRegex = /^[A-Z0-9]{8,12}$/i;
         if (!txnRegex.test(txnId)) {
             return interaction.editReply("❌ **ভুল Transaction ID ফরম্যাট!** অনুগ্রহ করে সঠিক এবং অরিজিনাল বিকাশ/নগদ TxnID প্রদান করুন।");
         }
 
-        // [FEATURE 13] Voucher/Coupon System Verification
         let discountText = "None";
         if (voucherCode) {
             const vRef = db.ref(`vouchers/${voucherCode}`);
@@ -337,18 +337,16 @@ client.on("interactionCreate", async (interaction) => {
         const staffButtons = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`approve_order`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close & Feedback").setStyle(ButtonStyle.Danger) // Modified for feature 5
+            new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close & Feedback").setStyle(ButtonStyle.Danger) 
         );
 
         await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [staffButtons] });
         return interaction.editReply(`✅ অর্ডার চ্যানেল সফলভাবে তৈরি হয়েছে: ${privateChannel}`);
     }
 
-    // [FEATURE 5] Ticket Feedback & Close Trigger
     if (interaction.isButton() && interaction.customId.startsWith("close_")) {
         const type = interaction.customId.split("_")[1];
         
-        // Show rating component to the customer inside channel before deleting
         const ratingRow = new ActionRowBuilder().addComponents(
             new StringSelectMenuBuilder().setCustomId(`submit_feedback_${type}`).setPlaceholder("⭐ আমাদের সার্ভিস রেটিং দিন...").addOptions([
                 { label: "⭐⭐⭐⭐⭐ Excellent Support", value: "5_stars" },
@@ -359,7 +357,6 @@ client.on("interactionCreate", async (interaction) => {
 
         await interaction.reply({ content: "🔒 **এই টিকিট বা অর্ডারটি বন্ধ করা হচ্ছে।** চ্যানেলটি সম্পূর্ণ রিমুভ করার আগে কাস্টমারকে নিচে রেটিং দেওয়ার জন্য অনুরোধ করা হচ্ছে:", components: [ratingRow] });
         
-        // Create Transcript backup (Advanced logging)
         try {
             const logChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
             if (logChannel) {
@@ -375,11 +372,9 @@ client.on("interactionCreate", async (interaction) => {
             }
         } catch(e){}
 
-        // Delay deletion to let user select rating
         setTimeout(async () => { await interaction.channel.delete().catch(()=>{}); }, 15000);
     }
 
-    // [FEATURE 5] Process Feedback Submission
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("submit_feedback_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const rating = interaction.values[0].replace("_", " ");
@@ -394,7 +389,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ রেটিং দেওয়ার জন্য আপনাকে ধন্যবাদ!");
     }
 
-    // [FEATURE 4] Giveaways Join Interaction Listener
     if (interaction.isButton() && interaction.customId.startsWith("join_giveaway_")) {
         const giveawayId = interaction.customId.split("_")[2];
         const gRef = db.ref(`giveaways/${giveawayId}/participants`);
@@ -408,7 +402,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "🎉 আপনি সফলভাবে গিভঅ্যাওয়েতে নাম এন্ট্রি করেছেন!", flags: [MessageFlags.Ephemeral] });
     }
 
-    // Standard panel components processing
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0];
         const payEmbed = new EmbedBuilder().setTitle(`💳 Payment Gateway Gateway: ${value.toUpperCase()}`).setDescription(`অর্ডার কনফার্ম করতে নিচে বাটনে চাপ দিয়ে পেমেন্ট আইডি দিন।`).setColor("Blue");
@@ -424,22 +417,19 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     const guild = newState.guild;
     if (guild.id !== ALLOWED_GUILD_ID) return;
 
-    // [FEATURE 2] VC Counter Live Refresh on join/leave
     await updateServerStats(guild);
 
-    // [FEATURE 6] Temporary Private Voice Channel (Join to Create)
     if (newState.channelId === JOIN_TO_CREATE_VC_ID) {
         const member = newState.member;
         const tempChannel = await guild.channels.create({
             name: `🔒 ${member.user.username}'s Room`,
-            type: 2, // GuildVoice
+            type: 2, 
             parent: newState.channel.parentId
         });
         await member.voice.setChannel(tempChannel).catch(()=>{});
         temporaryVoiceChannels.set(tempChannel.id, true);
     }
 
-    // Clean up temporary voice channels if empty
     if (oldState.channelId && temporaryVoiceChannels.has(oldState.channelId)) {
         const ch = guild.channels.cache.get(oldState.channelId);
         if (ch && ch.members.size === 0) {
@@ -448,13 +438,11 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
         }
     }
 
-    // [FEATURE 14] 24/7 Voice Reconnect and Music/Quran Player safeguard
     if (guild.members.me && !guild.members.me.voice.channel) {
         await connectVoiceAndPlayStream(guild);
     }
 });
 
-// [FEATURE 14] Audio stream integration inside 24/7 voice channel
 async function connectVoiceAndPlayStream(guild) {
     try {
         const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
@@ -468,15 +456,12 @@ async function connectVoiceAndPlayStream(guild) {
             selfMute: false
         });
 
-        // Initialize audio player
         const player = createAudioPlayer();
-        // আপনি এখানে যেকোনো লাইভ ২৪/৭ ইন্টারনেট অডিও বা রেডিও স্ট্রিম ইউআরএল দিতে পারেন
         const resource = createAudioResource("https://stream.zeno.fm/0r0xa792kwzuv"); 
         player.play(resource);
         connection.subscribe(player);
 
         player.on(AudioPlayerStatus.Idle, () => {
-            // Loop or restart the stream
             const nextResource = createAudioResource("https://stream.zeno.fm/0r0xa792kwzuv");
             player.play(nextResource);
         });
@@ -490,10 +475,8 @@ async function connectVoiceAndPlayStream(guild) {
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     
-    // Check Admin rights for setup commands
     const isAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator);
     if (!isAdmin) {
-        // [FEATURE 11] Staff Performance & Online Duty Tracker
         if (message.content === "!duty on") {
             await db.ref(`staff_duty/${message.author.id}`).set({ status: "ON DUTY", startTime: Date.now() });
             return message.reply("🟢 **আপনি এখন ডিউটিতে আছেন।** আপনার অ্যাক্টিভিটি ট্র্যাকিং শুরু হয়েছে।");
@@ -505,7 +488,6 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // [FEATURE 4] Dynamic Giveaway System Command Setup
     if (message.content.startsWith("!giveaway")) {
         const giveawayId = Math.floor(1000 + Math.random() * 9000);
         const gEmbed = new EmbedBuilder()
@@ -522,7 +504,6 @@ client.on("messageCreate", async (message) => {
         return message.channel.send({ embeds: [gEmbed], components: [row] });
     }
 
-    // [FEATURE 7] Raid Mode Toggle Command
     if (message.content === "!raidmode on") {
         await db.ref("settings/raid_mode").set("on");
         return message.reply("🛑 **Raid Mode Activated!** ভেরিফিকেশন লকড এবং নতুন অ্যাকাউন্ট কিক করা শুরু হবে।");
@@ -532,7 +513,6 @@ client.on("messageCreate", async (message) => {
         return message.reply("🟢 **Raid Mode Deactivated!** সার্ভার এখন সাধারণ মেম্বারদের জন্য উন্মুক্ত।");
     }
 
-    // Admin Trigger for Manual UI panels initialization
     if (message.content === "!setup") {
         const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId("universal_verify_button").setLabel("Verify Me").setStyle(ButtonStyle.Success));
         const embed = new EmbedBuilder().setTitle("🚨 Verification System").setDescription("ভেরিফাই করতে নিচের বাটনে ক্লিক করুন।").setImage(COVER_IMAGES.VERIFY).setColor("Blue");
@@ -544,21 +524,18 @@ client.on("messageCreate", async (message) => {
 // 🚀 Firebase Webhooks Integration & Sync Panel Initializers
 // ================================
 function listenToFirebaseCloudSync() {
-    // [FEATURE 8] Embed Builder Dynamic Webhook sync from Firebase Realtime
     db.ref("panels").on("value", async (snapshot) => {
         const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
         if (!guild) return;
         console.log("🔄 Firebase Triggered Realtime Panel Live Sync Refresh...");
-        // Auto panel updater logic inside CHANNELS lists here...
     });
 
-    // [FEATURE 12] Social Media Automated Live Feed Check (Simulated check loop)
     setInterval(async () => {
         const socialSnapshot = await db.ref("social_feed/latest_post").once("value");
         if (socialSnapshot.exists()) {
-            // Send alert to ANNOUNCEMENT_CHANNEL_ID if new link found
+            // Live Feed Check Loop...
         }
-    }, 60000 * 5); // check every 5 mins
+    }, 60000 * 5); 
 }
 
 // ================================
@@ -571,15 +548,12 @@ client.once("ready", async () => {
     
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
     if (guild) {
-        // [FEATURE 14] 24/7 Quran or Music activation
         await connectVoiceAndPlayStream(guild);
-        // [FEATURE 2] Initial Stats load
         await updateServerStats(guild);
     }
     
     listenToFirebaseCloudSync();
 
-    // Trigger Feature 15 Weekly Report scheduler
     setInterval(() => { if (guild) sendWeeklyReport(guild); }, 1000 * 60 * 60 * 24 * 7);
 });
 
