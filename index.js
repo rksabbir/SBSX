@@ -108,7 +108,9 @@ const SOCIAL_FEED_CHANNEL_ID = "1488338739850772641";
 const STAFF_ADMIN_LOG_ID = "1524324771502882877";
 const WEEKLY_REPORT_CHANNEL_ID = "1524326280923709550";
 const TRANSCRIPT_LOG_CHANNEL_ID = "1524326928268660807";
-const AUDIO_STREAM_URL = "https://server11.fmlistening.com/8056_time"; // Quran Audio Stream
+
+// ফায়ারবেস থেকে লিংক লোড না হতে পারলে এই ব্যাকআপ লিংকটি কাজ করবে
+let AUDIO_STREAM_URL = "https://stream.radiojar.com/0v9n06vcc9duv"; 
 
 // Databases
 const DATA_FILE = "./database.json";
@@ -235,7 +237,7 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
     }
     
-    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্তスタッフ", value: `${staff}`, inline: true });
     return embed;
 }
 
@@ -344,20 +346,25 @@ function createVerificationEmbed() { return new EmbedBuilder().setTitle("🚨 Ve
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
-    if (interaction.isButton() || interaction.isStringSelectMenu()) {
-        const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
-        if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_") && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_") && !interaction.customId.startsWith("rate_staff_")) return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
-        cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
+    // ⭐ [সংশোধিত ও ফিক্সড]: রেটিং বাটনের ইন্টারঅ্যাকশন হ্যান্ডেলিং (সবার উপরে দেওয়া হয়েছে যাতে ৩ সেকেন্ড এরর "This interaction failed" না আসে)
+    if (interaction.isButton() && interaction.customId.startsWith("rate_staff_")) {
+        try {
+            await interaction.deferUpdate().catch(() => {}); 
+            const rating = interaction.customId.split("_")[2]; // ৫ স্টার, ৩ স্টার বা ১ স্টার বের করবে
+            return await interaction.editReply({ 
+                content: `❤️ রেটিং দেওয়ার জন্য আপনাকে ধন্যবাদ! আপনি আমাদের সাপোর্ট টিমকে **${rating} স্টার** দিয়েছেন।`, 
+                components: [] // বাটনগুলো মুছে দেওয়া হবে যাতে ২য় বার ক্লিক না করা যায়
+            });
+        } catch (err) {
+            console.error("Rating Button Error:", err);
+        }
+        return;
     }
 
-    // ⭐ [নতুন সংযোজন]: রেটিং বাটনের ইন্টারঅ্যাকশন হ্যান্ডেলিং ("This interaction failed" সমস্যার নিখুঁত সমাধান)
-    if (interaction.isButton() && interaction.customId.startsWith("rate_staff_")) {
-        const rating = interaction.customId.split("_")[2]; // ৫ স্টার নাকি অন্য কিছু তা বের করবে
-        await interaction.deferUpdate(); // ডিসকর্ডকে বলবে বট রেসপন্স পেয়েছে এবং প্রসেস করছে
-        return interaction.editReply({ 
-            content: `❤️ রেটিং দেওয়ার জন্য আপনাকে ধন্যবাদ! আপনি আমাদের সাপোর্ট টিমকে **${rating} স্টার** দিয়েছেন।`, 
-            components: [] // বাটনের ইন্টারঅ্যাকশন সফল হবার পর বাটনগুলো রিমুভ করে দেওয়া হবে
-        });
+    if (interaction.isButton() || interaction.isStringSelectMenu()) {
+        const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
+        if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_") && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_")) return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
+        cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
@@ -457,7 +464,6 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
-    // কুপন মোডাল সাবমিট সফল হ্যান্ডলিং (Interaction Failed ফিক্সড)
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const category = interaction.customId.split("_")[2]; 
@@ -602,13 +608,11 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
-    // ⭐ [সংশোধিত ক্লোজ ফাংশন]: ফায়ারবেস ট্র্যাকিং কন্ডিশনসহ প্রতি ইউজারের DM-এ শুধুমাত্র একবার মেসেজ পাঠানো হবে
     if (interaction.isButton() && interaction.customId.startsWith("close_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
 
-        // HTML Transcript Backup
         try {
             const transcriptLogChan = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
             if (transcriptLogChan) {
@@ -631,7 +635,6 @@ client.on("interactionCreate", async (interaction) => {
         
         if (currentOrder) {
             try {
-                // ফায়ারবেস ডেটাবেজ চেক: এই ইউজার এই মাসে বা আগে কখনো রেটিং মেসেজ পেয়েছে কিনা তা ট্র্যাক করা হচ্ছে
                 const snapshot = await db.ref(`rating_history/${currentOrder.userId}`).once("value");
                 const alreadyRated = snapshot.val();
 
@@ -649,7 +652,6 @@ client.on("interactionCreate", async (interaction) => {
                             components: [ratingRow]
                         }).catch(() => console.log("ইউজারের DM বন্ধ থাকার কারণে মেসেজ পাঠানো যায়নি।"));
 
-                        // ফায়ারবেসে সেভ করে রাখা হচ্ছে যাতে পরের বার টিকেট ক্লোজ হলে আর মেসেজ না যায়
                         await db.ref(`rating_history/${currentOrder.userId}`).set(true);
                     }
                 }
@@ -716,46 +718,57 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ========================================================
-// 👥 অ্যাডভান্সড মেম্বার ও ভয়েস মেম্বার কাউন্টার (সুরক্ষিত সংস্করণ)
+// 👥 রিয়েল-টাইম ভয়েস স্টেট মেম্বার কাউন্টার (রেট-লিমিট ও vunt/hunt লক প্রোটেকশনসহ)
 // ========================================================
 let lastMemberCount = 0;
 let lastVcCount = 0;
+let lastUpdateTIme = 0; // সর্বশেষ কখন নাম আপডেট হয়েছে তার ট্র্যাকিং সময়
 
-setInterval(async () => {
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
-    if (!guild) return;
+client.on("voiceStateUpdate", async (oldState, newState) => {
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
+    if (!guild) return; 
 
+    // ১. ২৪/৭ কোরআন তিলাওয়াত বট ডিসকানেক্ট হলে পুনরায় জয়েন করানোর অটো-লজিক
+    if (guild.members.me && !guild.members.me.voice.channel) {
+        await connectVoice(guild); 
+    }
+
+    // ২. রেট-লিমিট প্রটেক্টেড কাউন্টার লজিক
     try {
-        // ১. সার্ভারের মোট মেম্বার সংখ্যা বের করা
-        const totalMembers = guild.memberCount;
+        const totalMembers = guild.memberCount; 
 
-        // ২. পুরো সার্ভারের সব ভয়েস চ্যানেলে একটিভ থাকা মোট মেম্বার গণনা (বট বাদে)
+        // পুরো সার্ভারের সব ভয়েস চ্যানেলে একটিভ থাকা মোট মেম্বার গণনা (বট বাদে)
         let totalVoiceUsers = 0;
         guild.voiceStates.cache.forEach((state) => {
-            // মেম্বার যদি কোনো চ্যানেলে কানেক্ট থাকে এবং সে নিজে বট না হয়
             if (state.channelId && !state.member?.user.bot) {
                 totalVoiceUsers++;
             }
         });
 
-        // ⭐ অত্যন্ত গুরুত্বপূর্ণ কন্ডিশন: যদি মেম্বার সংখ্যা বা ভয়েস একটিভ সংখ্যা পরিবর্তন না হয়, 
-        // তবে ডিসকর্ড API-তে কোনো রিকোয়েস্ট পাঠাবে না (এর ফলে তিলাওয়াত চ্যানেলে বটের কোনো সমস্যা হবে না)
+        // যদি মেম্বার সংখ্যা এবং ভয়েস একটিভ সংখ্যা দুটোই আগের মতো থাকে, তবে কোনো এপিআই অ্যাকশন করবে না
         if (totalMembers === lastMemberCount && totalVoiceUsers === lastVcCount) return;
 
-        // আপনার কাঙ্ক্ষিত কাউন্টার চ্যানেল আইডি (STATS_VC_CHANNEL_ID = "1524321192079786005")
-        const statsChannel = guild.channels.cache.get(STATS_VC_CHANNEL_ID);
+        const statsChannel = guild.channels.cache.get(STATS_VC_CHANNEL_ID); 
         if (statsChannel) {
-            lastMemberCount = totalMembers;
-            lastVcCount = totalVoiceUsers;
+            const now = Date.now();
+            // ডিসকর্ডের রেট-লিমিট (১০ মিনিটে ২ বার) এড়ানোর জন্য ৫ মিনিট (৩০০০০০ মিলিসেকেন্ড) পর পর চ্যানেলের নাম আপডেট করবে
+            if (now - lastUpdateTIme > 5 * 60 * 1000) {
+                lastMemberCount = totalMembers;
+                lastVcCount = totalVoiceUsers;
+                lastUpdateTIme = now;
 
-            // আপনার চাহিদা অনুযায়ী হুবহু ফরম্যাট: 👥 Members: 21 | 🎙️ VC: 1
-            await statsChannel.setName(`👥 Members: ${totalMembers} | 🎙️ VC: ${totalVoiceUsers}`);
-            console.log(`📊 কাউন্টার চ্যানেল আপডেট হয়েছে -> Members: ${totalMembers} | VC: ${totalVoiceUsers}`);
+                await statsChannel.setName(`👥 Members: ${totalMembers} | 🎙️ VC: ${totalVoiceUsers}`);
+                console.log(`📊 রিয়েল-টাইম কাউন্টার চ্যানেল আপডেট হয়েছে -> Members: ${totalMembers} | VC: ${totalVoiceUsers}`);
+            } else {
+                // যদি ৫ মিনিটের কম সময়ে কেউ আসা/যাওয়া করে, তবে ব্যাকগ্রাউন্ডে ভেরিয়েবল আপডেট রাখবে কিন্তু নাম পরিবর্তন টাইম বাফার পর করবে
+                lastMemberCount = totalMembers;
+                lastVcCount = totalVoiceUsers;
+            }
         }
     } catch (error) {
-        console.error("❌ কাউন্টার চ্যানেল আপডেট করতে সমস্যা হয়েছে (Rate Limit হতে পারে):", error);
+        console.error("❌ কাউন্টার চ্যানেল আপডেট করতে সমস্যা হয়েছে:", error);
     }
-}, 15000); // প্রতি ১৫ সেকেন্ড পর পর চেক করবে, তবে ডাটা পরিবর্তন না হলে নাম পরিবর্তন করবে না।
+});
 
 // ================================
 // 📡 PART 4 - Core Bot Events & Setup
@@ -765,21 +778,25 @@ client.once("ready", async () => {
     console.log(`🚀 ${client.user.tag} হিসাবে সফলভাবে লগইন করা হয়েছে!`);
     setBotPresence();
 
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
     if (guild) {
-        await connectVoice(guild);
+        await connectVoice(guild); 
         
-        // অফলাইন রিকভারি এবং মেম্বার সিঙ্ক হুক
+        // ⭐ অফলাইন রিকভারি এবং মেম্বার সিঙ্ক হুক (ডাবল ওয়েলকাম মেসেজ ফিক্সড)
         try {
             await guild.members.fetch();
             const savedIds = getSavedMembers();
             const currentMembers = guild.members.cache.filter(m => !m.user.bot);
             const currentIds = [...currentMembers.keys()];
 
+            // শুধুমাত্র তারাই নতুন মেম্বার যারা বট অফলাইন থাকার সময় জয়েন করেছে এবং ডাটাবেজে একেবারেই নেই
             const newJoins = currentIds.filter(id => !savedIds.includes(id));
+            
             for (const newId of newJoins) {
                 const member = currentMembers.get(newId);
-                if (member && !member.roles.cache.has(VERIFIED_ROLE_ID)) {
+                const logs = getWelcomeLogs();
+                // নিশ্চিত হওয়া হচ্ছে মেম্বারটি নতুন এবং তার আগে কোনো ডুপ্লিকেট ওয়েলকাম লগ নেই
+                if (member && !member.roles.cache.has(VERIFIED_ROLE_ID) && !logs[newId]) {
                     const welcomeChannel = guild.channels.cache.get(WELCOME_CHANNEL_ID);
                     if (welcomeChannel) {
                         const embed = buildDynamicWelcomeEmbed(member, "unverified", true);
@@ -789,6 +806,7 @@ client.once("ready", async () => {
                 }
             }
 
+            // বট অফলাইন থাকার সময় কেউ সার্ভার লিভ নিলে তার ট্র্যাকিং
             const leftUsers = savedIds.filter(id => !currentIds.includes(id));
             for (const leftId of leftUsers) {
                 const logs = getWelcomeLogs();
@@ -805,6 +823,7 @@ client.once("ready", async () => {
                 }
             }
 
+            // বর্তমান সকল মেম্বার আইডি ডাটাবেজে সেভ করে সিঙ্ক রাখা হচ্ছে
             const finalIds = [...guild.members.cache.filter(m => !m.user.bot).keys()];
             saveMembers(finalIds);
         } catch (err) {
@@ -850,7 +869,7 @@ client.on("guildMemberRemove", async (member) => {
     }
 });
 
-// রিয়েল-টাইম মেম্বার সিঙ্ক ইভেন্ট রিকভারি ব্যাকআপ
+// রিয়েল-টাইম মেম্বার সিঙ্ক ইভেন্ট রিকভারি ব্যাকআপ কমান্ড
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.content === "!syncmembers" && message.member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -865,11 +884,6 @@ client.on("messageCreate", async (message) => {
     }
 });
 
-client.on("voiceStateUpdate", async () => { 
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
-    if (guild && guild.members.me && !guild.members.me.voice.channel) await connectVoice(guild);
-});
-
 function setBotPresence() { 
     client.user.setPresence({ 
         activities: [{ name: "Security & Verification", type: ActivityType.Watching }], 
@@ -877,37 +891,61 @@ function setBotPresence() {
     }); 
 }
 
-// 🕋 24/7 Quran Play Connection (সুরক্ষিত ও উন্নত সংস্করণ)
+// 🕋 24/7 Quran Play Connection (Firebase Realtime DB সম্বলিত সংস্করণ)
 async function connectVoice(guild) { 
     try { 
-        const channel = guild.channels.cache.get(VOICE_CHANNEL_ID);
-        if (!channel) return;
+        const channel = guild.channels.cache.get(VOICE_CHANNEL_ID); 
+        if (!channel) return; 
+
+        // 🔗 ఫায়ারবেস ডেটাবেজ থেকে লাইভ কোরআন তিলাওয়াত লিংক নিয়ে আসা (settings/quran_stream_url)
+        try {
+            const snapshot = await db.ref("settings/quran_stream_url").once("value");
+            if (snapshot.exists() && snapshot.val()) {
+                AUDIO_STREAM_URL = snapshot.val(); // ডাটাবেজের লিংকটি সেট হবে
+                console.log(`📡 ফায়ারবেস থেকে লাইভ তিলাওয়াত লিংক লোড হয়েছে: ${AUDIO_STREAM_URL}`);
+            }
+        } catch (dbErr) {
+            console.error("❌ ফায়ারবেস থেকে লিংক আনতে সমস্যা হয়েছে, ব্যাকআপ লিংক ব্যবহার করা হচ্ছে:", dbErr.message);
+        }
         
-        const connection = joinVoiceChannel({
-            channelId: channel.id,
-            guildId: guild.id,
-            adapterCreator: guild.voiceAdapterCreator,
+        const connection = joinVoiceChannel({ 
+            channelId: channel.id, 
+            guildId: guild.id, 
+            adapterCreator: guild.voiceAdapterCreator, 
             selfDeaf: true, 
             selfMute: false 
         }); 
         
-        const player = createAudioPlayer();
-        const resource = createAudioResource(AUDIO_STREAM_URL);
-        player.play(resource);
-        connection.subscribe(player);
+        const player = createAudioPlayer(); 
+        
+        // অডিও রিসোর্স তৈরি ও ভলিউম সেটআপ
+        const resource = createAudioResource(AUDIO_STREAM_URL, { inlineVolume: true });
+        resource.volume?.setVolume(0.8); // ভলিউম ৮০%
 
-        player.on(AudioPlayerStatus.Idle, () => {
+        player.play(resource); 
+        connection.subscribe(player); 
+
+        player.on(AudioPlayerStatus.Idle, async () => { 
             console.log("🔄 আল কোরআন তিলাওয়াত পুনরায় লুপে প্লে হচ্ছে...");
-            const nextResource = createAudioResource(AUDIO_STREAM_URL);
-            player.play(nextResource);
+            
+            // লুপ হওয়ার সময়ও চেক করবে ফায়ারবেস ডাটাবেজে লিংক আপডেট করা হয়েছে কি না
+            try {
+                const snap = await db.ref("settings/quran_stream_url").once("value");
+                if (snap.exists() && snap.val()) AUDIO_STREAM_URL = snap.val();
+            } catch (e) {}
+
+            const nextResource = createAudioResource(AUDIO_STREAM_URL, { inlineVolume: true });
+            nextResource.volume?.setVolume(0.8);
+            player.play(nextResource); 
         });
 
         player.on('error', error => {
             console.error('❌ Audio Player Error:', error.message);
-            setTimeout(() => connectVoice(guild), 5000); // অডিও ড্রপ হলে ৫ সেকেন্ড পর আবার ট্রাই করবে
+            // অডিও ড্রপ বা নেটওয়ার্ক এরর আসলে ৫ সেকেন্ড পর আবার কানেক্ট করার চেষ্টা করবে
+            setTimeout(() => connectVoice(guild), 5000); 
         });
 
-    } catch (e) { console.error("❌ Voice Connect Error:", e); }
+    } catch (e) { console.error("❌ Voice Connect Error:", e); } 
 }
 
 function startBot() { 
