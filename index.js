@@ -1,6 +1,6 @@
-// ================================
-// 🚀 PART 1 - Setup + Express + Firebase + Config
-// ================================
+// ========================================================
+// 🚀 PART 1 - Setup + Express + Firebase + Realtime Config
+// ========================================================
 
 const express = require("express");
 const fs = require("fs");
@@ -54,13 +54,13 @@ admin.initializeApp({
 const db = admin.database();
 
 const app = express();
-app.get("/", (req, res) => { res.send("Bot is running!"); });
+app.get("/", (req, res) => { res.send("Bot is running perfectly with Realtime DB Sync!"); });
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
-// ================================
-// ⚙️ Bot Config & Automod Rules
-// ================================
+// ========================================================
+// ⚙️ Static Constants Configuration
+// ========================================================
 
 const TOKEN = process.env.TOKEN;
 const ALLOWED_GUILD_ID = "1488101970425155584";
@@ -99,7 +99,6 @@ const COVER_IMAGES = {
 
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
-// New Configs from User Requirements
 const STATS_VC_CHANNEL_ID = "1524321192079786005"; // 👥 মেম্বার কাউন্টার চ্যানেল আইডি
 const LEVEL_ROLE_ID = "1524322087295127552";
 const GIVEAWAY_CHANNEL_ID = "1488341249739198585";
@@ -109,10 +108,10 @@ const STAFF_ADMIN_LOG_ID = "1524324771502882877";
 const WEEKLY_REPORT_CHANNEL_ID = "1524326280923709550";
 const TRANSCRIPT_LOG_CHANNEL_ID = "1524326928268660807";
 
-// ফায়ারবেস থেকে লিংক লোড না হতে পারলে এই ব্যাকআপ লিংকটি কাজ করবে
+// 🕋 গ্লোবাল স্ট্রিম ভেরিয়েবল (ফায়ারবেস থেকে লাইভ সিঙ্ক হবে)
 let AUDIO_STREAM_URL = "https://stream.radiojar.com/0v9n06vcc9duv"; 
 
-// Databases
+// 📁 Local JSON Storage
 const DATA_FILE = "./database.json";
 const WELCOME_LOG_FILE = "./welcome_messages.json";
 const PUNISH_FILE = "./punishments.json"; 
@@ -137,41 +136,51 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// Firebase থেকে ডেটা নিয়ে আসার ফাংশন
-async function fetchFirebasePanelData(panelType) {
-    try {
-        const snapshot = await db.ref(`panels/${panelType}`).once("value");
-        const data = snapshot.val() || {};
+// ========================================================
+// 🔄 100% Realtime Database Data Synchronizer
+// ========================================================
+let globalFirebaseCache = {};
+
+// ফায়ারবেসের যেকোনো পরিবর্তন এটি লাইভ নজরদারি করবে (Realtime Listener)
+db.ref().on("value", (snapshot) => {
+    if (snapshot.exists()) {
+        globalFirebaseCache = snapshot.val();
+        console.log("⚡ [Realtime Database Sync]: ফায়ারবেসের নতুন ডেটা বোটে লাইভ আপডেট হয়েছে!");
         
-        const customDescription = data.description || null;
-        const customImage = data.image || null;
-
-        const options = Object.keys(data)
-            .filter(key => key !== "description" && key !== "image" && key !== "title")
-            .map(key => ({
-                label: data[key],
-                value: key
-            }));
-
-        if (options.length === 0) {
-            options.push({ label: "No Options Found in DB", value: "none" });
+        // যদি ফায়ারবেসে কোরআন স্ট্রিম চেঞ্জ করা হয়, তবে তা সাথে সাথে ভেরিয়েবলে আপডেট হবে
+        if (globalFirebaseCache.settings && globalFirebaseCache.settings.quran_stream_url) {
+            AUDIO_STREAM_URL = globalFirebaseCache.settings.quran_stream_url;
         }
-
-        return { options, customDescription, customImage, fullData: data };
-    } catch (error) {
-        console.error(`❌ Firebase Panel Data Fetch Error (${panelType}):`, error);
-        return { 
-            options: [{ label: "Error Loading from Database", value: "error" }], 
-            customDescription: null, 
-            customImage: null,
-            fullData: {}
-        };
     }
+}, (error) => {
+    console.error("❌ Realtime Sync Error:", error);
+});
+
+// লাইভ ক্যাশ থেকে প্যানেলের ডেটা প্রসেস করার ফাংশন
+function fetchFirebasePanelData(panelType) {
+    const panels = globalFirebaseCache.panels || {};
+    const data = panels[panelType] || {};
+    
+    const customDescription = data.description || null;
+    const customImage = data.image || null;
+
+    const options = Object.keys(data)
+        .filter(key => key !== "description" && key !== "image" && key !== "title")
+        .map(key => ({
+            label: data[key],
+            value: key
+        }));
+
+    if (options.length === 0) {
+        options.push({ label: "No Options Found in DB", value: "none" });
+    }
+
+    return { options, customDescription, customImage, fullData: data };
 }
 
-// ================================
+// ========================================================
 // 📂 Database Helper Functions
-// ================================
+// ========================================================
 
 function getSavedMembers() { if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify([]), "utf8"); return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
 function saveMembers(memberIds) { fs.writeFileSync(DATA_FILE, JSON.stringify(memberIds, null, 2), "utf8"); }
@@ -182,9 +191,9 @@ function savePunishment(userId, status, durationMs = null) { const punishments =
 function getOrderLogs() { if (!fs.existsSync(ORDER_LOG_FILE)) fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(ORDER_LOG_FILE, "utf8")); }
 function saveOrderLog(channelId, trackingMessageId, orderDetails) { const logs = getOrderLogs(); logs[channelId] = { trackingMessageId, ...orderDetails }; fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify(logs, null, 2), "utf8"); }
 
-// ================================
+// ========================================================
 // 🎉 Dynamic Welcome Embed Builder
-// ================================
+// ========================================================
 
 function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyTime = null) {
     let statusText = "❌ Unverified"; let color = "#FFA500"; 
@@ -205,9 +214,9 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
     return embed;
 }
 
-// ================================
+// ========================================================
 // 🛒 Order Status Embed Builder
-// ================================
+// ========================================================
 function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
     let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
     
@@ -237,7 +246,7 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
     }
     
-    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্তスタッフ", value: `${staff}`, inline: true });
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
     return embed;
 }
 
@@ -304,13 +313,10 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // লাইভ লিংক রেসপন্স
+    // লাইভ লিংক রেসপন্স (রিয়েল-টাইম ক্যাশ থেকে লোড হচ্ছে)
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
-        try {
-            const snapshot = await db.ref("settings/verification_link").once("value");
-            const dbLink = snapshot.val() || "কোনো লিংক ফায়ারবেসে পাওয়া যায়নি।";
-            return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${dbLink}\``);
-        } catch (err) {}
+        const dbLink = (globalFirebaseCache.settings && globalFirebaseCache.settings.verification_link) || "কোনো লিংক ফায়ারবেসে পাওয়া যায়নি।";
+        return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${dbLink}\``);
     }
 
     if (BAD_WORDS.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
@@ -334,9 +340,9 @@ client.on("messageCreate", async (message) => {
     }
 });
 
-// ================================
+// ========================================================
 // ⚡ PART 3 - Interaction Handling
-// ================================
+// ========================================================
 
 const verificationRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("universal_verify_button").setLabel("Verify Me").setStyle(ButtonStyle.Success)
@@ -346,14 +352,14 @@ function createVerificationEmbed() { return new EmbedBuilder().setTitle("🚨 Ve
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
-    // ⭐ [সংশোধিত ও ফিক্সড]: রেটিং বাটনের ইন্টারঅ্যাকশন হ্যান্ডেলিং (সবার উপরে দেওয়া হয়েছে যাতে ৩ সেকেন্ড এরর "This interaction failed" না আসে)
+    // ⭐ [সংশোধিত ও ফিক্সড]: রেটিং বাটনের ইন্টারঅ্যাকশন হ্যান্ডেলিং (সবার উপরে দ্রুত অ্যাকনলেজ রেসপন্স)
     if (interaction.isButton() && interaction.customId.startsWith("rate_staff_")) {
         try {
             await interaction.deferUpdate().catch(() => {}); 
-            const rating = interaction.customId.split("_")[2]; // ৫ স্টার, ৩ স্টার বা ১ স্টার বের করবে
+            const rating = interaction.customId.split("_")[2];
             return await interaction.editReply({ 
                 content: `❤️ রেটিং দেওয়ার জন্য আপনাকে ধন্যবাদ! আপনি আমাদের সাপোর্ট টিমকে **${rating} স্টার** দিয়েছেন।`, 
-                components: [] // বাটনগুলো মুছে দেওয়া হবে যাতে ২য় বার ক্লিক না করা যায়
+                components: [] 
             });
         } catch (err) {
             console.error("Rating Button Error:", err);
@@ -436,7 +442,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // ড্রপডাউন সিলেকশন এবং ফিক্সড কুপন মোডাল ট্রিগার
+    // ড্রপডাউন সিলেকশন এবং কুপন মোডাল ট্রিগার (লাইভ ক্যাশ ভেরিফাইড)
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -467,13 +473,13 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const category = interaction.customId.split("_")[2]; 
-        const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim();
+        const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
         
         let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
-        if (couponEntered.toUpperCase() !== "SKIP") {
-            const couponSnap = await db.ref(`coupons/${couponEntered.toUpperCase()}`).once("value");
-            if (couponSnap.exists()) {
-                discountText = `🎉 কুপন কোড \`${couponEntered.toUpperCase()}\` সফলভাবে অ্যাপ্লাই হয়েছে! আপনি পাচ্ছেন **${couponSnap.val()}** স্পেশাল ছাড়!`;
+        if (couponEntered !== "SKIP") {
+            const coupons = globalFirebaseCache.coupons || {};
+            if (coupons[couponEntered]) {
+                discountText = `🎉 কুপন কোড \`${couponEntered}\` সফলভাবে অ্যাপ্লাই হয়েছে! আপনি পাচ্ছেন **${coupons[couponEntered]}** স্পেশাল ছাড়!`;
             } else {
                 discountText = "⚠️ আপনি যে কুপন কোডটি দিয়েছেন তা ভ্যালিড নয় বা এক্সপায়ার হয়েছে। রেগুলার প্রাইস প্রযোজ্য।";
             }
@@ -718,11 +724,11 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ========================================================
-// 👥 রিয়েল-টাইম ভয়েস স্টেট মেম্বার কাউন্টার (রেট-লিমিট ও vunt/hunt লক প্রোটেকশনসহ)
+// 👥 রিয়েল-টাইম ভয়েস স্টেট মেম্বার কাউন্টার (রেট-লিমিট ও লক প্রোটেকশনসহ)
 // ========================================================
 let lastMemberCount = 0;
 let lastVcCount = 0;
-let lastUpdateTIme = 0; // সর্বশেষ কখন নাম আপডেট হয়েছে তার ট্র্যাকিং সময়
+let lastUpdateTIme = 0; 
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
@@ -770,11 +776,12 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
     }
 });
 
-// ================================
+// ========================================================
 // 📡 PART 4 - Core Bot Events & Setup
-// ================================
+// ========================================================
 
-client.once("ready", async () => {
+// d.js v14-v15 Deprecation ফিক্সড: clientReady ব্যবহার করা হয়েছে
+client.once("clientReady", async () => {
     console.log(`🚀 ${client.user.tag} হিসাবে সফলভাবে লগইন করা হয়েছে!`);
     setBotPresence();
 
@@ -839,8 +846,14 @@ client.on("guildMemberAdd", async (member) => {
     const punishments = getPunishments();
     if (punishments[member.id] && punishments[member.id].status === "Muted") {
         const remaining = punishments[member.id].expiresAt - Date.now();
-        if (remaining > 0) { await member.timeout(remaining, "Muted status persistent across rejoin").catch(() => {}); return; }
-        else { savePunishment(member.id, null); }
+        if (remaining > 0) { 
+            // TimeoutNegativeWarning ফিক্স: সময় মাইনাসে গেলে ১ সেকেন্ড ডিফল্ট সেভ করবে
+            const safeRemaining = remaining < 1000 ? 1000 : remaining;
+            await member.timeout(safeRemaining, "Muted status persistent across rejoin").catch(() => {}); 
+            return; 
+        } else { 
+            savePunishment(member.id, null); 
+        }
     }
 
     const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
@@ -869,7 +882,7 @@ client.on("guildMemberRemove", async (member) => {
     }
 });
 
-// রিয়েল-টাইম মেম্বার সিঙ্ক ইভেন্ট রিকভারি ব্যাকআপ কমান্ড
+// রিয়েল-টাইม মেম্বার সিঙ্ক ইভেন্ট রিকভারি ব্যাকআপ কমান্ড
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.content === "!syncmembers" && message.member.permissions.has(PermissionFlagsBits.Administrator)) {
@@ -891,22 +904,11 @@ function setBotPresence() {
     }); 
 }
 
-// 🕋 24/7 Quran Play Connection (Firebase Realtime DB সম্বলিত সংস্করণ)
+// 🕋 24/7 Quran Play Connection (Realtime DB Sync লুপসহ)
 async function connectVoice(guild) { 
     try { 
         const channel = guild.channels.cache.get(VOICE_CHANNEL_ID); 
         if (!channel) return; 
-
-        // 🔗 ఫায়ারবেস ডেটাবেজ থেকে লাইভ কোরআন তিলাওয়াত লিংক নিয়ে আসা (settings/quran_stream_url)
-        try {
-            const snapshot = await db.ref("settings/quran_stream_url").once("value");
-            if (snapshot.exists() && snapshot.val()) {
-                AUDIO_STREAM_URL = snapshot.val(); // ডাটাবেজের লিংকটি সেট হবে
-                console.log(`📡 ফায়ারবেস থেকে লাইভ তিলাওয়াত লিংক লোড হয়েছে: ${AUDIO_STREAM_URL}`);
-            }
-        } catch (dbErr) {
-            console.error("❌ ফায়ারবেস থেকে লিংক আনতে সমস্যা হয়েছে, ব্যাকআপ লিংক ব্যবহার করা হচ্ছে:", dbErr.message);
-        }
         
         const connection = joinVoiceChannel({ 
             channelId: channel.id, 
@@ -926,13 +928,12 @@ async function connectVoice(guild) {
         connection.subscribe(player); 
 
         player.on(AudioPlayerStatus.Idle, async () => { 
-            console.log("🔄 আল কোরআন তিলাওয়াত পুনরায় লুপে প্লে হচ্ছে...");
+            console.log("🔄 আল কোরআন তিলাওয়াত লাইভ লিংক থেকে পুনরায় লুপে প্লে হচ্ছে...");
             
-            // লুপ হওয়ার সময়ও চেক করবে ফায়ারবেস ডাটাবেজে লিংক আপডেট করা হয়েছে কি না
-            try {
-                const snap = await db.ref("settings/quran_stream_url").once("value");
-                if (snap.exists() && snap.val()) AUDIO_STREAM_URL = snap.val();
-            } catch (e) {}
+            // লুপ হওয়ার সময় গ্লোবাল ক্যাশ থেকে লিংক রিলোড হবে
+            if (globalFirebaseCache.settings && globalFirebaseCache.settings.quran_stream_url) {
+                AUDIO_STREAM_URL = globalFirebaseCache.settings.quran_stream_url;
+            }
 
             const nextResource = createAudioResource(AUDIO_STREAM_URL, { inlineVolume: true });
             nextResource.volume?.setVolume(0.8);
@@ -941,7 +942,6 @@ async function connectVoice(guild) {
 
         player.on('error', error => {
             console.error('❌ Audio Player Error:', error.message);
-            // অডিও ড্রপ বা নেটওয়ার্ক এরর আসলে ৫ সেকেন্ড পর আবার কানেক্ট করার চেষ্টা করবে
             setTimeout(() => connectVoice(guild), 5000); 
         });
 
