@@ -24,8 +24,14 @@ const {
 } = require("discord.js");
 
 const {
-    joinVoiceChannel
+    joinVoiceChannel,
+    createAudioPlayer,
+    createAudioResource,
+    AudioPlayerStatus
 } = require("@discordjs/voice");
+
+// html-transcripts ইম্পোর্ট
+const discordTranscripts = require("discord-html-transcripts");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -93,6 +99,17 @@ const COVER_IMAGES = {
 
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
+// New Configs from User Requirements
+const STATS_VC_CHANNEL_ID = "1524321192079786005";
+const LEVEL_ROLE_ID = "1524322087295127552";
+const GIVEAWAY_CHANNEL_ID = "1488341249739198585";
+const EMBED_NOTICE_CHANNEL_ID = "1488338739850772641";
+const SOCIAL_FEED_CHANNEL_ID = "1488338739850772641";
+const STAFF_ADMIN_LOG_ID = "1524324771502882877";
+const WEEKLY_REPORT_CHANNEL_ID = "1524326280923709550";
+const TRANSCRIPT_LOG_CHANNEL_ID = "1524326928268660807";
+const AUDIO_STREAM_URL = "https://server11.fmlistening.com/8056_time"; // Quran Audio Stream (ডিফল্ট লাইভ ফ্রেম)
+
 // Databases
 const DATA_FILE = "./database.json";
 const WELCOME_LOG_FILE = "./welcome_messages.json";
@@ -109,9 +126,10 @@ const client = new Client({
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildVoiceStates
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.GuildMessageReactions
     ],
-    partials: [Partials.Channel, Partials.GuildMember]
+    partials: [Partials.Channel, Partials.GuildMember, Partials.Message, Partials.Reaction]
 });
 
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
@@ -217,13 +235,27 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
     }
     
-    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্তスタッフ", value: `${staff}`, inline: true });
     return embed;
 }
 
 // ================================
-// 🚨 Automod Rules + Anti-Link System
+// 🚨 Automod Rules + Anti-Link System + Caps/Ghost-Ping
 // ================================
+
+// Ghost Ping ট্র্যাকিং এর জন্য ডিলিট ইভেন্ট
+client.on("messageDelete", async (message) => {
+    if (!message.guild || message.author?.bot) return;
+    if (message.mentions.users.size > 0 || message.mentions.roles.size > 0) {
+        const targets = [...message.mentions.users.values()].map(u => u.toString()).join(" ") || [...message.mentions.roles.values()].map(r => r.toString()).join(" ");
+        const ghostEmbed = new EmbedBuilder()
+            .setColor("Red")
+            .setTitle("🛑 Ghost Ping Detected")
+            .setDescription(`**কারা করেছে:** ${message.author}\n**চ্যানেল:** ${message.channel}\n**যাকে ট্যাগ করা হয়েছিল:** ${targets}\n**মেসেজ:** ${message.content || "*কোনো লেখা নেই*"}`)
+            .setTimestamp();
+        message.channel.send({ embeds: [ghostEmbed] }).then(m => setTimeout(() => m.delete().catch(() => {}), 10000));
+    }
+});
 
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
@@ -234,26 +266,54 @@ client.on("messageCreate", async (message) => {
     let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // 🔗 [FEATURE]: Anti-Link Spam (মেসেজে অন্য লিংক থাকলে সাথে সাথে ডিলিট যেন অন্য কেও দেখতে না পারে)
+    // 🛑 Caps-Lock Protection (৭০% এর বেশি বড় হাতের অক্ষর)
+    const upperCount = message.content.replace(/[^A-Z]/g, "").length;
+    const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
+    if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
+        try { await message.delete().catch(() => {}); } catch(e){}
+        const capsWarn = await message.channel.send(`⚠️ <@${userId}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর (Caps Lock) ব্যবহার করবেন না।`);
+        setTimeout(() => capsWarn.delete().catch(() => {}), 5000);
+        return;
+    }
+
+    // 🎮 Activity Leveling (Firebase XP System)
+    const xpRef = db.ref(`leveling/${userId}`);
+    xpRef.transaction((current) => {
+        if (!current) {
+            return { xp: 10, level: 1 };
+        } else {
+            let nextXp = (current.xp || 0) + Math.floor(Math.random() * 5) + 5;
+            let nextLevel = current.level || 1;
+            let neededXp = nextLevel * 100;
+            if (nextXp >= neededXp) {
+                nextXp -= neededXp;
+                nextLevel += 1;
+                
+                // লেভেল আপ নোটিফিকেশন এবং রোল রিওয়ার্ড
+                message.channel.send(`🎉 অভিনন্দন <@${userId}>! আপনি লেভেল **${nextLevel}** এ উন্নীত হয়েছেন।`).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
+                message.member.roles.add(LEVEL_ROLE_ID).catch(() => {});
+            }
+            return { xp: nextXp, level: nextLevel };
+        }
+    });
+
+    // 🔗 [FEATURE]: Anti-Link Spam
     const linkRegex = /(https?:\/\/[^\s]+)/g;
     if (linkRegex.test(message.content)) {
         try { 
             await message.delete().catch(() => {}); 
         } catch(e){}
         
-        // তাৎক্ষণিক ওয়ার্নিং (৫ সেকেন্ড পর মুছে যাবে)
         const linkWarn = await message.channel.send(`⚠️ <@${userId}>, সার্ভারে কোনো প্রকার বাইরের লিংক ছড়ানো সম্পূর্ণ নিষিদ্ধ! আপনার মেসেজটি সফলভাবে হাইড/মুছে ফেলা হয়েছে।`);
         setTimeout(() => linkWarn.delete().catch(() => {}), 5000);
         return;
     }
 
-    // 🔍 [FEATURE]: বাংলা/ইংরেজি যেকোনো ফরম্যাটে "লিংক" চাইলে ফায়ারবেস থেকে কপিযোগ্য রেসপন্স
+    // 🔍 [FEATURE]: লাইভ লিংক রেসপন্স
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
         try {
             const snapshot = await db.ref("settings/verification_link").once("value");
             const dbLink = snapshot.val() || "কোনো লিংক ফায়ারবেসে পাওয়া যায়নি।";
-            
-            // ব্যাকটিক্স (``) দিয়ে পাঠানো হয়েছে যাতে ইউজার এক ক্লিকে সম্পূর্ণ লিংক কপি করতে পারে
             return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${dbLink}\``);
         } catch (err) {
             console.error("Firebase Link Load Error:", err);
@@ -295,7 +355,7 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isButton() || interaction.isStringSelectMenu()) {
         const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
-        if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_")) return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
+        if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_") && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_")) return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
         cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
@@ -306,10 +366,68 @@ client.on("interactionCreate", async (interaction) => {
             if (!role) return interaction.editReply("❌ Role not found!");
             if (interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
             await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
+            
+            // উইকলি গ্রোথ ট্র্যাকিং
+            db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
+
             const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
             if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(interaction.member, "verified", userLog.isOffline, Date.now()); await msg.edit({ embeds: [updatedEmbed] }); } } catch (e) {} }
         } catch (err) { console.error(err); }
         return;
+    }
+
+    // Giveaway বাটনে ক্লিক ট্র্যাকিং
+    if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
+        const gwId = interaction.customId.split("_")[2];
+        const participantRef = db.ref(`giveaways/${gwId}/participants/${interaction.user.id}`);
+        const snap = await participantRef.once("value");
+        if (snap.exists()) {
+            return interaction.reply({ content: "❌ আপনি অলরেডি এই গিভঅ্যাওয়েতে জয়েন করেছেন!", flags: [MessageFlags.Ephemeral] });
+        }
+        await participantRef.set(interaction.user.tag);
+        
+        // কাউন্ট আপডেট করা
+        const fullSnap = await db.ref(`giveaways/${gwId}`).once("value");
+        const gwData = fullSnap.val();
+        const count = Object.keys(gwData.participants || {}).length;
+        
+        const embed = EmbedBuilder.from(interaction.message.embeds[0]);
+        embed.setFields({ name: "🎉 এন্ট্রি সংখ্যা", value: `\`${count}\` জন মেম্বার`, inline: true });
+        await interaction.message.edit({ embeds: [embed] });
+
+        return interaction.reply({ content: "✅ আপনি সফলভাবে গিভঅ্যাওয়েতে নাম এন্ট্রি করেছেন!", flags: [MessageFlags.Ephemeral] });
+    }
+
+    // এডভান্সড টিকেট রেটিং ফিডব্যাক সিস্টেম
+    if (interaction.isButton() && interaction.customId.startsWith("star_rating_")) {
+        const [, , stars, staffId] = interaction.customId.split("_");
+        
+        const modal = new ModalBuilder().setCustomId(`modal_feedback_${stars}_${staffId}`).setTitle("📝 Ticket Support Feedback");
+        const commentInput = new TextInputBuilder().setCustomId("feedback_comment").setLabel("আপনার মূল্যবান মতামতটি লিখুন (ঐচ্ছিক)").setStyle(TextInputStyle.Paragraph).setRequired(false);
+        modal.addComponents(new ActionRowBuilder().addComponents(commentInput));
+        return interaction.showModal(modal);
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_feedback_")) {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const [, , stars, staffId] = interaction.customId.split("_");
+        const comment = interaction.fields.getTextInputValue("feedback_comment") || "কোনো কমেন্ট নেই।";
+        
+        const reviewChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID); // রিভিউ সরাসরি মেইন লগে সাবমিট হবে
+        if (reviewChannel) {
+            const reviewEmbed = new EmbedBuilder()
+                .setTitle("⭐ NEW SUPPORT FEEDBACK")
+                .setColor("Gold")
+                .addFields(
+                    { name: "👤 কাস্টমার", value: `${interaction.user}`, inline: true },
+                    { name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `<@${staffId}>`, inline: true },
+                    { name: "📊 রেটিং স্কোর", value: `${"⭐".repeat(parseInt(stars))}`, inline: false },
+                    { name: "💬 কাস্টমার কমেন্ট", value: `\`\`\`${comment}\`\`\``, inline: false }
+                )
+                .setTimestamp();
+            await reviewChannel.send({ embeds: [reviewEmbed] });
+        }
+        return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
@@ -323,14 +441,40 @@ client.on("interactionCreate", async (interaction) => {
         else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${value}`; } 
 
         if (type === "order") {
-            const payEmbed = new EmbedBuilder().setTitle(`💳 Payment Gateway: ${value.toUpperCase().replace("_", " ")}`).setDescription(`আপনার অর্ডারটি প্রসেস করতে নিচে দেওয়া **"Pay via Gateway"** বাটনে ক্লিক করে অটোমেটিক পেমেন্ট সম্পন্ন করুন এবং প্রাপ্ত Transaction ID সাবমিট করুন।`).setColor(embedColor);
-            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`submit_txn_${value}`).setLabel("Pay via Gateway & Submit TxnID").setStyle(ButtonStyle.Primary));
-            return interaction.reply({ embeds: [payEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
+            // কুপন ভাউচার ডিসকাউন্ট সিস্টেম ইন্টিগ্রেশন করার জন্য প্রম্পট করা মোডাল
+            const modal = new ModalBuilder().setCustomId(`modal_coupon_check_${value}`).setTitle("🎟️ Coupon / Discount Code");
+            const couponInput = new TextInputBuilder().setCustomId("coupon_code_input").setLabel("ডিসকাউন্ট কুপন কোড (থাকলে দিন, না থাকলে SKIP লিখুন)").setStyle(TextInputStyle.Short).setValue("SKIP").setRequired(true);
+            modal.addComponents(new ActionRowBuilder().addComponents(couponInput));
+            return interaction.showModal(modal);
         } else if (type) {
             const ephemeralEmbed = new EmbedBuilder().setTitle(`📌 Selected Category: ${value.toUpperCase().replace("_", " ")}`).setDescription(`চ্যানেল তৈরি করতে নিচের বাটনে চাপ দিন।`).setColor(embedColor);
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(buttonId).setLabel(`Create ${type.toUpperCase()}`).setStyle(ButtonStyle.Success));
             return interaction.reply({ embeds: [ephemeralEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
         }
+    }
+
+    // কুপন ভেরিফিকেশন মোডাল হ্যান্ডলার
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_check_")) {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const category = interaction.customId.split("_")[3];
+        const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim();
+        
+        let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
+        if (couponEntered.toUpperCase() !== "SKIP") {
+            const couponSnap = await db.ref(`coupons/${couponEntered.toUpperCase()}`).once("value");
+            if (couponSnap.exists()) {
+                discountText = `🎉 কুপন কোড \`${couponEntered.toUpperCase()}\` সফলভাবে অ্যাপ্লাই হয়েছে! আপনি পাচ্ছেন **${couponSnap.val()}** স্পেশাল ছাড়!`;
+            } else {
+                discountText = "⚠️ আপনি যে কুপন কোডটি দিয়েছেন তা ভ্যালিড নয় বা এক্সপায়ার হয়েছে। রেগুলার প্রাইস প্রযোজ্য।";
+            }
+        }
+
+        const payEmbed = new EmbedBuilder()
+            .setTitle(`💳 Payment Gateway: ${category.toUpperCase().replace("_", " ")}`)
+            .setDescription(`আপনার অর্ডারটি প্রসেস করতে নিচে দেওয়া **"Pay via Gateway"** বাটনে ক্লিক করে অটোমেটিক পেমেন্ট সম্পন্ন করুন এবং প্রাপ্ত Transaction ID সাবমিট করুন।\n\n🎁 **ডিসকাউন্ট স্ট্যাটাস:** ${discountText}`)
+            .setColor("#9B59B6");
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`submit_txn_${category}`).setLabel("Pay via Gateway & Submit TxnID").setStyle(ButtonStyle.Primary));
+        return interaction.editReply({ embeds: [payEmbed], components: [row] });
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
@@ -427,6 +571,9 @@ client.on("interactionCreate", async (interaction) => {
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
         await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
         await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
+        
+        // স্টাফ ডিউটি পারফরম্যান্স ট্র্যাকিং (টিকিট সংখ্যা বৃদ্ধি)
+        db.ref(`staff_duty/${interaction.user.id}/claims`).transaction(c => (c || 0) + 1);
         return;
     }
 
@@ -459,8 +606,45 @@ client.on("interactionCreate", async (interaction) => {
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
 
-        await interaction.reply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
+        // 📜 [FEATURE]: HTML Transcript System (চ্যাট ব্যাকআপ)
+        try {
+            const transcriptLogChan = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
+            if (transcriptLogChan) {
+                const attachment = await discordTranscripts.createTranscript(interaction.channel, {
+                    limit: -1,
+                    fileName: `transcript-${interaction.channel.name}.html`,
+                    returnType: 'attachment',
+                    poweredBy: false
+                });
+                await transcriptLogChan.send({
+                    content: `📜 **টিকিট ব্যাকআপ লগ:** চ্যানেল \`#${interaction.channel.name}\` বন্ধ করেছেন ${interaction.user}.`,
+                    files: [attachment]
+                });
+            }
+        } catch (transErr) {
+            console.error("Transcript Error:", transErr);
+        }
+
+        // ক্লোজ করার আগে কাস্টমারের কাছে ৫ স্টার ফিডব্যাক প্যানেল পাঠানো
         const orderLogs = getOrderLogs(); const currentOrder = orderLogs[interaction.channel.id];
+        const staffOwnerId = currentOrder?.staffId || interaction.user.id;
+        
+        const feedbackRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`star_rating_1_${staffOwnerId}`).setLabel("⭐ 1").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`star_rating_2_${staffOwnerId}`).setLabel("⭐ 2").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`star_rating_3_${staffOwnerId}`).setLabel("⭐ 3").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`star_rating_4_${staffOwnerId}`).setLabel("⭐ 4").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`star_rating_5_${staffOwnerId}`).setLabel("⭐ 5").setStyle(ButtonStyle.Primary)
+        );
+
+        if (currentOrder) {
+            const targetUserObj = await interaction.guild.members.fetch(currentOrder.userId).catch(() => null);
+            if (targetUserObj) {
+                await targetUserObj.send({ content: "👋 আমাদের সাপোর্ট টিম আপনাকে কেমন সাহায্য করলো? নিচে ক্লিক করে আপনার রেটিং দিন:", components: [feedbackRow] }).catch(() => {});
+            }
+        }
+
+        await interaction.reply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
         const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
         if (currentOrder && trackingChannel) {
             try {
@@ -587,9 +771,90 @@ async function getDynamicPaymentPanel() {
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
 }
 
-// Manual Setup Commands
+// Manual Setup & Staff Commands
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
+    
+    // 🛟 Staff Duty Tracker System (!duty on / !duty off)
+    if (message.content === "!duty on") {
+        if (!message.member.roles.cache.has(ROLES.SUPPORT_CUSTOMER) && !message.member.roles.cache.has(ROLES.SUPPORT_TICKET_REPORT) && !message.member.roles.cache.has(ROLES.ADMIN)) return;
+        await db.ref(`staff_duty/${message.author.id}/status`).set({ startTime: Date.now(), state: "ON" });
+        return message.reply("🟢 আপনি এখন সাকসেসফুলি অন-ডিউটিতে আছেন। বটের মাধ্যমে আপনার টাইম কাউন্ট করা শুরু হয়েছে।");
+    }
+
+    if (message.content === "!duty off") {
+        if (!message.member.roles.cache.has(ROLES.SUPPORT_CUSTOMER) && !message.member.roles.cache.has(ROLES.SUPPORT_TICKET_REPORT) && !message.member.roles.cache.has(ROLES.ADMIN)) return;
+        const dutyRef = db.ref(`staff_duty/${message.author.id}`);
+        const snap = await dutyRef.once("value");
+        const data = snap.val();
+        if (!data || data.status?.state !== "ON") return message.reply("⚠️ আপনি তো ডিউটিতে অন ছিলেন না!");
+
+        const elapsedMs = Date.now() - data.status.startTime;
+        const totalMinutes = Math.floor(elapsedMs / (1000 * 60));
+        
+        await dutyRef.child("totalMinutes").transaction(m => (m || 0) + totalMinutes);
+        await dutyRef.child("status").set({ state: "OFF" });
+
+        const staffLogChan = message.guild.channels.cache.get(STAFF_ADMIN_LOG_ID);
+        if (staffLogChan) {
+            const finalSnap = await dutyRef.once("value");
+            const totalClaims = finalSnap.val().claims || 0;
+            const updatedMinutes = finalSnap.val().totalMinutes || 0;
+
+            const logEmbed = new EmbedBuilder()
+                .setTitle("🕒 STAFF DUTY REPORT")
+                .setColor("Orange")
+                .addFields(
+                    { name: "👤 স্টাফ", value: `${message.author}`, inline: true },
+                    { name: "⏱️ এই সেশনের সময়", value: `\`${totalMinutes}\` মিনিট`, inline: true },
+                    { name: "📊 মোট ডিউটি টাইম", value: `\`${updatedMinutes}\` মিনিট`, inline: true },
+                    { name: "🎫 মোট হ্যান্ডেলড টিকেট", value: `\`${totalClaims}\` টি`, inline: true }
+                )
+                .setTimestamp();
+            await staffLogChan.send({ embeds: [logEmbed] });
+        }
+        return message.reply(`🔴 ডিউটি অফ করা হয়েছে। এই সেশনে মোট \`${totalMinutes}\` মিনিট কাজ করেছেন। আপনার সামগ্রিক পারফরম্যান্স রিপোর্ট অ্যাডমিন লগে পাঠানো হয়েছে।`);
+    }
+
+    // 🎁 Live Giveaway Commands (!giveaway <সময় মিনিট> <উইনার সংখ্যা> <পুরস্কার>)
+    if (message.content.startsWith("!giveaway")) {
+        if (!message.member.permissions.has(PermissionFlagsBits.Administrator) && !message.member.roles.cache.has(ROLES.ADMIN)) return;
+        const args = message.content.split(" ");
+        const duration = parseInt(args[1]);
+        const winnersCount = parseInt(args[2]);
+        const prize = args.slice(3).join(" ");
+
+        if (!duration || !winnersCount || !prize) return message.reply("⚠️ সঠিক ফরম্যাট: `!giveaway <সময় মিনিটে> <উইনার সংখ্যা> <পুরস্কারের নাম>`");
+
+        const gwId = `gw_${Date.now()}`;
+        const endAt = Date.now() + (duration * 60 * 1000);
+
+        const gwEmbed = new EmbedBuilder()
+            .setTitle(`🎁 GIVEAWAY STARTED: ${prize}`)
+            .setDescription(`**সময়সীমা:** <t:${Math.floor(endAt / 1000)}:R> (<t:${Math.floor(endAt / 1000)}:F>)\n**উইনার সংখ্যা:** \`${winnersCount}\` জন\n\n👇 নিচের বাটনে ক্লিক করে ফ্রিতে জয়েন করুন!`)
+            .setColor("Purple")
+            .setFields({ name: "🎉 এন্ট্রি সংখ্যা", value: "`0` জন মেম্বার", inline: true })
+            .setTimestamp();
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`giveaway_join_${gwId}`).setLabel("🎉 Join Giveaway").setStyle(ButtonStyle.Primary)
+        );
+
+        const gwChan = message.guild.channels.cache.get(GIVEAWAY_CHANNEL_ID);
+        if (gwChan) {
+            const gwMsg = await gwChan.send({ embeds: [gwEmbed], components: [row] });
+            await db.ref(`giveaways/${gwId}`).set({
+                msgId: gwMsg.id,
+                endAt: endAt,
+                winnersCount: winnersCount,
+                prize: prize,
+                ended: false
+            });
+            message.reply(`✅ গিভঅ্যাওয়েটি সফলভাবে <#${GIVEAWAY_CHANNEL_ID}> চ্যানেলে স্টার্ট করা হয়েছে।`);
+        }
+        return;
+    }
+
     const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN);
     if (!isServerAdmin) return;
 
@@ -611,6 +876,85 @@ client.on("messageCreate", async (message) => {
 // ================================
 
 function listenToFirebaseUpdates() {
+    // 8. 📜 Embed Builder Web-hook integration via Firebase Realtime DB
+    db.ref("embed_notices").on("child_added", async (snapshot) => {
+        const data = snapshot.val();
+        if (!data || data.posted) return;
+        
+        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+        if (!guild) return;
+        
+        const noticeChan = guild.channels.cache.get(EMBED_NOTICE_CHANNEL_ID);
+        if (noticeChan) {
+            const embed = new EmbedBuilder()
+                .setTitle(data.title || "📢 SERVER ANNOUNCEMENT")
+                .setDescription(data.description || "")
+                .setColor(data.color || "Blue")
+                .setTimestamp();
+            if (data.image) embed.setImage(data.image);
+            await noticeChan.send({ embeds: [embed] });
+            await snapshot.ref.update({ posted: true });
+        }
+    });
+
+    // 12. 🔗 Social Media Auto-Notification
+    db.ref("social_feeds").on("child_added", async (snapshot) => {
+        const data = snapshot.val();
+        if (!data || data.notified) return;
+
+        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+        if (!guild) return;
+
+        const feedChan = guild.channels.cache.get(SOCIAL_FEED_CHANNEL_ID);
+        if (feedChan) {
+            const feedEmbed = new EmbedBuilder()
+                .setTitle("🔔 NEW SOCIAL MEDIA UPDATE!")
+                .setDescription(`🚀 আমাদের সোশ্যাল মিডিয়ায় একটি নতুন পোস্ট আপলোড করা হয়েছে!\n\n🔗 **লিংক ও কন্টেন্ট:** [এখানে ক্লিক করুন](${data.link})`)
+                .setColor("Red")
+                .setTimestamp();
+            await feedChan.send({ content: `@everyone`, embeds: [feedEmbed] });
+            await snapshot.ref.update({ notified: true });
+        }
+    });
+
+    // 4. 🎁 Giveaway Panel System Firebase Monitor & Trigger
+    db.ref("giveaway_panels").on("value", async (snapshot) => {
+        const data = snapshot.val();
+        if (!data) return;
+
+        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+        if (!guild) return;
+
+        const gwChan = guild.channels.cache.get(GIVEAWAY_CHANNEL_ID);
+        if (!gwChan) return;
+
+        const messages = await gwChan.messages.fetch({ limit: 10 }).catch(() => null);
+        const hasBotMsg = messages?.some(m => m.author.id === client.user.id);
+
+        if (!hasBotMsg && data.active === true) {
+            const endAt = Date.now() + (parseInt(data.durationMinutes || 60) * 60 * 1000);
+            const gwEmbed = new EmbedBuilder()
+                .setTitle(`🎁 LIVE GIVEAWAY: ${data.prize || "Premium Gift"}`)
+                .setDescription(`**সময়সীমা:** <t:${Math.floor(endAt / 1000)}:R>\n**উইনার সংখ্যা:** \`${data.winnersCount || 1}\` জন\n\n👇 নিচের বাটনে ক্লিক করে ফ্রিতে জয়েন করুন!`)
+                .setColor("Purple")
+                .setFields({ name: "🎉 এন্ট্রি সংখ্যা", value: "`0` জন মেম্বার", inline: true })
+                .setTimestamp();
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`giveaway_join_dbpanel`).setLabel("🎉 Join Giveaway").setStyle(ButtonStyle.Primary)
+            );
+
+            const sent = await gwChan.send({ embeds: [gwEmbed], components: [row] });
+            await db.ref(`giveaways/dbpanel`).set({
+                msgId: sent.id,
+                endAt: endAt,
+                winnersCount: parseInt(data.winnersCount || 1),
+                prize: data.prize || "Premium Gift",
+                ended: false
+            });
+        }
+    });
+
     db.ref("panels").on("value", async (snapshot) => {
         const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
         if (!guild) return;
@@ -662,6 +1006,90 @@ function listenToFirebaseUpdates() {
     });
 }
 
+// 🕒 প্রতি ৫ মিনিট পর পর কাউন্টার চ্যানেল এবং গিভঅ্যাওয়ে চেকার ইন্টারভাল রান
+setInterval(async () => {
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (!guild) return;
+
+    // ২. 📊 Server Live Stats & Voice Counter Channels (প্রতি ৫ মিনিটে কাউন্টার চ্যানেল নেম আপডেট)
+    const statsChannel = guild.channels.cache.get(STATS_VC_CHANNEL_ID);
+    if (statsChannel) {
+        const totalMembers = guild.memberCount;
+        const activeInVc = guild.members.cache.filter(m => m.voice.channel).size;
+        await statsChannel.setName(`👥 Members: ${totalMembers} | 🎙️ VC: ${activeInVc}`).catch(() => {});
+    }
+
+    // 🎁 Giveaway Realtime Database Live Checker & Handler
+    const now = Date.now();
+    const gwsSnap = await db.ref("giveaways").once("value");
+    const giveaways = gwsSnap.val() || {};
+
+    for (const [gwId, gw] of Object.entries(giveaways)) {
+        if (!gw.ended && now >= gw.endAt) {
+            const gwChan = guild.channels.cache.get(GIVEAWAY_CHANNEL_ID);
+            if (gwChan) {
+                const participants = gw.participants ? Object.keys(gw.participants) : [];
+                let winners = [];
+                
+                if (participants.length > 0) {
+                    const count = Math.min(gw.winnersCount, participants.length);
+                    for (let i = 0; i < count; i++) {
+                        const randIndex = Math.floor(Math.random() * participants.length);
+                        winners.push(`<@${participants.splice(randIndex, 1)[0]}>`);
+                    }
+                }
+
+                const winText = winners.length > 0 ? winners.join(", ") : "কেউ জয়েন করেনি ❌";
+                const endEmbed = new EmbedBuilder()
+                    .setTitle(`🎁 GIVEAWAY CONCLUDED / WINNERS!`)
+                    .setDescription(`**পুরস্কার:** \`${gw.prize}\`\n🎉 **উইনারগণ:** ${winText}`)
+                    .setColor("Green")
+                    .setTimestamp();
+                
+                await gwChan.send({ content: `🎊 অভিনন্দন উইনারদের! ${winText}`, embeds: [endEmbed] });
+                await db.ref(`giveaways/${gwId}/ended`).set(true);
+            }
+        }
+    }
+}, 5 * 60 * 1000);
+
+// ১৫. 📈 Weekly Server Growth Analytics Report Cron (প্রতি রবিবার রাত ১২ টায় চলবে)
+setInterval(async () => {
+    const d = new Date();
+    if (d.getDay() === 0 && d.getHours() === 0 && d.getMinutes() === 0) { // রবিবার রাত ১২:০০ টা
+        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+        if (!guild) return;
+
+        const reportChan = guild.channels.cache.get(WEEKLY_REPORT_CHANNEL_ID);
+        if (reportChan) {
+            const joinsSnap = await db.ref("analytics/joins").once("value");
+            const leavesSnap = await db.ref("analytics/leaves").once("value");
+
+            const totalJoins = joinsSnap.exists() ? Object.keys(joinsSnap.val()).length : 0;
+            const totalLeaves = leavesSnap.exists() ? Object.keys(leavesSnap.val()).length : 0;
+            const statusRatio = totalJoins - totalLeaves;
+
+            const weeklyEmbed = new EmbedBuilder()
+                .setTitle("📈 WEEKLY SERVER GROWTH & STATS REPORT")
+                .setColor("Green")
+                .setDescription(`সার্ভারের গত সপ্তাহের মেম্বার জয়েন ও লিভের সম্পূর্ণ ডাটা অ্যানালাইসিস নিচে দেওয়া হলো:`)
+                .addFields(
+                    { name: "📥 মোট জয়েন মেম্বার", value: `\`${totalJoins}\` জন`, inline: true },
+                    { name: "📤 মোট লিভ মেম্বার", value: `\`${totalLeaves}\` জন`, inline: true },
+                    { name: "📊 নেট গ্রোথ রেশিও", value: `\`${statusRatio >= 0 ? "+" + statusRatio : statusRatio}\` মেম্বার`, inline: false }
+                )
+                .setTimestamp()
+                .setFooter({ text: "Weekly Analytics Engine", iconURL: client.user.displayAvatarURL() });
+
+            await reportChan.send({ embeds: [weeklyEmbed] });
+
+            // ডাটাবেস রিসেট নতুন সপ্তাহের জন্য
+            await db.ref("analytics/joins").remove();
+            await db.ref("analytics/leaves").remove();
+        }
+    }
+}, 60000);
+
 // ================================
 // 🚀 PART 5 - Live Member Events & Smart Sync Recovery
 // ================================
@@ -674,6 +1102,10 @@ client.on("guildMemberAdd", async (member) => {
 
 client.on("guildMemberRemove", async (member) => {
     if (member.guild.id !== ALLOWED_GUILD_ID) return; const saved = getSavedMembers(); saveMembers(saved.filter(id => id !== member.id));
+    
+    // উইকলি গ্রোথ ডাটা ট্র্যাকিং
+    db.ref(`analytics/leaves/${Date.now()}`).set(member.id);
+
     const logs = getWelcomeLogs(); const userLog = logs[member.id]; const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID);
     if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(member, "left", userLog.isOffline); await msg.edit({ content: `🚫 **${member.user.tag}** সার্ভার থেকে বিদায় নিয়েছেন।`, embeds: [updatedEmbed] }); } } catch (e) {} }
 });
@@ -756,11 +1188,25 @@ function setBotPresence() {
     }); 
 }
 
+// ১৪. 🎵 24/7 Quran Audio Player inside Voice (অডিও প্লেয়ার এবং লাইভ ফ্রেম মেকানিজম)
 async function connectVoice(guild) { 
     try { 
         const channel = guild.channels.cache.get(VOICE_CHANNEL_ID); 
         if (!channel) return; 
-        joinVoiceChannel({ channelId: channel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true, selfMute: false }); 
+        const connection = joinVoiceChannel({ channelId: channel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true, selfMute: false }); 
+        
+        // প্লেয়ার মেকানিজম এবং ব্যাকগ্রাউন্ড ২৪/৭ লাইভ স্ট্রিম
+        const player = createAudioPlayer();
+        const resource = createAudioResource(AUDIO_STREAM_URL);
+        player.play(resource);
+        connection.subscribe(player);
+
+        player.on(AudioPlayerStatus.Idle, () => {
+            const nextResource = createAudioResource(AUDIO_STREAM_URL);
+            player.play(nextResource);
+        });
+        player.on('error', error => { console.error('Audio Player Error:', error); });
+
     } catch (e) { console.error("❌ Voice Connect Error:", e); } 
 }
 
