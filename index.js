@@ -27,7 +27,7 @@ const {
     joinVoiceChannel
 } = require("@discordjs/voice");
 
-// ✅ আপনার আগের রেনডার Environment Variable থেকে সরাসরি অবজেক্ট লোড করার পারফেক্ট লজিক
+// রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
 try {
     if (process.env.FIREBASE_CONFIG) {
@@ -123,7 +123,6 @@ async function fetchFirebasePanelData(panelType) {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
         const data = snapshot.val() || {};
         
-        // ডেসক্রিপশন এবং ইমেজ ফায়ারবেস থেকে ফিল্টার করা হচ্ছে
         const customDescription = data.description || null;
         const customImage = data.image || null;
 
@@ -187,7 +186,7 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
 }
 
 // ================================
-// 🛒 Order Status Embed Builder (গোপন নম্বর মাস্কিং সহ)
+// 🛒 Order Status Embed Builder
 // ================================
 function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
     let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
@@ -208,7 +207,6 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         .setTimestamp()
         .setFooter({ text: "Order Update System" });
 
-    // ✅ এখানে ট্রানজেকশন আইডি বা গোপন নম্বরটি মাঝখান থেকে লুকাতে `****` ফরম্যাট করা হয়েছে
     if (txnId) {
         let maskedTxnId = txnId;
         if (txnId.length > 4) {
@@ -219,7 +217,7 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
     }
     
-    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্তスタッフ", value: `${staff}`, inline: true });
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
     return embed;
 }
 
@@ -230,23 +228,33 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
-    const userId = message.author.id; let triggerAutomod = false; let reason = "";
+    
+    const userId = message.author.id; 
+    let triggerAutomod = false; 
+    let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // 🔗 [FEATURE]: Anti-Link Spam & Verification Suggestion System
+    // 🔗 [FEATURE]: Anti-Link Spam (মেসেজে অন্য লিংক থাকলে সাথে সাথে ডিলিট যেন অন্য কেও দেখতে না পারে)
     const linkRegex = /(https?:\/\/[^\s]+)/g;
     if (linkRegex.test(message.content)) {
-        try { await message.delete().catch(() => {}); } catch(e){}
-        const linkWarn = await message.channel.send(`⚠️ <@${userId}>, সার্ভারে কোনো প্রকার লিংক ছড়ানো সম্পূর্ণ নিষিদ্ধ!`);
+        try { 
+            await message.delete().catch(() => {}); 
+        } catch(e){}
+        
+        // তাৎক্ষণিক ওয়ার্নিং (৫ সেকেন্ড পর মুছে যাবে)
+        const linkWarn = await message.channel.send(`⚠️ <@${userId}>, সার্ভারে কোনো প্রকার বাইরের লিংক ছড়ানো সম্পূর্ণ নিষিদ্ধ! আপনার মেসেজটি সফলভাবে হাইড/মুছে ফেলা হয়েছে।`);
         setTimeout(() => linkWarn.delete().catch(() => {}), 5000);
         return;
     }
 
+    // 🔍 [FEATURE]: বাংলা/ইংরেজি যেকোনো ফরম্যাটে "লিংক" চাইলে ফায়ারবেস থেকে কপিযোগ্য রেসপন্স
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
         try {
             const snapshot = await db.ref("settings/verification_link").once("value");
-            const dbLink = snapshot.val() || "ভেরিফিকেশন প্যানেল চেক করুন।";
-            return message.reply(`👋 আপনি কি সার্ভার লিংক বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের ভেরিফিকেশন গাইড/লিংক: ${dbLink}`);
+            const dbLink = snapshot.val() || "কোনো লিংক ফায়ারবেসে পাওয়া যায়নি।";
+            
+            // ব্যাকটিক্স (``) দিয়ে পাঠানো হয়েছে যাতে ইউজার এক ক্লিকে সম্পূর্ণ লিংক কপি করতে পারে
+            return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${dbLink}\``);
         } catch (err) {
             console.error("Firebase Link Load Error:", err);
         }
@@ -499,21 +507,14 @@ client.on("interactionCreate", async (interaction) => {
 });
 
 // ================================
-// ⚡ PART 4 - Live UI Panels Templates (বড় ও লম্বালম্বি প্রফেশনাল ডিজাইন)
+// ⚡ PART 4 - Live UI Panels Templates
 // ================================
 
-// 📦 [FEATURE]: Dynamic Order Guide Panel Builder From Firebase
 async function getDynamicOrderGuidePanel() {
     const { customDescription, customImage, fullData } = await fetchFirebasePanelData("order_guide");
-    
     const defaultTitle = "📦 HOW TO ORDER & SYSTEM GUIDE";
     const defaultDesc = `🛒 **আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী** 🛒\n\n` +
-                        `> অত্যন্ত সহজে এবং প্রফেশনাল উপায়ে আমাদের থেকে সার্ভিস পারচেজ করুন।\n\n` +
-                        `📌 **ধাপসমূহ:**\n` +
-                        `১. প্রথমে পেমেন্ট প্যানেল থেকে আপনার প্রয়োজনীয় প্যাকেজ নির্বাচন করুন।\n` +
-                        `২. প্রদর্শিত পেমেন্ট গেটওয়েতে টাকা পাঠিয়ে **Transaction ID (TxnID)** সংগ্রহ করুন।\n` +
-                        `৩. বাটনে ক্লিক করে TxnID সাবমিট করলে একটি সম্পূর্ণ অটোমেটিক সিকিউর চ্যানেল তৈরি হবে।\n\n` +
-                        `⚠️ **জরুরী নোট:** ফায়ারবেস ডেটা চেঞ্জ করার সাথে সাথেই এই প্যানেলের বিবরণ স্বয়ংক্রিয়ভাবে বদলে যাবে।`;
+                        `📌 **ধাপসমূহ:**\n১. পেমেন্ট প্যানেল থেকে আপনার প্রয়োজনীয় প্যাকেজ নির্বাচন করুন।\n২. টাকা পাঠিয়ে **Transaction ID (TxnID)** সংগ্রহ করুন।`;
 
     const embed = new EmbedBuilder()
         .setTitle(fullData.title || defaultTitle)
@@ -528,25 +529,13 @@ async function getDynamicOrderGuidePanel() {
 
 async function getDynamicTicketPanel() { 
     const { options, customDescription, customImage } = await fetchFirebasePanelData("ticket");
-    
-    const defaultDesc = `🛑 **Premium Support & Development Center** 🛑\n\n` +
-                        `> আমাদের অফিসিয়াল মেম্বারদের জন্য কাস্টম সাপোর্ট প্যানেল।\n\n` +
-                        `✨ **পরিষেবাসমূহ:**\n` +
-                        `┌ 🛠️ কাস্টম বট এবং সিস্টেম ডেভেলপমেন্ট\n` +
-                        `├ ⚡ হাই-স্পিড সার্ভার কনফিগারেশন সাপোর্ট\n` +
-                        `└ 🛡️ অ্যাডভান্সড সিকিউরিটি অ্যান্ড MANAGEMENT\n\n` +
-                        `📌 **নির্দেশনা:**\n` +
-                        `নিচের ড্রপডাউন মেনু থেকে আপনার কাঙ্ক্ষিত সাপোর্টের ধরন সিলেক্ট করুন। একটি সম্পূর্ণ আলাদা প্রাইভেট চ্যানেল তৈরি হবে যেখানে আমাদের ডেডিকেটেড স্টাফ টিম আপনাকে সাহায্য করবে।`;
+    const defaultDesc = `🛑 **Premium Support & Development Center** 🛑`;
 
     const embed = new EmbedBuilder()
         .setTitle("🎫 PREMIUM SUPPORT TICKET PANEL")
         .setDescription(customDescription || defaultDesc)
         .setImage(customImage || COVER_IMAGES.TICKET)
         .setColor("#5865F2")
-        .addFields(
-            { name: "⏰ কাজের সময়", value: "⏱️ ২৪/৭ ঘন্টা অনলাইন সাপোর্ট ব্যবস্থা", inline: false },
-            { name: "⚠️ সতর্কবার্তা", value: "ফানি বা ফেক কোনো টিকিট ওপেন করলে আইডি সরাসরি মিউট বা প্যানেল ব্যান হবে।", inline: false }
-        )
         .setFooter({ text: "Premium Ticket System • Live Sync Active", iconURL: client.user.displayAvatarURL() });
 
     const menu = new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("🛒 আপনার সাপোর্ট ক্যাটাগরি সিলেক্ট করুন...").addOptions(options); 
@@ -555,25 +544,13 @@ async function getDynamicTicketPanel() {
 
 async function getDynamicReportPanel() { 
     const { options, customDescription, customImage } = await fetchFirebasePanelData("report");
-    
-    const defaultDesc = `🚨 **Server Automated Report & Complaint Center** 🚨\n\n` +
-                        `> সার্ভারের সুশৃঙ্খল পরিবেশ বজায় রাখার জন্য আমাদের এই সিকিউরিটি জোন।\n\n` +
-                        `🛡️ **রিপোর্ট ক্যাটাগরি:**\n` +
-                        `┌ 🐛 সার্ভার বাগ (Server Bug Reports)\n` +
-                        `├ 👤 মেম্বার কমপ্লেন (User Violations)\n` +
-                        `└ 💼 স্টাফ অপব্যবহার (Staff Abuse Reports)\n\n` +
-                        `📌 **নিয়মাবলী:**\n` +
-                        `যেকোনো অন্যায়ের বিরুদ্ধে অভিযোগ করতে ড্রপডাউন ব্যবহার করুন।`;
+    const defaultDesc = `🚨 **Server Automated Report & Complaint Center** 🚨`;
 
     const embed = new EmbedBuilder()
         .setTitle("🚨 SERVER COMPLAINT & REPORT PANEL")
         .setDescription(customDescription || defaultDesc)
         .setImage(customImage || COVER_IMAGES.REPORT)
         .setColor("#ED4245")
-        .addFields(
-            { name: "⚖️ বিচার প্রক্রিয়া", value: "রিপোর্ট সাবমিট করার পর সর্বোচ্চ ১২ ঘন্টার মধ্যে একশন নেওয়া হবে।", inline: false },
-            { name: "🔒 গোপনীয়তা", value: "আপনার পরিচয় সম্পূর্ণ গোপন রাখা সুনিশ্চিত করা হবে।", inline: false }
-        )
         .setFooter({ text: "Security System • Live Sync Active", iconURL: client.user.displayAvatarURL() });
 
     const menu = new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("⚠️ আপনার রিপোর্টের ধরন সিলেক্ট করুন...").addOptions(options); 
@@ -582,19 +559,13 @@ async function getDynamicReportPanel() {
 
 async function getDynamicCustomerPanel() { 
     const { options, customDescription, customImage } = await fetchFirebasePanelData("customer");
-    
-    const defaultDesc = `💬 **General Customer Care & Help Counter** 💬\n\n` +
-                        `> সার্ভারের সাধারণ মেম্বারদের যেকোনো সমস্যা বা জিজ্ঞাসার জন্য ওয়ান-স্টপ সリューション।`;
+    const defaultDesc = `💬 **General Customer Care & Help Counter** 💬`;
 
     const embed = new EmbedBuilder()
         .setTitle("💬 GENERAL CUSTOMER SUPPORT CENTER")
         .setDescription(customDescription || defaultDesc)
         .setImage(customImage || COVER_IMAGES.CUSTOMER)
         .setColor("#57F287")
-        .addFields(
-            { name: "👥 দায়িত্বপ্রাপ্ত টিম", value: "🛟 কাস্টমার কেয়ার এক্সিকিউটিভ", inline: true },
-            { name: "⚡ রেসপন্স টাইম", value: "⏱️ ৫ থেকে ১৫ মিনিট", inline: true }
-        )
         .setFooter({ text: "Customer Support • Live Sync Active", iconURL: client.user.displayAvatarURL() });
 
     const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...").addOptions(options); 
@@ -603,19 +574,13 @@ async function getDynamicCustomerPanel() {
 
 async function getDynamicPaymentPanel() { 
     const { options, customDescription, customImage } = await fetchFirebasePanelData("payment");
-    
-    const defaultDesc = `💳 **Premium Store & Automatic Payment Gateway** 💳\n\n` +
-                        `> আমাদের যেকোনো প্রিমিয়াম সার্ভিস, লাইসেন্স বা মেম্বারশিপ নেওয়ার ডিজিটাল শপ।`;
+    const defaultDesc = `💳 **Premium Store & Automatic Payment Gateway** 💳`;
 
     const embed = new EmbedBuilder()
         .setTitle("🛍️ AUTOMATED SHOP & PAYMENT PANELS")
         .setDescription(customDescription || defaultDesc)
         .setImage(customImage || COVER_IMAGES.PAYMENT)
         .setColor("#3498DB")
-        .addFields(
-            { name: "💳 সাপোর্টেড পেমেন্ট", value: "🚀 বিকাশ, রকেট, নগদ এবং ইনস্ট্যান্ট গেটওয়ে সিস্টেম", inline: false },
-            { name: "🛡️ সেফটি নোট", value: "পেমেন্ট স্লিপ অথবা TxnID কারও সাথে শেয়ার করবেন না।", inline: false }
-        )
         .setFooter({ text: "Automated Payment Bot • Live Sync Active", iconURL: client.user.displayAvatarURL() });
 
     const menu = new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("🛍️ আপনার কাঙ্ক্ষিত মেম্বারশিপ/সার্ভিস সিলেক্ট করুন...").addOptions(options); 
@@ -633,11 +598,7 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) return message.channel.send(await getDynamicTicketPanel());
     if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(await getDynamicReportPanel());
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
-    
-    // 📢 [FEATURE]: Manual initialization of the Order Guide Channel Panel
-    if (message.content === "!guide" && message.channelId === ORDER_GUIDE_CHANNEL_ID) {
-        return message.channel.send(await getDynamicOrderGuidePanel());
-    }
+    if (message.content === "!guide" && message.channelId === ORDER_GUIDE_CHANNEL_ID) return message.channel.send(await getDynamicOrderGuidePanel());
 
     if ((message.content === "!payment" || message.content.toLowerCase() === "!payment") && 
         (message.channelId === CHANNELS.PAYMENT_PANEL || message.channelId === CHANNELS.BUY_PANEL)) {
@@ -646,7 +607,7 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================================
-// 🔥 REALTIME FIREBASE SYNC TO DISCORD (AUTO UPDATE ON LIVE CHANGES)
+// 🔥 REALTIME FIREBASE SYNC TO DISCORD
 // ================================
 
 function listenToFirebaseUpdates() {
@@ -654,17 +615,14 @@ function listenToFirebaseUpdates() {
         const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
         if (!guild) return;
 
-        console.log("🔄 Firebase Realtime Data changed! Updating panels in Discord channels...");
+        console.log("🔄 Firebase Realtime Data changed! Updating panels...");
 
         // 1. Ticket Panel Auto-Update
         const ticketChan = guild.channels.cache.get(CHANNELS.TICKET_PANEL);
         if (ticketChan) {
             const messages = await ticketChan.messages.fetch({ limit: 20 });
             const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_product_ticket");
-            if (botMsg) {
-                const updatedData = await getDynamicTicketPanel();
-                await botMsg.edit(updatedData).catch(() => {});
-            }
+            if (botMsg) { const updatedData = await getDynamicTicketPanel(); await botMsg.edit(updatedData).catch(() => {}); }
         }
 
         // 2. Report Panel Auto-Update
@@ -672,10 +630,7 @@ function listenToFirebaseUpdates() {
         if (reportChan) {
             const messages = await reportChan.messages.fetch({ limit: 20 });
             const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_report_category");
-            if (botMsg) {
-                const updatedData = await getDynamicReportPanel();
-                await botMsg.edit(updatedData).catch(() => {});
-            }
+            if (botMsg) { const updatedData = await getDynamicReportPanel(); await botMsg.edit(updatedData).catch(() => {}); }
         }
 
         // 3. Customer Panel Auto-Update
@@ -683,34 +638,25 @@ function listenToFirebaseUpdates() {
         if (custChan) {
             const messages = await custChan.messages.fetch({ limit: 20 });
             const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_customer_category");
-            if (botMsg) {
-                const updatedData = await getDynamicCustomerPanel();
-                await botMsg.edit(updatedData).catch(() => {});
-            }
+            if (botMsg) { const updatedData = await getDynamicCustomerPanel(); await botMsg.edit(updatedData).catch(() => {}); }
         }
 
-        // 4. Order Guide Panel Realtime Auto-Update (New Feature Sync)
+        // 4. Order Guide Panel Auto-Update
         const guideChan = guild.channels.cache.get(ORDER_GUIDE_CHANNEL_ID);
         if (guideChan) {
             const messages = await guideChan.messages.fetch({ limit: 20 });
             const botMsg = messages.find(m => m.author.id === client.user.id && m.embeds.length > 0 && m.components.length === 0);
-            if (botMsg) {
-                const updatedData = await getDynamicOrderGuidePanel();
-                await botMsg.edit(updatedData).catch(() => {});
-            }
+            if (botMsg) { const updatedData = await getDynamicOrderGuidePanel(); await botMsg.edit(updatedData).catch(() => {}); }
         }
 
-        // 5. Payment Panel Auto-Update (BUY_PANEL এবং PAYMENT_PANEL দুই জায়গাই চেক করবে)
+        // 5. Payment Panel Auto-Update
         const checkPaymentChannels = [CHANNELS.PAYMENT_PANEL, CHANNELS.BUY_PANEL];
         for (const chanId of checkPaymentChannels) {
             const payChan = guild.channels.cache.get(chanId);
             if (payChan) {
                 const messages = await payChan.messages.fetch({ limit: 20 });
                 const botMsg = messages.find(m => m.author.id === client.user.id && m.components.length > 0 && m.components[0].components[0].customId === "select_buy_category");
-                if (botMsg) {
-                    const updatedData = await getDynamicPaymentPanel();
-                    await botMsg.edit(updatedData).catch(() => {});
-                }
+                if (botMsg) { const updatedData = await getDynamicPaymentPanel(); await botMsg.edit(updatedData).catch(() => {}); }
             }
         }
     });
@@ -722,7 +668,7 @@ function listenToFirebaseUpdates() {
 
 client.on("guildMemberAdd", async (member) => {
     if (member.guild.id !== ALLOWED_GUILD_ID) return; const saved = getSavedMembers(); if (!saved.includes(member.id)) { saved.push(member.id); saveMembers(saved); }
-    const punishments = getPunishments(); if (punishments[member.id] && punishments[member.id].status === "Muted") { const record = punishments[member.id]; const now = Date.now(); if (!record.expiresAt || record.expiresAt > now) { const remainingTime = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000; try { await member.timeout(remainingTime, "Automod/Panel Bypass Block"); const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID); if (welcomeChannel) { welcomeChannel.send(`⚠️ মেম্বার <@${member.id}> তার আগের প্যানেল ব্যান/টাইমআউট শাস্তি ফাঁকি দেওয়ার জন্য লিভ নিয়ে পুনরায় জয়েন করায় তাকে পুনরায় মিউট করা হয়েছে।`); } } catch(e) {} } else { savePunishment(member.id, null); } }
+    const punishments = getPunishments(); if (punishments[member.id] && punishments[member.id].status === "Muted") { const record = punishments[member.id]; const now = Date.now(); if (!record.expiresAt || record.expiresAt > now) { const remainingTime = record.expiresAt ? record.expiresAt - now : 10 * 60 * 1000; try { await member.timeout(remainingTime, "Automod/Panel Bypass Block"); const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID); if (welcomeChannel) { welcomeChannel.send(`⚠️ মেম্বার <@${member.id}> তার আগের মিউট শাস্তি ফাঁকি দেওয়ার জন্য লিভ নিয়ে পুনরায় জয়েন করায় তাকে পুনরায় মিউট করা হয়েছে।`); } } catch(e) {} } else { savePunishment(member.id, null); } }
     const welcomeChannel = member.guild.channels.cache.get(WELCOME_CHANNEL_ID); if (welcomeChannel) { const embed = buildDynamicWelcomeEmbed(member, "unverified", false); const msg = await welcomeChannel.send({ content: `🎉 স্বাগতম ${member}!`, embeds: [embed] }).catch(() => {}); if (msg) saveWelcomeLog(member.id, msg.id, { isOffline: false }); }
 });
 
@@ -735,8 +681,6 @@ client.on("guildMemberRemove", async (member) => {
 client.once("clientReady", async () => {
     console.log(`✅ Logged in as ${client.user.tag}`); 
     setBotPresence();
-    
-    // লাইভ রিয়েল-টাইম ফায়ারবেস লিসেনার চালু করা হলো
     listenToFirebaseUpdates();
 
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID); 
@@ -755,7 +699,6 @@ client.once("clientReady", async () => {
         if (savedMembers.length === 0) {
             const initialIds = currentMembers.filter(m => !m.user.bot).map(m => m.id);
             saveMembers(initialIds);
-            console.log("✅ Initialized clean database with current guild members.");
             return;
         }
 
@@ -806,10 +749,6 @@ client.on("voiceStateUpdate", async () => {
     if (guild && guild.members.me && !guild.members.me.voice.channel) await connectVoice(guild); 
 });
 
-// ================================
-// 🛠️ প্রয়োজনীয় ইউটিলিটি ফাংশনসমূহ
-// ================================
-
 function setBotPresence() { 
     client.user.setPresence({ 
         activities: [{ name: "Security & Verification", type: ActivityType.Watching }], 
@@ -821,16 +760,8 @@ async function connectVoice(guild) {
     try { 
         const channel = guild.channels.cache.get(VOICE_CHANNEL_ID); 
         if (!channel) return; 
-        joinVoiceChannel({ 
-            channelId: channel.id, 
-            guildId: guild.id, 
-            adapterCreator: guild.voiceAdapterCreator, 
-            selfDeaf: true, 
-            selfMute: false 
-        }); 
-    } catch (e) {
-        console.error("❌ Voice Connect Error:", e);
-    } 
+        joinVoiceChannel({ channelId: channel.id, guildId: guild.id, adapterCreator: guild.voiceAdapterCreator, selfDeaf: true, selfMute: false }); 
+    } catch (e) { console.error("❌ Voice Connect Error:", e); } 
 }
 
 function startBot() { 
