@@ -54,7 +54,7 @@ admin.initializeApp({
 const db = admin.database();
 
 const app = express();
-app.get("/", (req, res) => { res.send("Bot is running perfectly with Realtime DB Sync & Original Commands!"); });
+app.get("/", (req, res) => { res.send("Bot is running perfectly with Realtime DB Auto-Edit System!"); });
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
@@ -136,27 +136,7 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// ========================================================
-// 🔄 100% Realtime Database Data Synchronizer
-// ========================================================
-let globalFirebaseCache = {};
-
-// ফায়ারবেসের যেকোনো পরিবর্তন এটি লাইভ নজরদারি করবে (Realtime Listener)
-db.ref().on("value", (snapshot) => {
-    if (snapshot.exists()) {
-        globalFirebaseCache = snapshot.val();
-        console.log("⚡ [Realtime Database Sync]: ফায়ারবেসের নতুন ডেটা বোটে লাইভ আপডেট হয়েছে!");
-        
-        // যদি ফায়ারবেসে কোরআন স্ট্রিম চেঞ্জ করা হয়, তবে তা সাথে সাথে ভেরিয়েবলে আপডেট হবে
-        if (globalFirebaseCache.settings && globalFirebaseCache.settings.quran_stream_url) {
-            AUDIO_STREAM_URL = globalFirebaseCache.settings.quran_stream_url;
-        }
-    }
-}, (error) => {
-    console.error("❌ Realtime Sync Error:", error);
-});
-
-// লাইভ ক্যাশ থেকে প্যানেলের ডেটা প্রসেস করার ফাংশন
+// 라이브 ক্যাш থেকে প্যানেলের ডেটা প্রসেস করার ফাংশন
 function fetchFirebasePanelData(panelType) {
     const panels = globalFirebaseCache.panels || {};
     const data = panels[panelType] || {};
@@ -177,6 +157,138 @@ function fetchFirebasePanelData(panelType) {
 
     return { options, customDescription, customImage, fullData: data };
 }
+
+// ========================================================
+// 🔄 100% Realtime Database Data Auto-Updater & Synchronizer
+// ========================================================
+let globalFirebaseCache = {};
+let isFirstSync = true;
+
+db.ref().on("value", async (snapshot) => {
+    if (snapshot.exists()) {
+        globalFirebaseCache = snapshot.val();
+        console.log("⚡ [Realtime Database Sync]: ফায়ারবেসের নতুন ডেটা বোটে লাইভ আপডেট হয়েছে!");
+        
+        if (globalFirebaseCache.settings && globalFirebaseCache.settings.quran_stream_url) {
+            AUDIO_STREAM_URL = globalFirebaseCache.settings.quran_stream_url;
+        }
+
+        // প্রথমবার বুট হওয়ার সময় মেসেজ এডিট স্কিপ করবে, শুধুমাত্র রিয়েল-টাইমে কেউ চেঞ্জ করলেই এডিট ট্রিগার হবে
+        if (isFirstSync) {
+            isFirstSync = false;
+            return;
+        }
+
+        // 🛠️ ফায়ারবেস চেঞ্জ হলে অটোমেটিক ডিসকর্ডের পাঠানো প্যানেল মেসেজগুলো এডিট করার লজিক
+        try {
+            const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+            if (!guild) return;
+
+            // ১. টিকেট প্যানেল অটো-এডিট
+            const ticketChan = guild.channels.cache.get(CHANNELS.TICKET_PANEL);
+            if (ticketChan) {
+                const fetched = await ticketChan.messages.fetch({ limit: 20 }).catch(() => null);
+                const botMsg = fetched?.find(m => m.author.id === client.user.id && m.components.length > 0);
+                if (botMsg) {
+                    const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("ticket");
+                    const embed = new EmbedBuilder()
+                        .setTitle(fullData.title || "🎫 PREMIUM SUPPORT TICKET PANEL")
+                        .setDescription(customDescription || "নিচের ড্রপডাউন থেকে আপনার ক্যাটাগরি সিলেক্ট করুন।")
+                        .setColor("#5865F2")
+                        .setImage(customImage || COVER_IMAGES.TICKET);
+                    const row = new ActionRowBuilder().addComponents(
+                        new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("Choose a support category...").addOptions(options)
+                    );
+                    await botMsg.edit({ embeds: [embed], components: [row] }).catch(() => {});
+                    console.log("✅ Ticket Panel Message Auto-Edited!");
+                }
+            }
+
+            // ২. রিপোর্ট প্যানেল অটো-এডিট
+            const reportChan = guild.channels.cache.get(CHANNELS.REPORT_PANEL);
+            if (reportChan) {
+                const fetched = await reportChan.messages.fetch({ limit: 20 }).catch(() => null);
+                const botMsg = fetched?.find(m => m.author.id === client.user.id && m.components.length > 0);
+                if (botMsg) {
+                    const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("report");
+                    const embed = new EmbedBuilder()
+                        .setTitle(fullData.title || "🚨 SERVER COMPLAINT & REPORT PANEL")
+                        .setDescription(customDescription || "কাউকে রিপোর্ট করতে নিচের অপশন সিলেক্ট করুন।")
+                        .setColor("#ED4245")
+                        .setImage(customImage || COVER_IMAGES.REPORT);
+                    const row = new ActionRowBuilder().addComponents(
+                        new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("Choose a report category...").addOptions(options)
+                    );
+                    await botMsg.edit({ embeds: [embed], components: [row] }).catch(() => {});
+                    console.log("✅ Report Panel Message Auto-Edited!");
+                }
+            }
+
+            // ৩. কাস্টমার প্যানেল অটো-এডিট
+            const customerChan = guild.channels.cache.get(CHANNELS.CUSTOMER_PANEL);
+            if (customerChan) {
+                const fetched = await customerChan.messages.fetch({ limit: 20 }).catch(() => null);
+                const botMsg = fetched?.find(m => m.author.id === client.user.id && m.components.length > 0);
+                if (botMsg) {
+                    const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("customer");
+                    const embed = new EmbedBuilder()
+                        .setTitle(fullData.title || "💬 GENERAL CUSTOMER SUPPORT CENTER")
+                        .setDescription(customDescription || "যেকোনো সাধারণ সাহায্যের জন্য ড্রপডাউনটি ব্যবহার করুন।")
+                        .setColor("#57F287")
+                        .setImage(customImage || COVER_IMAGES.CUSTOMER);
+                    const row = new ActionRowBuilder().addComponents(
+                        new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("Choose an inquiry type...").addOptions(options)
+                    );
+                    await botMsg.edit({ embeds: [embed], components: [row] }).catch(() => {});
+                    console.log("✅ Customer Panel Message Auto-Edited!");
+                }
+            }
+
+            // ৪. পেমেন্ট/শপ প্যানেল অটো-এডিট
+            const buyChan = guild.channels.cache.get(CHANNELS.BUY_PANEL) || guild.channels.cache.get(CHANNELS.PAYMENT_PANEL);
+            if (buyChan) {
+                const fetched = await buyChan.messages.fetch({ limit: 20 }).catch(() => null);
+                const botMsg = fetched?.find(m => m.author.id === client.user.id && m.components.length > 0);
+                if (botMsg) {
+                    const { options, customDescription, customImage, fullData } = fetchFirebasePanelData("payment");
+                    const embed = new EmbedBuilder()
+                        .setTitle(fullData.title || "🛍️ AUTOMATED SHOP & PAYMENT PANELS")
+                        .setDescription(customDescription || "আমাদের সার্ভিস বা প্যাকেজ কিনতে নিচের ড্রপডাউন ব্যবহার করুন।")
+                        .setColor("#9B59B6")
+                        .setImage(customImage || COVER_IMAGES.PAYMENT);
+                    const row = new ActionRowBuilder().addComponents(
+                        new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("Select a service to order...").addOptions(options)
+                    );
+                    await botMsg.edit({ embeds: [embed], components: [row] }).catch(() => {});
+                    console.log("✅ Shop/Payment Panel Message Auto-Edited!");
+                }
+            }
+
+            // ৫. অর্ডার গাইড অটো-এডিট
+            const guideChan = guild.channels.cache.get(ORDER_GUIDE_CHANNEL_ID);
+            if (guideChan) {
+                const fetched = await guideChan.messages.fetch({ limit: 20 }).catch(() => null);
+                const botMsg = fetched?.find(m => m.author.id === client.user.id);
+                if (botMsg) {
+                    const panels = globalFirebaseCache.panels || {};
+                    const guideData = panels["order_guide"] || {};
+                    const embed = new EmbedBuilder()
+                        .setTitle(guideData.title || "📦 HOW TO ORDER & SYSTEM GUIDE")
+                        .setDescription(guideData.description || "আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী।")
+                        .setColor("#FFFF00")
+                        .setImage(guideData.image || COVER_IMAGES.PAYMENT);
+                    await botMsg.edit({ embeds: [embed] }).catch(() => {});
+                    console.log("✅ Order Guide Message Auto-Edited!");
+                }
+            }
+
+        } catch (editError) {
+            console.error("❌ Auto-Edit Failed:", editError);
+        }
+    }
+}, (error) => {
+    console.error("❌ Realtime Sync Error:", error);
+});
 
 // ========================================================
 // 📂 Database Helper Functions
@@ -246,7 +358,7 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
     }
     
-    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্তスタッフ", value: `${staff}`, inline: true });
     return embed;
 }
 
@@ -871,7 +983,7 @@ client.on("voiceStateUpdate", async (oldState, newState) => {
 // 📡 PART 4 - Core Bot Events & Setup
 // ========================================================
 
-client.once("clientReady", async () => {
+client.once("ready", async () => {
     console.log(`🚀 ${client.user.tag} হিসাবে সফলভাবে লগইন করা হয়েছে!`);
     client.user.setPresence({ activities: [{ name: "Security & Verification", type: ActivityType.Watching }], status: "online" });
 
