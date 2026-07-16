@@ -9,3 +9,5 @@ while True:
         print(f"Status: {r.status_code}")
     except Exception as e:
         print("Error:", e)
+
+    time.sleep(60)  # ৬০ সেকেন্ড পর আবার চেক
