@@ -135,7 +135,9 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// 🔑 Credentials Generator
+// ================================================
+// 🔑 NEW FEATURE: Credentials Generator
+// ================================================
 function generateCredentials(discordUser) {
     const cleanName = discordUser.username.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
     const randomNum = Math.floor(1000 + Math.random() * 9000);
@@ -218,28 +220,36 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
 // ================================================
 // 🛒 Order Status Embed Builder
 // ================================================
-function buildOrderStatusEmbed(user, category, status, staff = null, reason = null, txnId = null, generatedUser = null) {
-    let color = "#00FF00"; let statusString = "✅ AUTO VERIFIED & ACCOUNT CREATED";
+function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
+    let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
+    
+    if (status === "approved") { color = "#00FF00"; statusString = `✅ APPROVED & RUNNING (কাজ চলছে)`; }
+    else if (status === "closed") { color = "#FF0000"; statusString = "🔒 CLOSED (টিকিট বন্ধ করা হয়েছে)"; }
+    else if (status === "banned") { color = "#2F3136"; statusString = `🚫 FAKE TICKET BAN (${reason || "ফানি টিকিট"})`; }
 
     const embed = new EmbedBuilder()
-        .setTitle("📦 AUTOMATED ORDER LOG")
+        .setTitle("📦 ORDER TRACKING SYSTEM")
         .setColor(color)
         .addFields(
             { name: "👤 কাস্টমার", value: `${user}`, inline: true },
             { name: "🛒 প্রোডাক্ট/ক্যাটাগরি", value: `\`${category.toUpperCase().replace("_", " ")}\``, inline: true },
-            { name: "📊 স্ট্যাটাস", value: `**${statusString}**`, inline: false }
+            { name: "📁 টিকিট চ্যানেল", value: `${ticketChannel}`, inline: true },
+            { name: "📊 বর্তমান স্ট্যাটাস", value: `**${statusString}**`, inline: false }
         )
         .setTimestamp()
-        .setFooter({ text: "Automated Payment Verification System" });
+        .setFooter({ text: "Order Update System" });
 
     if (txnId) {
-        let maskedTxnId = txnId.length > 4 ? txnId.substring(0, 2) + "****" + txnId.substring(txnId.length - 2) : "****";
+        let maskedTxnId = txnId;
+        if (txnId.length > 4) {
+            maskedTxnId = txnId.substring(0, 2) + "****" + txnId.substring(txnId.length - 2);
+        } else {
+            maskedTxnId = "****";
+        }
         embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
     }
     
-    if (generatedUser) {
-        embed.addFields({ name: "👤 Generated Account", value: `\`${generatedUser}\``, inline: true });
-    }
+    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
     return embed;
 }
 
@@ -445,7 +455,7 @@ client.on("interactionCreate", async (interaction) => {
         if (type === "order") {
             const modal = new ModalBuilder().setCustomId(`modal_coupon_${value}`).setTitle("🎟️ Coupon / Discount Code");
             const couponInput = new TextInputBuilder()
-                .setCustomId("coupon_code_input").setLabel("কুপন কোড দিন (না থাকলে ফাঁকা রাখুন)")
+                .setCustomId("coupon_code_input") .setLabel("কুপন কোড দিন (না থাকলে ফাঁকা রাখুন)")
                 .setStyle(TextInputStyle.Short)
                 .setRequired(false);
             modal.addComponents(new ActionRowBuilder().addComponents(couponInput));
@@ -470,10 +480,9 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // ================================================
-    // 💳 NO CHANNEL DIRECT INSTANT DELIVER SYSTEM
+    // 💳 NEW FEATURE: Automated Payment -> Account Creation System
     // ================================================
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
-        // Ephemeral Reply (গোপন সিপ্রেক্ট মেসেজ যা কেবল এই ইউজারই দেখবে)
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
         const parts = interaction.customId.split("_");
@@ -492,7 +501,7 @@ client.on("interactionCreate", async (interaction) => {
 
             const txnData = txnSnap.val();
 
-            // ট্রানজেকশনের used ফ্লাগ এবং স্ট্যাটাস চেক
+            // ট্রানজেকশনের used ফ্লাগ চেক
             const isUsed = txnData.used === true || txnData["used "] === true;
             const isStatusActive = txnData.status !== false;
 
@@ -519,7 +528,7 @@ client.on("interactionCreate", async (interaction) => {
                 status: "active",
                 createdAt: Date.now(),
                 expiresAt: expiryTimestamp,
-                hwid: "" // Loader প্রথম লগইনে HWID বাইন্ড করবে
+                hwid: "" // C++ Loader প্রথম লগইনে অটো HWID বাইন্ড করবে
             });
 
             // 🔥 ৪. Transaction ID Burn / Used মার্ক করা
@@ -531,44 +540,82 @@ client.on("interactionCreate", async (interaction) => {
                 assignedUser: creds.username
             });
 
-            // 📩 ৫. কোনো চ্যানেল তৈরি ছাড়া সরাসরি স্ল্যাশ মেসেজে ইউজার ও পাসওয়ার্ড দেখানো
-            const credsEmbed = new EmbedBuilder()
-                .setTitle(`🎉 Payment Verified & Account Created!`)
-                .setDescription(`আপনার পেমেন্ট ভেরিফাই সম্পন্ন হয়েছে! কোনো চ্যানেল তৈরি করা হয়নি, নিচে আপনার ব্যক্তিগত লগইন তথ্য দেওয়া হলো:\n\n**🛒 প্রোডাক্ট:** \`${txnData.product || category.toUpperCase()}\`\n**💳 Transaction ID:** \`${txnId}\`
+            // 📁 ৫. প্রাইভেট অর্ডার চ্যানেল তৈরি
+            const randomCode = Math.floor(1000 + Math.random() * 9000); 
+            let supportRoleId = ROLES.SUPPORT_CUSTOMER;
+            let channelPrefix = `order-${randomCode}`; 
 
-🔑 **Your Login Credentials:**
+            const permissionOverwrites = [
+                { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+                { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
+                { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
+            ];
+
+            if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+            if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
+
+            const privateChannel = await interaction.guild.channels.create({
+                name: channelPrefix,
+                type: 0,
+                permissionOverwrites: permissionOverwrites
+            });
+
+            // 📩 ৬. প্রাইভেট চ্যানেলে ক্রেডেনশিয়াল এমবেড পাঠানো
+            const insideEmbed = new EmbedBuilder()
+                .setTitle(`🎉 Payment Verified & Account Created!`)
+                .setDescription(`স্বাগতম ${interaction.user}!\nআপনার পেমেন্ট ভেরিফাই করা হয়েছে এবং অ্যাকাউন্ট তৈরি সম্পন্ন হয়েছে।\n\n**🛒 প্রোডাক্ট:** \`${txnData.product || category.toUpperCase()}\`\n**💳 Transaction ID:** \`${txnId}\`
+
+🔑 **Software / App Login Credentials:**
 > 👤 **Username:** \`${creds.username}\`
 > 🔑 **Password:** \`${creds.password}\`
 > 📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>
 
-⚠️ *গোপনীয়তা রক্ষার জন্য তথ্যগুলো এখনই সেভ করে রাখুন।*`)
+⚠️ *নিরাপত্তার স্বার্থে আপনার ইউজারনেম ও পাসওয়ার্ড কারো সাথে শেয়ার করবেন না।*`)
                 .setColor("Green")
                 .setTimestamp();
 
-            await interaction.editReply({ embeds: [credsEmbed] });
+            const staffButtons = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId(`approve_order`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId(`ban_panel_order`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
+            );
 
-            // 📬 . ইউজারের ইনবক্সেও (DM) কপি পাঠানো
+            await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [staffButtons] });
+
+            // 📬 ৭. ইউজারের ইনবক্সে (DM) লগইন পাসওয়ার্ড পাঠানো
             try {
                 const dmEmbed = new EmbedBuilder()
-                    .setTitle("🔑 Software Login Credentials")
-                    .setDescription(`আপনার পেমেন্ট ভেরিফাই সম্পন্ন হয়েছে!\n\n👤 **Username:** \`${creds.username}\`\n🔑 **Password:** \`${creds.password}\`\n⏳ **Status:** Active`)
+                    .setTitle("🔑 Your Software Login Credentials")
+                    .setDescription(`ধন্যবাদ আপনার ক্রয়ের জন্য! আপনার প্রোডাক্ট ব্যবহারের জন্য লগইন তথ্য নিচে দেওয়া হলো:\n\n👤 **Username:** \`${creds.username}\`\n🔑 **Password:** \`${creds.password}\`\n⏳ **Status:** Active`)
                     .setColor("Blue")
                     .setTimestamp();
                 await interaction.user.send({ embeds: [dmEmbed] });
             } catch (dmErr) {
-                console.log("❌ DM Closed for user:", dmErr);
+                console.log("❌ DM Closed:", dmErr);
             }
 
-            // 📊 ৭. এডমিনদের সুবিধার জন্য ব্যাকএন্ড অর্ডার ট্র্যাকিং চ্যানেলে লগ পাঠানো
+            // 📊 ৮. ট্র্যাকিং চ্যানেল আপডেট
             const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
             if (trackingChannel) {
-                const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, "auto_verified", null, null, txnId, creds.username);
-                await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
+                const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending", null, null, txnId);
+                const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
+                if (trackingMsg) {
+                    saveOrderLog(privateChannel.id, trackingMsg.id, { 
+                        userId: interaction.user.id, 
+                        category: category, 
+                        status: "pending", 
+                        txnId: txnId,
+                        username: creds.username 
+                    });
+                }
             }
 
+            return interaction.editReply(`✅ **পেমেন্ট ভেরিফাই হয়েছে!** আপনার অ্যাকাউন্ট তৈরি সম্পূর্ণ হয়েছে এবং অর্ডার চ্যানেল তৈরি করা হয়েছে: ${privateChannel}`);
+
         } catch (err) {
-            console.error("❌ Direct Payment Verification Error:", err);
-            return interaction.editReply("❌ **প্রসেসিংয়ে ত্রুটি ঘটেছে!** অনুগ্রহ করে সাপোর্ট টিমের সাথে যোগাযোগ করুন।");
+            console.error("❌ Payment Processing Error:", err);
+            return interaction.editReply("❌ **প্রসেসিংয়ে ত্রুটি ঘটেছে!** অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।");
         }
     }
 });
