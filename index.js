@@ -239,17 +239,6 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
     return embed;
 }
 
-function generateCredentials(discordUser) {
-    const cleanName = discordUser.username.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
-    const randomNum = Math.floor(1000 + Math.random() * 9000);
-    const randomPass = Math.random().toString(36).slice(-8);
-
-    return {
-        username: `${cleanName || 'user'}_${randomNum}`,
-        password: `pass_${randomPass}`
-    };
-}
-
 // Ghost Ping ট্র্যাকিং
 client.on("messageDelete", async (message) => {
     if (!message.guild || message.author?.bot) return;
@@ -274,7 +263,7 @@ client.on("messageCreate", async (message) => {
     let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // 🛑 Caps-Lock Protection (৭০% এর বেশি বড় হাতের অক্ষর)
+    // 🛑 Caps-Lock Protection
     const upperCount = message.content.replace(/[^A-Z]/g, "").length;
     const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
     if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
@@ -284,7 +273,7 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // 🎮 Activity Leveling (Firebase XP System)
+    // 🎮 Activity Leveling
     const xpRef = db.ref(`leveling/${userId}`);
     xpRef.transaction((current) => {
         if (!current) {
@@ -377,7 +366,6 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
-    // Giveaway বাটনে ক্লিক ট্র্যাকিং
     if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
         const gwId = interaction.customId.split("_")[2];
         const participantRef = db.ref(`giveaways/${gwId}/participants/${interaction.user.id}`);
@@ -398,7 +386,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "✅ আপনি সফলভাবে গিভঅ্যাওয়েতে নাম এন্ট্রি করেছেন!", flags: [MessageFlags.Ephemeral] });
     }
 
-    // এডভান্সড টিকেট রেটিং ফিডব্যাক সিস্টেম
     if (interaction.isButton() && interaction.customId.startsWith("star_rating_")) {
         const [, , stars, staffId] = interaction.customId.split("_");
         
@@ -430,7 +417,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // ড্রপডাউন সিলেকশন এবং ফিক্সড কুপন মোডাল ট্রিগার
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -442,7 +428,6 @@ client.on("interactionCreate", async (interaction) => {
         else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${value}`; } 
 
         if (type === "order") {
-            // [FIX 1 & FIX 2]: কাস্টম আইডি ছোট করা এবং লেবেল টেক্সট ৪৫ অক্ষরের নিচে নামিয়ে আনা
             const modal = new ModalBuilder().setCustomId(`modal_coupon_${value}`).setTitle("🎟️ Coupon / Discount Code");
             const couponInput = new TextInputBuilder()
                 .setCustomId("coupon_code_input")
@@ -459,10 +444,9 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
-    // কুপন মোডাল সাবমিট সফল হ্যান্ডলিং (Interaction Failed ফিক্সড)
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const category = interaction.customId.split("_")[2]; // সঠিক ইনডেক্স ২ নির্বাচন করা হয়েছে
+        const category = interaction.customId.split("_")[2];
         const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim();
         
         let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
@@ -477,31 +461,55 @@ client.on("interactionCreate", async (interaction) => {
 
         const payEmbed = new EmbedBuilder()
             .setTitle(`💳 Payment Gateway: ${category.toUpperCase().replace("_", " ")}`)
-            .setDescription(`আপনার অর্ডারটি প্রসেস করতে নিচে দেওয়া **"Pay via Gateway"** বাটনে ক্লিক করে অটোমেটিক পেমেন্ট সম্পন্ন করুন এবং প্রাপ্ত Transaction ID সাবমিট করুন।\n\n🎁 **ডিসকাউন্ট স্ট্যাটাস:** ${discountText}`)
+            .setDescription(`আপনার অর্ডারটি প্রসেস করতে নিচে দেওয়া **"Pay via Gateway"** বাটনে ক্লিক করে অটোমেটিক পেমেন্ট সম্পন্ন করুন এবং আপনার পেমেন্ট TxnID সহ **কাস্টম ইউজারনেম ও পাসওয়ার্ড** সেট করুন।\n\n🎁 **ডিসকাউন্ট স্ট্যাটাস:** ${discountText}`)
             .setColor("#9B59B6");
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`submit_txn_${category}`).setLabel("Pay via Gateway & Submit TxnID").setStyle(ButtonStyle.Primary));
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`submit_txn_${category}`).setLabel("Pay via Gateway & Submit Details").setStyle(ButtonStyle.Primary));
         return interaction.editReply({ embeds: [payEmbed], components: [row] });
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const category = interaction.customId.split("_")[2];
-        const modal = new ModalBuilder().setCustomId(`modal_payment_${category}`).setTitle("🔒 Payment TxnID Verification");
-        const txnInput = new TextInputBuilder().setCustomId("txn_id_input").setLabel("Enter Your Transaction ID (TxnID)").setPlaceholder("e.g. A1B2C3D4E5").setStyle(TextInputStyle.Short).setRequired(true);
-        modal.addComponents(new ActionRowBuilder().addComponents(txnInput));
+        const modal = new ModalBuilder().setCustomId(`modal_payment_${category}`).setTitle("🔒 Payment & Custom Credentials");
+        
+        const txnInput = new TextInputBuilder()
+            .setCustomId("txn_id_input")
+            .setLabel("Transaction ID (TxnID)")
+            .setPlaceholder("e.g. A1B2C3D4E5")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+
+        const usernameInput = new TextInputBuilder()
+            .setCustomId("custom_username")
+            .setLabel("Your Custom Username")
+            .setPlaceholder("Enter preferred username")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+
+        const passwordInput = new TextInputBuilder()
+            .setCustomId("custom_password")
+            .setLabel("Your Custom Password")
+            .setPlaceholder("Enter preferred password")
+            .setStyle(TextInputStyle.Short)
+            .setRequired(true);
+
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(txnInput),
+            new ActionRowBuilder().addComponents(usernameInput),
+            new ActionRowBuilder().addComponents(passwordInput)
+        );
         return interaction.showModal(modal);
     }
 
-
-
-
-if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
         const category = interaction.customId.split("_")[2];
         const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
+        const customUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
+        const customPass = interaction.fields.getTextInputValue("custom_password").trim();
 
         try {
-            // 🔍 ১. Firebase Database এ Transaction ID ভ্যালিডিটি ও ইউসেজ চেক
+            // 🔍 ১. Transaction ID ভ্যালিডিটি 체크
             const txnRef = db.ref(`transactions/${txnId}`);
             const txnSnap = await txnRef.once("value");
 
@@ -511,117 +519,88 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_paymen
 
             const txnData = txnSnap.val();
             
-            // পূর্বে ব্যবহৃত হয়েছে কিনা চেক করা
             if (txnData.used === true) {
                 return interaction.editReply("❌ **Transaction ID ইতোমধ্যে ব্যবহৃত হয়েছে!** এই ID দিয়ে আগে একটি অ্যাকাউন্ট তৈরি করা হয়েছে।");
             }
 
-            // 🔑 ২. অটোমেটিক ইউজারনেম ও পাসওয়ার্ড জেনারেট
-            const creds = generateCredentials(interaction.user);
-            const subDays = txnData.days || 30; // ডেটাবেজের মেয়াদের দিন (ডিফল্ট ৩০ দিন)
+            // 🔍 ২. ইউজারনেম ও পাসওয়ার্ড মেয়াদের ইউনিকনেস চেক
+            const existingUserSnap = await db.ref(`users/${customUser}`).once("value");
+            
+            if (existingUserSnap.exists()) {
+                const userData = existingUserSnap.val();
+                if (userData.expiresAt && userData.expiresAt > Date.now()) {
+                    return interaction.editReply(`❌ **Username Taken!** \`${customUser}\` নামটির মেয়াদ এখনো শেষ হয়নি। অনুগ্রহ করে অন্য কোনো Username বাছুন।`);
+                }
+            }
+
+            // একই পাসওয়ার্ড অন্য সচল অ্যাকাউন্টে ব্যবহার হচ্ছে কিনা চেক
+            const allUsersSnap = await db.ref("users").once("value");
+            const allUsers = allUsersSnap.val() || {};
+            let isPasswordTakenAndActive = false;
+
+            for (const u in allUsers) {
+                if (allUsers[u].password === customPass && allUsers[u].expiresAt > Date.now()) {
+                    isPasswordTakenAndActive = true;
+                    break;
+                }
+            }
+
+            if (isPasswordTakenAndActive) {
+                return interaction.editReply("❌ **Password In Use!** এই পাসওয়ার্ডটি অন্য একটি সক্রিয় অ্যাকাউন্টে ব্যবহৃত হচ্ছে। মেয়াদী নিরাপত্তার স্বার্থে ভিন্ন পাসওয়ার্ড দিন।");
+            }
+
+            // 🔑 ৩. সাবস্ক্রিপশন মেয়াদ সেটআপ
+            const subDays = txnData.days || 30; // ডেটাবেজের মেয়াদের দিন
             const expiryTimestamp = Date.now() + (subDays * 24 * 60 * 60 * 1000);
 
-            // 💾 ৩. C++ Loader / App-এর জন্য Firebase-এ ইউজার তথ্য সেভ
-            await db.ref(`users/${creds.username}`).set({
-                username: creds.username,
-                password: creds.password,
+            // 💾 ৪. Firebase-এ তথ্য সেভ
+            await db.ref(`users/${customUser}`).set({
+                username: customUser,
+                password: customPass,
                 discordId: interaction.user.id,
                 category: category,
                 status: "active",
                 createdAt: Date.now(),
                 expiresAt: expiryTimestamp,
-                hwid: "" // C++ Loader প্রথম লগইনে অটো বাইন্ড করে নিবে
+                hwid: "" 
             });
 
-            // 🔥 ৪. Transaction ID used হিসেবে মার্ক করা (Burn system)
+            // 🔥 ৫. Transaction ID used মার্ক করা
             await txnRef.update({
                 used: true,
                 usedBy: interaction.user.id,
                 usedAt: Date.now(),
-                assignedUser: creds.username
+                assignedUser: customUser
             });
 
-            // 📁 ৫. অর্ডার চ্যানেল ক্রিয়েশন
-            const randomCode = Math.floor(1000 + Math.random() * 9000); 
-            let supportRoleId = ROLES.SUPPORT_CUSTOMER;
-            let channelPrefix = `order-${randomCode}`; 
-
-            const permissionOverwrites = [
-                { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-                { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
-                { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
-            ];
-
-            if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-            if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
-
-            const privateChannel = await interaction.guild.channels.create({
-                name: channelPrefix,
-                type: 0,
-                permissionOverwrites: permissionOverwrites
-            });
-
-            // 📩 ৬. প্রাইভেট অর্ডার চ্যানেলে মেসেজ এবং ক্রেডেনশিয়াল পাঠানো
-            const insideEmbed = new EmbedBuilder()
-                .setTitle(`🎉 Payment Verified & Account Created!`)
-                .setDescription(`স্বাগতম ${interaction.user}!\nআপনার পেমেন্ট সফলভাবে ভেরিফাই করা হয়েছে। আপনার **Login Credentials** নিচে দেওয়া হলো:\n\n**🛒 ক্যাটাগরি:** \`${category.toUpperCase()}\`\n**💳 Transaction ID:** \`${txnId}\`
-
-🔑 **লগইন তথ্য (Software/Loader):**
-> 👤 **Username:** \`${creds.username}\`
-> 🔑 **Password:** \`${creds.password}\`
-> 📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>
-
-⚠️ *আপনার নিরাপত্তার স্বার্থে এই তথ্যগুলো কারো সাথে শেয়ার করবেন না।*`)
-                .setColor("Green")
-                .setTimestamp();
-
-            const staffButtons = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId(`approve_order`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId(`ban_panel_order`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
-            );
-
-            await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [staffButtons] });
-
-            // 📬 ৭. ইউজারের ডিরেক্ট মেসেজে (DM) লগইন তথ্য দেওয়া
+            // 📩 ৬. প্রাইভেট DM এ ইউজার তথ্য পাঠানো
             try {
                 const dmEmbed = new EmbedBuilder()
-                    .setTitle("🔑 Your Software Login Credentials")
-                    .setDescription(`ধন্যবাদ আপনার ক্রয়ের জন্য! আপনার লগইন তথ্য নিচে দেওয়া হলো:\n\n👤 **Username:** \`${creds.username}\`\n🔑 **Password:** \`${creds.password}\`\n⏳ **Status:** Active`)
-                    .setColor("Blue")
+                    .setTitle("🔑 Your Custom Credentials Created Successfully!")
+                    .setDescription(`ধন্যবাদ আপনার ক্রয়ের জন্য! আপনার তৈরি করা লগইন তথ্য নিচে দেওয়া হলো:\n\n👤 **Username:** \`${customUser}\`\n🔑 **Password:** \`${customPass}\`\n📅 **মেয়াদ শেষ হবে:** <t:${Math.floor(expiryTimestamp / 1000)}:R>\n💳 **TxnID:** \`${txnId}\`\n⏳ **Status:** Active`)
+                    .setColor("Green")
                     .setTimestamp();
                 await interaction.user.send({ embeds: [dmEmbed] });
             } catch (dmErr) {
-                console.log("❌ DM Closed:", dmErr);
+                console.log("❌ User DM closed:", dmErr);
             }
 
-            // 📊 ৮. ট্র্যাকিং চ্যানেলে আপডেট
+            // 📊 ৭. ট্র্যacking চ্যানেলে লগ আপডেট
             const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
             if (trackingChannel) {
-                const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending", null, null, txnId);
-                const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
-                if (trackingMsg) {
-                    saveOrderLog(privateChannel.id, trackingMsg.id, { 
-                        userId: interaction.user.id, 
-                        category: category, 
-                        status: "pending", 
-                        txnId: txnId,
-                        username: creds.username 
-                    });
-                }
+                const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, "Direct Delivery (No Ticket)", "approved", null, null, txnId);
+                await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
             }
 
-            return interaction.editReply(`✅ **পেমেন্ট ভেরিফাই হয়েছে!** অ্যাকাউন্ট তৈরি সম্পন্ন হয়েছে এবং অর্ডার চ্যানেল ওপেন করা হয়েছে: ${privateChannel}`);
+            return interaction.editReply({
+                content: `✅ **পেমেন্ট ভেরিফাই হয়েছে!** আলাদা কোনো টিকিট চ্যানেল ক্রিয়েট করা হয়নি। আপনার কাস্টম অ্যাকাউন্ট তৈরি সম্পন্ন করা হয়েছে:\n\n👤 **Username:** \`${customUser}\`\n🔑 **Password:** \`${customPass}\`\n📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>\n\n*(তথ্যগুলো আপনাকে ডিরেক্ট মেসেজেও (DM) পাঠিয়ে দেওয়া হয়েছে)*`
+            });
 
         } catch (err) {
             console.error("❌ Payment Processing Error:", err);
             return interaction.editReply("❌ **প্রসেসিংয়ে ত্রুটি ঘটেছে!** অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।");
         }
     }
-
-
-    
 
     if (interaction.isButton() && interaction.customId.startsWith("create_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -703,7 +682,6 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_paymen
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
 
-        // HTML Transcript Backup
         try {
             const transcriptLogChan = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
             if (transcriptLogChan) {
@@ -793,7 +771,7 @@ if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_paymen
 async function getDynamicOrderGuidePanel() {
     const { customDescription, customImage, fullData } = await fetchFirebasePanelData("order_guide");
     const defaultTitle = "📦 HOW TO ORDER & SYSTEM GUIDE";
-    const defaultDesc = `🛒 **আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী** 🛒\n\n📌 **ধাপসমূহ:**\n১. পেমেন্ট প্যানেল থেকে প্যাকেজ নির্বাচন করুন।\n২. টাকা পাঠিয়ে **Transaction ID** সংগ্রহ করুন।`;
+    const defaultDesc = `🛒 **আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী** 🛒\n\n📌 **ধাপসমূহ:**\n১. পেমেন্ট প্যানেল থেকে প্যাকেজ নির্বাচন করুন।\n২. টাকা পাঠিয়ে **Transaction ID** সংগ্রহ করুন।\n৩. নিজের পছন্দের **Username & Password** বসিয়ে এক সেকেন্ডে অটো অ্যাকাউন্ট তৈরি করে নিন!`;
 
     const embed = new EmbedBuilder()
         .setTitle(fullData.title || defaultTitle)
@@ -852,17 +830,22 @@ async function getDynamicCustomerPanel() {
 }
 
 async function getDynamicPaymentPanel() { 
-    const { options, customDescription, customImage } = await fetchFirebasePanelData("payment");
-    const defaultDesc = `💳 **Premium Store & Automatic Payment Gateway** 💳`;
+    const defaultDesc = `💳 **AUTOMATED PRICING & PAYMENT GATEWAY** 💳\n\n📌 **প্রাইসিং লিস্ট (Package Prices):**\n• 🗓️ **Weekly (১ সপ্তাহ):** 5 USD / ৳510 BDT\n• 🗓️ **Monthly (১ মাস):** ৳1510 BDT\n• 🗓️ **2 Months (২ মাস):** ৳2410 BDT\n\n✨ পেমেন্ট শেষে TxnID সহ আপনার পছন্দের কাস্টম **Username** ও **Password** দিন!`;
 
     const embed = new EmbedBuilder()
         .setTitle("🛍️ AUTOMATED SHOP & PAYMENT PANELS")
-        .setDescription(customDescription || defaultDesc)
-        .setImage(customImage || COVER_IMAGES.PAYMENT)
+        .setDescription(defaultDesc)
+        .setImage(COVER_IMAGES.PAYMENT)
         .setColor("#3498DB")
         .setFooter({ text: "Automated Payment Bot", iconURL: client.user.displayAvatarURL() });
 
-    const menu = new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("🛍️ আপনার কাঙ্ক্ষিত মেম্বারশিপ/সার্ভিস সিলেক্ট করুন...").addOptions(options); 
+    const options = [
+        { label: "🗓️ Weekly - 5 USD / 510 BDT", value: "weekly" },
+        { label: "🗓️ Monthly - 1510 BDT", value: "monthly" },
+        { label: "🗓️ 2 Months - 2410 BDT", value: "2_months" }
+    ];
+
+    const menu = new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("🛍️ আপনার কাঙ্ক্ষিত প্যাকেজটি সিলেক্ট করুন...").addOptions(options); 
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] }; 
 }
 
@@ -1050,7 +1033,6 @@ function listenToFirebaseUpdates() {
         const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
         if (!guild) return;
 
-        // Panel Auto-Updates
         const ticketChan = guild.channels.cache.get(CHANNELS.TICKET_PANEL);
         if (ticketChan) {
             const messages = await ticketChan.messages.fetch({ limit: 20 });
@@ -1096,7 +1078,6 @@ setInterval(async () => {
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
     if (!guild) return;
 
-    // Live Stats Voice Counter Update
     const statsChannel = guild.channels.cache.get(STATS_VC_CHANNEL_ID);
     if (statsChannel) {
         const totalMembers = guild.memberCount;
@@ -1104,7 +1085,6 @@ setInterval(async () => {
         await statsChannel.setName(`👥 Members: ${totalMembers} | 🎙️ VC: ${activeInVc}`).catch(() => {});
     }
 
-    // Giveaway Checker
     const now = Date.now();
     const gwsSnap = await db.ref("giveaways").once("value");
     const giveaways = gwsSnap.val() || {};
@@ -1138,7 +1118,7 @@ setInterval(async () => {
     }
 }, 5 * 60 * 1000);
 
-// উইকলি গ্রোথ অ্যানালিটিক্স রিপোর্ট (প্রতি রবিবার রাত ১২ টায়)
+// উইকলি গ্রোথ অ্যানালিটিক্স রিপোর্ট
 setInterval(async () => {
     const d = new Date();
     if (d.getDay() === 0 && d.getHours() === 0 && d.getMinutes() === 0) {
