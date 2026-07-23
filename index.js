@@ -52,6 +52,28 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
 // ================================
+// 📱 Dynamic Realtime Settings (Firebase Sync)
+// ================================
+
+let PAYMENT_NUMBER = "01404548951"; // ডিফল্ট মোবাইল নম্বর
+let VERIFICATION_LINK = "https://discord.gg/example"; // ডিফল্ট লিঙ্ক
+
+// 🔄 ফায়ারবেস Realtime Database থেকে settings এর তথ্য লাইভ আপডেট রাখার লিসেনার
+db.ref("settings").on("value", (snapshot) => {
+    if (snapshot.exists()) {
+        const data = snapshot.val();
+        if (data.payment_number) {
+            PAYMENT_NUMBER = String(data.payment_number);
+            console.log("✅ Realtime Payment Number Updated:", PAYMENT_NUMBER);
+        }
+        if (data.verification_link) {
+            VERIFICATION_LINK = String(data.verification_link);
+            console.log("✅ Realtime Verification Link Updated:", VERIFICATION_LINK);
+        }
+    }
+});
+
+// ================================
 // ⚙️ Bot Config & Automod Rules
 // ================================
 
@@ -113,8 +135,6 @@ function getNormalizedCategory(cat) {
     if (c.includes("month")) return "monthly";
     return "weekly";
 }
-
-const PAYMENT_NUMBER = "01404548951";
 
 // New Configs
 const STATS_VC_CHANNEL_ID = "1524321192079786005";
@@ -337,13 +357,9 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // লাইভ লিংক রেসপন্স
+    // লাইভ লিঙ্ক রেসপন্স (ফায়ারবেসের রিয়েলটাইম ভ্যারিয়েবল `VERIFICATION_LINK` থেকে)
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
-        try {
-            const snapshot = await db.ref("settings/verification_link").once("value");
-            const dbLink = snapshot.val() || "কোনো লিংক ফায়ারবেসে পাওয়া যায়নি।";
-            return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${dbLink}\``);
-        } catch (err) {}
+        return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
     }
 
     if (BAD_WORDS.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
@@ -482,13 +498,6 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
-    
-    
-    
-    
-    
-    
-    
     // Modal Submit & Payment Handlers (কুপন সাবমিশন)
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -500,7 +509,7 @@ client.on("interactionCreate", async (interaction) => {
         
         let basePrice = PACKAGE_PRICES[category] || 510;
         let finalPrice = basePrice;
-        let discountText = "কোনো ডিসকাウント কুপন ব্যবহার করা হয়নি।";
+        let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
         let appliedCouponCode = null;
         let appliedDiscountValue = 0;
 
@@ -583,6 +592,7 @@ client.on("interactionCreate", async (interaction) => {
             usedTxns: []
         });
 
+        // 📱 পেমেন্ট নম্বরটি লাইভ ফায়ারবেস ভ্যারিয়েবল PAYMENT_NUMBER থেকে নেওয়া হচ্ছে
         const payEmbed = new EmbedBuilder()
             .setTitle(`💳 Payment Gateway: ${category.toUpperCase().replace("_", " ")}`)
             .setDescription(
@@ -604,17 +614,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ embeds: [payEmbed], components: [row] });
     }
 
-
-
-
-
-
-
-
-
-
-
-    
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
@@ -1126,7 +1125,7 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================================
-// 🔄 REALTIME FIREBASE SYNC LISTENER (PAYMENT PANEL FIX)
+// 🔄 REALTIME FIREBASE SYNC LISTENER (PAYMENT & PANELS FIX)
 // ================================
 client.on("ready", async () => {
     console.log(`🤖 Logged in as ${client.user.tag}!`);
