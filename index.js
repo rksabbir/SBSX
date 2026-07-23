@@ -113,7 +113,7 @@ const COVER_IMAGES = {
 
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
-// 💰 প্যাকেজের মূল্য তালিকা (সকল প্রকার নামের ম্যাপিং সহ)
+// 💰 প্যাকেজের মূল্য তালিকা
 const PACKAGE_PRICES = {
     weekly: 510,
     weekly_plan: 510,
@@ -127,7 +127,6 @@ const PACKAGE_PRICES = {
     two_months: 2410
 };
 
-// 📌 ক্যাটাগরি ডিটেক্ট করার অটোমেটিক ফাংশন
 function getNormalizedCategory(cat) {
     if (!cat) return "weekly";
     const c = String(cat).toLowerCase();
@@ -357,7 +356,7 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // লাইভ লিঙ্ক রেসপন্স (ফায়ারবেসের রিয়েলটাইম ভ্যারিয়েবল `VERIFICATION_LINK` থেকে)
+    // লাইভ লিঙ্ক রেসপন্স
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
         return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
     }
@@ -470,19 +469,57 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // ড্রপডাউন সিলেকশন হ্যান্ডলার
+    // 🌟 ড্রপডাউন সিলেকশন হ্যান্ডলার (1TIME KEY + TICKET HANDLING)
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
-        const value = interaction.values[0].toLowerCase();
+        const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
 
+        // 🔑 ১-টাইম কী তৈরির বিশেষ পারমিশন চেকিং
+        if (value === "generate_1time_key") {
+            const DEV_ROLE_NAME = "Developer"; // আপনার সার্ভারের ডেভেলপার রোলের নাম
+            const hasDevRole = interaction.member.roles.cache.some(role => role.name === DEV_ROLE_NAME);
+            const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+
+            if (!hasDevRole && !isAdmin) {
+                return interaction.reply({
+                    content: "❌ **অনুমতি নেই!** শুধুমাত্র **Developer** রোলধারীরা C++ অ্যাপের জন্য 1TIME KEY তৈরি করতে পারবেন।",
+                    flags: [MessageFlags.Ephemeral]
+                });
+            }
+
+            // C++ এর সাথে সিঙ্ক করে ফায়ারবেসে কী জেনারেট
+            const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
+            const keyRef = db.ref(`keys/${randomKey}`);
+            
+            await keyRef.set({
+                used: false,
+                generatedBy: interaction.user.tag,
+                userId: interaction.user.id,
+                createdAt: Date.now()
+            });
+
+            const keyEmbed = new EmbedBuilder()
+                .setTitle("🔑 1TIME KEY Generated Successfully!")
+                .setDescription(`আপনার ১-টাইম কী সফলভাবে তৈরি হয়েছে। C++ অ্যাপে লগইন করতে নিচের কী-টি ব্যবহার করুন:\n\n**KEY:** \`${randomKey}\``)
+                .setColor("#57F287")
+                .setFooter({ text: "নোট: এই কী-টি C++ অ্যাপে কেবল একবারই ব্যবহার করা যাবে।" });
+
+            return interaction.reply({ 
+                embeds: [keyEmbed], 
+                flags: [MessageFlags.Ephemeral] 
+            });
+        }
+
         let type = ""; let embedColor = ""; let buttonId = "";
-        if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${value}`; }
-        else if (interaction.customId === "select_report_category") { type = "report"; embedColor = "#ED4245"; buttonId = `create_report_${value}`; }
-        else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${value}`; }
-        else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${value}`; } 
+        const lowerVal = value.toLowerCase();
+
+        if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${lowerVal}`; }
+        else if (interaction.customId === "select_report_category") { type = "report"; embedColor = "#ED4245"; buttonId = `create_report_${lowerVal}`; }
+        else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${lowerVal}`; }
+        else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${lowerVal}`; } 
 
         if (type === "order") {
-            const modal = new ModalBuilder().setCustomId(`modal_coupon_${value}`).setTitle("🎟️ Coupon / Discount Code");
+            const modal = new ModalBuilder().setCustomId(`modal_coupon_${lowerVal}`).setTitle("🎟️ Coupon / Discount Code");
             const couponInput = new TextInputBuilder()
                 .setCustomId("coupon_code_input")
                 .setLabel("কুপন কোড দিন (না থাকলে SKIP লিখুন)")
@@ -498,12 +535,12 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
-    // Modal Submit & Payment Handlers (কুপন সাবমিশন)
+    // Modal Submit & Payment Handlers
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
-        const category = getNormalizedCategory(rawCategory); // অটো-ক্যাটাগরি ট্র্যাকিং
+        const category = getNormalizedCategory(rawCategory);
         const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
         const userId = interaction.user.id;
         
@@ -540,9 +577,7 @@ client.on("interactionCreate", async (interaction) => {
             }
         }
 
-        // 🌟 ১. যদি কুপনের কারণে দাম 0 BDT হয়ে যায়
         if (finalPrice <= 0) {
-            // ফায়ারবেসে পেমেন্ট সেশনকে ১০০% পেইড হিসেবে মার্ক করা
             await db.ref(`pending_payments/${userId}_${category}`).set({
                 targetPrice: 0,
                 basePrice: basePrice,
@@ -552,7 +587,6 @@ client.on("interactionCreate", async (interaction) => {
                 usedTxns: ["COUPON_100_PERCENT_OFF"]
             });
 
-            // কুপনটি সাথে সাথে Used মার্ক করে দেওয়া
             if (appliedCouponCode) {
                 await db.ref(`coupons/${appliedCouponCode}`).update({
                     status: "used",
@@ -567,7 +601,7 @@ client.on("interactionCreate", async (interaction) => {
                     `📦 **প্যাকেজের রেগুলার মূল্য:** \`${basePrice}\` BDT\n` +
                     `🎁 **কুপন ডিসকাউন্ট:** \`${appliedDiscountValue}\` BDT\n` +
                     `💰 **আপনাকে পেমেন্ট করতে হবে:** \`0\` BDT (সম্পূর্ণ ফ্রি!)\n\n` +
-                    `✨ আপনার কুপনের মাধ্যমে পুরো পেমেন্ট সম্পূর্ণ হয়েছে। আপনাকে কোনো Transaction ID দিতে হবে না।\n\n` +
+                    `✨ আপনার কুপনের মাধ্যমে পুরো পেমেন্ট সম্পূর্ণ হয়েছে।\n\n` +
                     `👉 অ্যাকাউন্ট তৈরির জন্য নিচের **"Create Account Credentials"** বাটনে ক্লিক করুন।`
                 )
                 .setColor("#00FF00");
@@ -582,7 +616,6 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply({ embeds: [zeroPriceEmbed], components: [row] });
         }
 
-        // 🌟 ২. যদি দাম ০ টাকার বেশি থাকে (স্বাভাবিক পেমেন্ট ফ্লো)
         await db.ref(`pending_payments/${userId}_${category}`).set({
             targetPrice: finalPrice,
             basePrice: basePrice,
@@ -592,7 +625,6 @@ client.on("interactionCreate", async (interaction) => {
             usedTxns: []
         });
 
-        // 📱 পেমেন্ট নম্বরটি লাইভ ফায়ারবেস ভ্যারিয়েবল PAYMENT_NUMBER থেকে নেওয়া হচ্ছে
         const payEmbed = new EmbedBuilder()
             .setTitle(`💳 Payment Gateway: ${category.toUpperCase().replace("_", " ")}`)
             .setDescription(
@@ -1049,18 +1081,34 @@ async function getDynamicOrderGuidePanel() {
     return { embeds: [embed] };
 }
 
+// 🌟 ১-টাইম কী ড্রপডাউন মেনু যুক্ত টিকেট প্যানেল
 async function getDynamicTicketPanel() {
     const { options, customDescription, customImage } = await fetchFirebasePanelData("ticket");
-    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট টিকিটে স্বাগতম!** 🎟️`;
+    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট ও কি জেনারেটর প্যানেল** 🎟️\n\n*(নোট: 1TIME KEY কেবল ডেভেলপাররা তৈরি করতে পারবেন)*`;
 
     const embed = new EmbedBuilder()
-        .setTitle("🎫 OFFICIAL SUPPORT TICKET CENTER")
+        .setTitle("🎫 OFFICIAL SUPPORT & KEY PANEL")
         .setDescription(customDescription || defaultDesc)
         .setImage(customImage || COVER_IMAGES.TICKET)
         .setColor("#5865F2")
         .setFooter({ text: "Official Support Panel", iconURL: client.user.displayAvatarURL() });
 
-    const menu = new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...").addOptions(options);
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId("select_product_ticket")
+        .setPlaceholder("👇 ড্রপডাউন মেনু থেকে সার্ভিস সিলেক্ট করুন...")
+        .addOptions([
+            {
+                label: "🔑 Generate 1TIME KEY (Dev Only)",
+                description: "C++ অ্যাপের জন্য ১-টাইম কী জেনারেট করুন",
+                value: "generate_1time_key"
+            },
+            {
+                label: "💬 General Support Ticket",
+                description: "সাধারণ সহায়তার জন্য টিকেট খুলুন",
+                value: "general_support"
+            }
+        ]);
+
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
 }
 
@@ -1125,7 +1173,7 @@ client.on("messageCreate", async (message) => {
 });
 
 // ================================
-// 🔄 REALTIME FIREBASE SYNC LISTENER (PAYMENT & PANELS FIX)
+// 🔄 REALTIME FIREBASE SYNC LISTENER
 // ================================
 client.on("ready", async () => {
     console.log(`🤖 Logged in as ${client.user.tag}!`);
@@ -1134,7 +1182,6 @@ client.on("ready", async () => {
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
     if (!guild) return;
 
-    // 🔥 ১. Payment Panel ডেডিকেটেড রিয়েলটাইম লিসেনার
     db.ref("panels/payment").on("value", async () => {
         try {
             const payChan = guild.channels.cache.get(CHANNELS.PAYMENT_PANEL);
@@ -1154,7 +1201,6 @@ client.on("ready", async () => {
         }
     });
 
-    // 🔥 ২. Ticket / Report / Customer Panel লিসেনার
     db.ref("panels").on("value", async (snapshot) => {
         const ticketChan = guild.channels.cache.get(CHANNELS.TICKET_PANEL);
         if (ticketChan) {
