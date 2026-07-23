@@ -91,14 +91,28 @@ const COVER_IMAGES = {
 
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
+// 💰 প্যাকেজের মূল্য তালিকা (সকল প্রকার নামের ম্যাপিং সহ)
 const PACKAGE_PRICES = {
     weekly: 510,
     weekly_plan: 510,
     monthly: 1510,
     monthly_plan: 1510,
     "2_months": 2410,
-    two_months_plan: 2410
+    two_months_plan: 2410,
+    two: 2410,
+    "2months": 2410,
+    "2month": 2410,
+    two_months: 2410
 };
+
+// 📌 ক্যাটাগরি ডিটেক্ট করার অটোমেটিক ফাংশন
+function getNormalizedCategory(cat) {
+    if (!cat) return "weekly";
+    const c = String(cat).toLowerCase();
+    if (c.includes("2") || c.includes("two")) return "2_months";
+    if (c.includes("month")) return "monthly";
+    return "weekly";
+}
 
 const PAYMENT_NUMBER = "01404548951";
 
@@ -158,19 +172,17 @@ async function fetchFirebasePanelData(panelType) {
 
         let options = [];
 
-        // যদি অপশন অবজেক্ট হিসেবে সাজানো থাকে
         if (data.options && typeof data.options === "object") {
             options = Object.keys(data.options).map(key => ({
                 label: String(data.options[key].label || data.options[key]),
                 value: String(data.options[key].value || key)
             }));
         } else {
-            // ফ্ল্যাট কি-ভ্যালু পেয়ার ফিক্স: সরাসরি key কে value এবং data[key] কে label হিসেবে নেওয়া
             options = Object.keys(data)
                 .filter(key => !["description", "image", "title", "options"].includes(key))
                 .map(key => ({
                     label: String(data[key]),
-                    value: String(key) // নিশ্চিত করে যে key (e.g. weekly/monthly) সঠিক value নির্দেশ করছে
+                    value: String(key)
                 }));
         }
 
@@ -442,7 +454,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // ড্রপডাউন সিলেকশন হ্যান্ডলার (Value Reading Fix)
+    // ড্রপডাউন সিলেকশন হ্যান্ডলার
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
         const value = interaction.values[0].toLowerCase();
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -473,17 +485,13 @@ client.on("interactionCreate", async (interaction) => {
     // Modal Submit & Payment Handlers
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const category = interaction.customId.split("_")[2].toLowerCase();
+        
+        const rawCategory = interaction.customId.split("_")[2].toLowerCase();
+        const category = getNormalizedCategory(rawCategory); // অটো-ক্যাটাগরি ট্র্যাকিং
         const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
         const userId = interaction.user.id;
         
-       // কাস্টম কী-গুলোকে আসল ক্যাটাগরির সাথে ম্যাপিং করা
-let actualCategory = category;
-if (category === "weekly_plan") actualCategory = "weekly";
-if (category === "monthly_plan") actualCategory = "monthly";
-if (category === "two_months_plan") actualCategory = "2_months";
-
-let basePrice = PACKAGE_PRICES[actualCategory] || PACKAGE_PRICES[category] || 510;
+        let basePrice = PACKAGE_PRICES[category] || 510;
         let finalPrice = basePrice;
         let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
         let appliedCouponCode = null;
@@ -547,7 +555,9 @@ let basePrice = PACKAGE_PRICES[actualCategory] || PACKAGE_PRICES[category] || 51
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
-        const category = interaction.customId.split("_")[2].toLowerCase();
+        const rawCategory = interaction.customId.split("_")[2].toLowerCase();
+        const category = getNormalizedCategory(rawCategory);
+        
         const modal = new ModalBuilder()
             .setCustomId(`modal_txn_${category}`)
             .setTitle("🔒 Submit Transaction ID");
@@ -566,7 +576,9 @@ let basePrice = PACKAGE_PRICES[actualCategory] || PACKAGE_PRICES[category] || 51
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_txn_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
-        const category = interaction.customId.split("_")[2].toLowerCase();
+        const rawCategory = interaction.customId.split("_")[2].toLowerCase();
+        const category = getNormalizedCategory(rawCategory);
+        
         const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
         const userId = interaction.user.id;
         const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
@@ -711,7 +723,8 @@ let basePrice = PACKAGE_PRICES[actualCategory] || PACKAGE_PRICES[category] || 51
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("open_cred_modal_")) {
-        const category = interaction.customId.split("_")[3].toLowerCase();
+        const rawCategory = interaction.customId.split("_")[3].toLowerCase();
+        const category = getNormalizedCategory(rawCategory);
 
         const modal = new ModalBuilder()
             .setCustomId(`modal_create_account_${category}`)
@@ -740,7 +753,9 @@ let basePrice = PACKAGE_PRICES[actualCategory] || PACKAGE_PRICES[category] || 51
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_create_account_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
-        const category = interaction.customId.split("_")[3].toLowerCase();
+        const rawCategory = interaction.customId.split("_")[3].toLowerCase();
+        const category = getNormalizedCategory(rawCategory);
+
         const customUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
         const customPass = interaction.fields.getTextInputValue("custom_password").trim();
         const userId = interaction.user.id;
@@ -1059,7 +1074,7 @@ client.on("ready", async () => {
     const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
     if (!guild) return;
 
-    // 🔥 ১. Payment Panel ডেডিকেটেড রিয়েলটাইম লিসেনার (ফায়ারবেসে পরিবর্তন হলেই মেসেজ আপডেট হবে)
+    // 🔥 ১. Payment Panel ডেডিকেটেড রিয়েলটাইম লিসেনার
     db.ref("panels/payment").on("value", async () => {
         try {
             const payChan = guild.channels.cache.get(CHANNELS.PAYMENT_PANEL);
