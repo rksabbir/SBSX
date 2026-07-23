@@ -480,44 +480,130 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
+  if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_payment_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const category = interaction.customId.split("_")[2];
-        const txnId = interaction.fields.getTextInputValue("txn_id_input");
-        const randomCode = Math.floor(1000 + Math.random() * 9000); 
-
-        let supportRoleId = ROLES.SUPPORT_CUSTOMER;
-        let channelPrefix = `order-${randomCode}`; 
-
-        const permissionOverwrites = [
-            { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
-        ];
-        if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-        if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
-
-        const privateChannel = await interaction.guild.channels.create({ name: channelPrefix, type: 0, permissionOverwrites: permissionOverwrites });
-        const insideEmbed = new EmbedBuilder().setTitle(`🛍️ Welcome to your Paid Order Channel`).setDescription(`স্বাগতম ${interaction.user}!\n**ক্যাটাগরি:** ${category.toUpperCase()}\n**Transaction ID:** \`${txnId}\``).setColor("Green");
         
-        const staffButtons = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId(`approve_order`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId(`ban_panel_order`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
-        );
+        const category = interaction.customId.split("_")[2];
+        const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
 
-        await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [staffButtons] });
+        try {
+            // 🔍 ১. Firebase Database এ Transaction ID ভ্যালিডিটি ও ইউসেজ চেক
+            const txnRef = db.ref(`transactions/${txnId}`);
+            const txnSnap = await txnRef.once("value");
 
-        const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
-        if (trackingChannel) {
-            const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending", null, null, txnId);
-            const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
-            if (trackingMsg) {
-                saveOrderLog(privateChannel.id, trackingMsg.id, { userId: interaction.user.id, category: category, status: "pending", txnId: txnId });
+            if (!txnSnap.exists()) {
+                return interaction.editReply("❌ **অকার্যকর Transaction ID!** সিস্টেমের ডেটাবেজে এই Transaction ID পাওয়া যায়নি।");
             }
+
+            const txnData = txnSnap.val();
+            
+            // পূর্বে ব্যবহৃত হয়েছে কিনা চেক করা
+            if (txnData.used === true) {
+                return interaction.editReply("❌ **Transaction ID ইতোমধ্যে ব্যবহৃত হয়েছে!** এই ID দিয়ে আগে একটি অ্যাকাউন্ট তৈরি করা হয়েছে।");
+            }
+
+            // 🔑 ২. অটোমেটিক ইউজারনেম ও পাসওয়ার্ড জেনারেট
+            const creds = generateCredentials(interaction.user);
+            const subDays = txnData.days || 30; // ডেটাবেজের মেয়াদের দিন (ডিফল্ট ৩০ দিন)
+            const expiryTimestamp = Date.now() + (subDays * 24 * 60 * 60 * 1000);
+
+            // 💾 ৩. C++ Loader / App-এর জন্য Firebase-এ ইউজার তথ্য সেভ
+            await db.ref(`users/${creds.username}`).set({
+                username: creds.username,
+                password: creds.password,
+                discordId: interaction.user.id,
+                category: category,
+                status: "active",
+                createdAt: Date.now(),
+                expiresAt: expiryTimestamp,
+                hwid: "" // C++ Loader প্রথম লগইনে অটো বাইন্ড করে নিবে
+            });
+
+            // 🔥 ৪. Transaction ID used হিসেবে মার্ক করা (Burn system)
+            await txnRef.update({
+                used: true,
+                usedBy: interaction.user.id,
+                usedAt: Date.now(),
+                assignedUser: creds.username
+            });
+
+            // 📁 ৫. অর্ডার চ্যানেল ক্রিয়েশন
+            const randomCode = Math.floor(1000 + Math.random() * 9000); 
+            let supportRoleId = ROLES.SUPPORT_CUSTOMER;
+            let channelPrefix = `order-${randomCode}`; 
+
+            const permissionOverwrites = [
+                { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
+                { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
+                { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
+            ];
+
+            if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+            if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory, PermissionFlagsBits.ManageChannels] });
+
+            const privateChannel = await interaction.guild.channels.create({
+                name: channelPrefix,
+                type: 0,
+                permissionOverwrites: permissionOverwrites
+            });
+
+            // 📩 ৬. প্রাইভেট অর্ডার চ্যানেলে মেসেজ এবং ক্রেডেনশিয়াল পাঠানো
+            const insideEmbed = new EmbedBuilder()
+                .setTitle(`🎉 Payment Verified & Account Created!`)
+                .setDescription(`স্বাগতম ${interaction.user}!\nআপনার পেমেন্ট সফলভাবে ভেরিফাই করা হয়েছে। আপনার **Login Credentials** নিচে দেওয়া হলো:\n\n**🛒 ক্যাটাগরি:** \`${category.toUpperCase()}\`\n**💳 Transaction ID:** \`${txnId}\`
+
+🔑 **লগইন তথ্য (Software/Loader):**
+> 👤 **Username:** \`${creds.username}\`
+> 🔑 **Password:** \`${creds.password}\`
+> 📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>
+
+⚠️ *আপনার নিরাপত্তার স্বার্থে এই তথ্যগুলো কারো সাথে শেয়ার করবেন না।*`)
+                .setColor("Green")
+                .setTimestamp();
+
+            const staffButtons = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim Staff").setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId(`approve_order`).setLabel("✅ Approve").setStyle(ButtonStyle.Success),
+                new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close").setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId(`ban_panel_order`).setLabel("🚫 Ban/Timeout").setStyle(ButtonStyle.Danger)
+            );
+
+            await privateChannel.send({ content: `${interaction.user}`, embeds: [insideEmbed], components: [staffButtons] });
+
+            // 📬 ৭. ইউজারের ডিরেক্ট মেসেজে (DM) লগইন তথ্য দেওয়া
+            try {
+                const dmEmbed = new EmbedBuilder()
+                    .setTitle("🔑 Your Software Login Credentials")
+                    .setDescription(`ধন্যবাদ আপনার ক্রয়ের জন্য! আপনার লগইন তথ্য নিচে দেওয়া হলো:\n\n👤 **Username:** \`${creds.username}\`\n🔑 **Password:** \`${creds.password}\`\n⏳ **Status:** Active`)
+                    .setColor("Blue")
+                    .setTimestamp();
+                await interaction.user.send({ embeds: [dmEmbed] });
+            } catch (dmErr) {
+                console.log("❌ DM Closed:", dmErr);
+            }
+
+            // 📊 ৮. ট্র্যাকিং চ্যানেলে আপডেট
+            const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
+            if (trackingChannel) {
+                const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending", null, null, txnId);
+                const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
+                if (trackingMsg) {
+                    saveOrderLog(privateChannel.id, trackingMsg.id, { 
+                        userId: interaction.user.id, 
+                        category: category, 
+                        status: "pending", 
+                        txnId: txnId,
+                        username: creds.username 
+                    });
+                }
+            }
+
+            return interaction.editReply(`✅ **পেমেন্ট ভেরিফাই হয়েছে!** অ্যাকাউন্ট তৈরি সম্পন্ন হয়েছে এবং অর্ডার চ্যানেল ওপেন করা হয়েছে: ${privateChannel}`);
+
+        } catch (err) {
+            console.error("❌ Payment Processing Error:", err);
+            return interaction.editReply("❌ **প্রসেসিংয়ে ত্রুটি ঘটেছে!** অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।");
         }
-        return interaction.editReply(`✅ পেমেন্ট সাবমিট হয়েছে এবং অর্ডার চ্যানেল তৈরি হয়েছে: ${privateChannel}`);
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("create_")) {
