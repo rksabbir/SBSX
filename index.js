@@ -145,7 +145,7 @@ function generateUniqueCouponCode() {
     return code;
 }
 
-// Firebase থেকে ডেটা নিয়ে আসার ফাংশন
+// Firebase থেকে ডেটা নিয়ে আসার ফিক্সড ফাংশন
 async function fetchFirebasePanelData(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
@@ -154,12 +154,23 @@ async function fetchFirebasePanelData(panelType) {
         const customDescription = data.description || null;
         const customImage = data.image || null;
 
-        const options = Object.keys(data)
-            .filter(key => key !== "description" && key !== "image" && key !== "title")
-            .map(key => ({
-                label: data[key],
-                value: key
+        let options = [];
+
+        // যদি অপশন অবজেক্ট ম্যাপ করা থাকে
+        if (data.options && typeof data.options === "object") {
+            options = Object.keys(data.options).map(key => ({
+                label: String(data.options[key]),
+                value: String(key)
             }));
+        } else {
+            // ফ্ল্যাট কি-ভ্যালু পেয়ার সঠিক কি (Key) এবং লেবেল ধরে ফেচ করা
+            options = Object.keys(data)
+                .filter(key => !["description", "image", "title", "options"].includes(key))
+                .map(key => ({
+                    label: String(data[key]),
+                    value: String(key)
+                }));
+        }
 
         if (options.length === 0) {
             options.push({ label: "No Options Found in DB", value: "none" });
@@ -429,9 +440,9 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // ড্রপডাউন সিলেকশন এবং ফিক্সড কুপন মোডাল ট্রিগার
+    // ড্রপডাউন সিলেকশন হ্যান্ডলার (ফিক্সড Value Reading)
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
-        const value = interaction.values[0];
+        const value = interaction.values[0].toLowerCase();
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
 
         let type = ""; let embedColor = ""; let buttonId = "";
@@ -462,7 +473,7 @@ client.on("interactionCreate", async (interaction) => {
     // ================================
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const category = interaction.customId.split("_")[2];
+        const category = interaction.customId.split("_")[2].toLowerCase();
         const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
         const userId = interaction.user.id;
         
@@ -534,7 +545,7 @@ client.on("interactionCreate", async (interaction) => {
     // 🔘 2. Submit TxnID Button Click
     // ================================
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
-        const category = interaction.customId.split("_")[2];
+        const category = interaction.customId.split("_")[2].toLowerCase();
         const modal = new ModalBuilder()
             .setCustomId(`modal_txn_${category}`)
             .setTitle("🔒 Submit Transaction ID");
@@ -556,7 +567,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_txn_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
-        const category = interaction.customId.split("_")[2];
+        const category = interaction.customId.split("_")[2].toLowerCase();
         const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
         const userId = interaction.user.id;
         const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
@@ -711,7 +722,7 @@ client.on("interactionCreate", async (interaction) => {
     // 🔑 4. Open Account Creation Modal Trigger
     // ================================
     if (interaction.isButton() && interaction.customId.startsWith("open_cred_modal_")) {
-        const category = interaction.customId.split("_")[3];
+        const category = interaction.customId.split("_")[3].toLowerCase();
 
         const modal = new ModalBuilder()
             .setCustomId(`modal_create_account_${category}`)
@@ -743,7 +754,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_create_account_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
-        const category = interaction.customId.split("_")[3];
+        const category = interaction.customId.split("_")[3].toLowerCase();
         const customUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
         const customPass = interaction.fields.getTextInputValue("custom_password").trim();
         const userId = interaction.user.id;
@@ -1251,7 +1262,7 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!orderguide" && message.channelId === ORDER_GUIDE_CHANNEL_ID) return message.channel.send(await getDynamicOrderGuidePanel());
 });
 
-// Realtime DB Panel Auto Updater
+// Realtime DB Panel Auto Updater (Fix Payment Panel Syncing)
 client.on("ready", async () => {
     console.log(`🤖 Logged in as ${client.user.tag}!`);
     setBotPresence();
