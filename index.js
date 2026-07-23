@@ -91,11 +91,13 @@ const COVER_IMAGES = {
 
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
-// Package Base Prices
 const PACKAGE_PRICES = {
     weekly: 510,
+    weekly_plan: 510,
     monthly: 1510,
-    "2_months": 2410
+    monthly_plan: 1510,
+    "2_months": 2410,
+    two_months_plan: 2410
 };
 
 const PAYMENT_NUMBER = "01404548951";
@@ -475,7 +477,13 @@ client.on("interactionCreate", async (interaction) => {
         const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
         const userId = interaction.user.id;
         
-        let basePrice = PACKAGE_PRICES[category] || 510;
+       // কাস্টম কী-গুলোকে আসল ক্যাটাগরির সাথে ম্যাপিং করা
+let actualCategory = category;
+if (category === "weekly_plan") actualCategory = "weekly";
+if (category === "monthly_plan") actualCategory = "monthly";
+if (category === "two_months_plan") actualCategory = "2_months";
+
+let basePrice = PACKAGE_PRICES[actualCategory] || PACKAGE_PRICES[category] || 510;
         let finalPrice = basePrice;
         let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
         let appliedCouponCode = null;
