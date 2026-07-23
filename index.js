@@ -482,7 +482,14 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
-    // Modal Submit & Payment Handlers
+    
+    
+    
+    
+    
+    
+    
+    // Modal Submit & Payment Handlers (কুপন সাবমিশন)
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
@@ -493,7 +500,7 @@ client.on("interactionCreate", async (interaction) => {
         
         let basePrice = PACKAGE_PRICES[category] || 510;
         let finalPrice = basePrice;
-        let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
+        let discountText = "কোনো ডিসকাウント কুপন ব্যবহার করা হয়নি।";
         let appliedCouponCode = null;
         let appliedDiscountValue = 0;
 
@@ -524,6 +531,49 @@ client.on("interactionCreate", async (interaction) => {
             }
         }
 
+        // 🌟 ১. যদি কুপনের কারণে দাম 0 BDT হয়ে যায়
+        if (finalPrice <= 0) {
+            // ফায়ারবেসে পেমেন্ট সেশনকে ১০০% পেইড হিসেবে মার্ক করা
+            await db.ref(`pending_payments/${userId}_${category}`).set({
+                targetPrice: 0,
+                basePrice: basePrice,
+                appliedCoupon: appliedCouponCode,
+                appliedDiscount: appliedDiscountValue,
+                totalPaid: 0,
+                usedTxns: ["COUPON_100_PERCENT_OFF"]
+            });
+
+            // কুপনটি সাথে সাথে Used মার্ক করে দেওয়া
+            if (appliedCouponCode) {
+                await db.ref(`coupons/${appliedCouponCode}`).update({
+                    status: "used",
+                    usedBy: userId,
+                    usedAt: Date.now()
+                });
+            }
+
+            const zeroPriceEmbed = new EmbedBuilder()
+                .setTitle(`🎉 100% Discount Applied! (${category.toUpperCase()})`)
+                .setDescription(
+                    `📦 **প্যাকেজের রেগুলার মূল্য:** \`${basePrice}\` BDT\n` +
+                    `🎁 **কুপন ডিসকাউন্ট:** \`${appliedDiscountValue}\` BDT\n` +
+                    `💰 **আপনাকে পেমেন্ট করতে হবে:** \`0\` BDT (সম্পূর্ণ ফ্রি!)\n\n` +
+                    `✨ আপনার কুপনের মাধ্যমে পুরো পেমেন্ট সম্পূর্ণ হয়েছে। আপনাকে কোনো Transaction ID দিতে হবে না।\n\n` +
+                    `👉 অ্যাকাউন্ট তৈরির জন্য নিচের **"Create Account Credentials"** বাটনে ক্লিক করুন।`
+                )
+                .setColor("#00FF00");
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`open_cred_modal_${category}`)
+                    .setLabel("🔑 Create Account Credentials")
+                    .setStyle(ButtonStyle.Success)
+            );
+
+            return interaction.editReply({ embeds: [zeroPriceEmbed], components: [row] });
+        }
+
+        // 🌟 ২. যদি দাম ০ টাকার বেশি থাকে (স্বাভাবিক পেমেন্ট ফ্লো)
         await db.ref(`pending_payments/${userId}_${category}`).set({
             targetPrice: finalPrice,
             basePrice: basePrice,
@@ -554,6 +604,17 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply({ embeds: [payEmbed], components: [row] });
     }
 
+
+
+
+
+
+
+
+
+
+
+    
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
