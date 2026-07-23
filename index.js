@@ -239,6 +239,18 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
     return embed;
 }
 
+
+function generateCredentials(discordUser) {
+    const cleanName = discordUser.username.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+    const randomNum = Math.floor(1000 + Math.random() * 9000);
+    const randomPass = Math.random().toString(36).slice(-8);
+
+    return {
+        username: `${cleanName || 'user'}_${randomNum}`,
+        password: `pass_${randomPass}`
+    };
+}
+
 // Ghost Ping ট্র্যাকিং
 client.on("messageDelete", async (message) => {
     if (!message.guild || message.author?.bot) return;
