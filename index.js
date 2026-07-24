@@ -89,7 +89,7 @@ const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983";
 // নতুন অর্ডার গাইড চ্যানেল আইডি
 const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 
-// ১-টাইম কী জেনারেটর চ্যানেল আইডি (প্রয়োজনে একাধিক আইডি অ্যারেতে রাখতে পারেন)
+// ১-টাইম কী জেনারেটর চ্যানেল আইডি
 const ONETIME_KEY_CHANNEL_IDS = ["1488340757160005683"];
 
 const ROLES = {
@@ -241,14 +241,18 @@ async function handleOneTimeKeyGeneration(interaction) {
 
     const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
     const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+    const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
     
     const keyRef = db.ref(`keys/${randomKey}`);
     
+    // C++ অ্যাপ্লিকেশনের সহজ রিডের জন্য avatarUrl এবং serverName অন্তর্ভুক্ত
     await keyRef.set({
         used: false,
         generatedBy: interaction.user.tag,
+        username: interaction.user.username,
         userId: interaction.user.id,
-        avatarUrl: userAvatarUrl, // C++ অ্যাপের সহজ রিড সুবিধার জন্য Avatar URL অন্তর্ভুক্ত
+        avatarUrl: userAvatarUrl,
+        serverName: serverName,
         createdAt: Date.now()
     });
 
@@ -859,6 +863,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
     }
 
+    // 🌟 FULL AUTOMATED ACCOUNT CREATION & SYNC FOR C++ APP
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_create_account_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
@@ -869,6 +874,7 @@ client.on("interactionCreate", async (interaction) => {
         const customPass = interaction.fields.getTextInputValue("custom_password").trim();
         const userId = interaction.user.id;
         const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+        const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
 
         const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
         const sessionSnap = await sessionRef.once("value");
@@ -888,23 +894,31 @@ client.on("interactionCreate", async (interaction) => {
             }
 
             let days = 7;
-            if (category === "monthly") days = 30;
-            else if (category === "2_months") days = 60;
+            let packageName = "Weekly";
+            if (category === "monthly") {
+                days = 30;
+                packageName = "Monthly";
+            } else if (category === "2_months") {
+                days = 60;
+                packageName = "2 Months";
+            }
 
             const expiryTimestamp = Date.now() + (days * 24 * 60 * 60 * 1000);
 
-            // 🔥 C++ অ্যাপ সিঙ্কের জন্য Username, Password, Avatar URL সহ সম্পূর্ণ ডেটা সেভ
+            // 🔥 C++ অ্যাপের সাথে সম্পূর্ণ সিঙ্ক রেখে সমস্ত তথ্য Firebase-এ সেভ
             await db.ref(`users/${customUser}`).set({
                 username: customUser,
                 password: customPass,
                 discordId: userId,
-                avatarUrl: userAvatarUrl, // Firebase-এ Avatar লিঙ্ক অটো সেভ রাখা
-                category: category,
+                avatarUrl: userAvatarUrl,    // C++ অ্যাপের জন্য Avatar Link
+                serverName: serverName,      // C++ অ্যাপের জন্য Server Name
+                category: category,          // category (weekly/monthly/2_months)
+                package: packageName,        // package (Weekly/Monthly)
                 paidAmount: sessionData.totalPaid,
                 usedTxns: sessionData.usedTxns,
                 createdAt: Date.now(),
-                expiresAt: expiryTimestamp,
-                status: "active"
+                expiresAt: expiryTimestamp,  // Expire Timestamp
+                status: "active"             // Account Status
             });
 
             const randomCode = Math.floor(1000 + Math.random() * 9000);
@@ -932,7 +946,7 @@ client.on("interactionCreate", async (interaction) => {
                 .setThumbnail(userAvatarUrl)
                 .addFields(
                     { name: "👤 কাস্টমার", value: `${interaction.user}`, inline: true },
-                    { name: "📦 প্যাকেজ", value: `\`${category.toUpperCase()}\``, inline: true },
+                    { name: "📦 প্যাকেজ", value: `\`${packageName.toUpperCase()}\``, inline: true },
                     { name: "👤 Username", value: `\`${customUser}\``, inline: true },
                     { name: "🔑 Password", value: `\`${customPass}\``, inline: true },
                     { name: "💳 Total Paid", value: `\`${sessionData.totalPaid}\` BDT`, inline: true },
@@ -953,7 +967,7 @@ client.on("interactionCreate", async (interaction) => {
                     .setDescription(
                         `👤 **Username:** \`${customUser}\`\n` +
                         `🔑 **Password:** \`${customPass}\`\n` +
-                        `📦 **Package:** \`${category.toUpperCase()}\`\n` +
+                        `📦 **Package:** \`${packageName}\`\n` +
                         `📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>`
                     )
                     .setThumbnail(userAvatarUrl)
