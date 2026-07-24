@@ -91,10 +91,13 @@ const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 // ১-টাইম কী জেনারেটর চ্যানেল আইডি
 const ONETIME_KEY_CHANNEL_ID = "1488340757160005683";
 
+
+
 const ROLES = {
     ADMIN: "1488332568372973568", 
     SUPPORT_TICKET_REPORT: "1488333580705861765", 
-    SUPPORT_CUSTOMER: "1488335064873046086" 
+    SUPPORT_CUSTOMER: "1488335064873046086",
+    DEVELOPER: "1523955414612578354" // 👈 এখানে আপনার Developer রোলের আসল ID বসান
 };
 
 const CHANNELS = {
@@ -476,18 +479,16 @@ client.on("interactionCreate", async (interaction) => {
         const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
 
-        // 🔑 ১-টাইম কী তৈরির বিশেষ পারমিশন চেকিং
-        if (value === "generate_1time_key") {
-            const DEV_ROLE_NAME = "Developer"; // আপনার সার্ভারের ডেভেলপার রোলের নাম
-            const hasDevRole = interaction.member.roles.cache.some(role => role.name === DEV_ROLE_NAME);
-            const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+      if (value === "generate_1time_key") {
+    const hasDevRole = interaction.member.roles.cache.has(ROLES.DEVELOPER);
+    const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
 
-            if (!hasDevRole && !isAdmin) {
-                return interaction.reply({
-                    content: "❌ **অনুমতি নেই!** শুধুমাত্র **Developer** রোলধারীরা C++ অ্যাপের জন্য 1TIME KEY তৈরি করতে পারবেন।",
-                    flags: [MessageFlags.Ephemeral]
-                });
-            }
+    if (!hasDevRole && !isAdmin) {
+        return interaction.reply({
+            content: "❌ **অনুমতি নেই!** শুধুমাত্র **Developer** রোলধারীরা C++ অ্যাপের জন্য 1TIME KEY তৈরি করতে পারবেন।",
+            flags: [MessageFlags.Ephemeral]
+        });
+    }
 
             // C++ এর সাথে সিঙ্ক করে ফায়ারবেসে কী জেনারেট
             const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
