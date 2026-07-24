@@ -89,10 +89,14 @@ const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983";
 // নতুন অর্ডার গাইড চ্যানেল আইডি
 const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 
+// ১-টাইম কী জেনারেটর চ্যানেল আইডি (প্রয়োজনে একাধিক আইডি অ্যারেতে রাখতে পারেন)
+const ONETIME_KEY_CHANNEL_IDS = ["1488340757160005683"];
+
 const ROLES = {
     ADMIN: "1488332568372973568", 
     SUPPORT_TICKET_REPORT: "1488333580705861765", 
-    SUPPORT_CUSTOMER: "1488335064873046086" 
+    SUPPORT_CUSTOMER: "1488335064873046086",
+    DEVELOPER: "1523955414612578354" // Developer রোলের ID
 };
 
 const CHANNELS = {
@@ -180,7 +184,7 @@ function generateUniqueCouponCode() {
     return code;
 }
 
-// 📌 Firebase থেকে ডেটা নিয়ে আসার ফিক্সড ও ফ্লেক্সিবল ফাংশন
+// 📌 Firebase থেকে ডেটা নিয়ে আসার ফাংশন
 async function fetchFirebasePanelData(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
@@ -219,6 +223,42 @@ async function fetchFirebasePanelData(panelType) {
             fullData: {}
         };
     }
+}
+
+// ================================
+// 🔑 Key Generation Core Function
+// ================================
+async function handleOneTimeKeyGeneration(interaction) {
+    const hasDevRole = interaction.member.roles.cache.has(ROLES.DEVELOPER);
+    const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+
+    if (!hasDevRole && !isAdmin) {
+        return interaction.reply({
+            content: "❌ **অনুমতি নেই!** শুধুমাত্র **Developer** রোলধারীরা C++ অ্যাপের জন্য 1TIME KEY তৈরি করতে পারবেন।",
+            flags: [MessageFlags.Ephemeral]
+        });
+    }
+
+    const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
+    const keyRef = db.ref(`keys/${randomKey}`);
+    
+    await keyRef.set({
+        used: false,
+        generatedBy: interaction.user.tag,
+        userId: interaction.user.id,
+        createdAt: Date.now()
+    });
+
+    const keyEmbed = new EmbedBuilder()
+        .setTitle("🔑 1TIME KEY Generated Successfully!")
+        .setDescription(`আপনার ১-টাইম কী সফলভাবে তৈরি হয়েছে। C++ অ্যাপে লগইন করতে নিচের কী-টি ব্যবহার করুন:\n\n**KEY:** \`${randomKey}\``)
+        .setColor("#57F287")
+        .setFooter({ text: "নোট: এই কী-টি C++ অ্যাপে কেবল একবারই ব্যবহার করা যাবে।" });
+
+    return interaction.reply({ 
+        embeds: [keyEmbed], 
+        flags: [MessageFlags.Ephemeral] 
+    });
 }
 
 // ================================
@@ -292,37 +332,6 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
     if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
     return embed;
 }
-
-// 🔄 REALTIME PROFILE PICTURE & USERNAME SYNC (userUpdate Event)
-client.on("userUpdate", async (oldUser, newUser) => {
-    try {
-        const oldAvatar = oldUser.displayAvatarURL({ extension: "png" });
-        const newAvatar = newUser.displayAvatarURL({ extension: "png" });
-        const oldTag = oldUser.tag;
-        const newTag = newUser.tag;
-
-        if (oldAvatar !== newAvatar || oldTag !== newTag) {
-            const usersRef = db.ref("users");
-            const snapshot = await usersRef.once("value");
-
-            if (snapshot.exists()) {
-                snapshot.forEach((childSnap) => {
-                    const userData = childSnap.val();
-                    if (userData.discordId === newUser.id) {
-                        childSnap.ref.update({
-                            avatar_url: newAvatar,
-                            discord_username: newTag,
-                            last_synced_at: Date.now()
-                        });
-                        console.log(`✨ Profile Synced for User: ${childSnap.key} (${newTag})`);
-                    }
-                });
-            }
-        }
-    } catch (syncErr) {
-        console.error("❌ Profile Sync Error:", syncErr);
-    }
-});
 
 // Ghost Ping ট্র্যাকিং
 client.on("messageDelete", async (message) => {
@@ -447,6 +456,11 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
+    // 🔑 Button ভিত্তিক OneTime Key Handler
+    if (interaction.isButton() && (interaction.customId === "btn_generate_1time_key" || interaction.customId === "generate_1time_key")) {
+        return handleOneTimeKeyGeneration(interaction);
+    }
+
     // Giveaway বাটনে ক্লিক ট্র্যাকিং
     if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
         const gwId = interaction.customId.split("_")[2];
@@ -501,44 +515,12 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // 🌟 ড্রপডাউন সিলেকশন হ্যান্ডলার (1TIME KEY + TICKET HANDLING)
-    if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
+    if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_") || interaction.customId.startsWith("select_key_"))) {
         const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
 
-        // 🔑 ১-টাইম কী তৈরির বিশেষ পারমিশন চেকিং
         if (value === "generate_1time_key") {
-            const DEV_ROLE_NAME = "Developer"; 
-            const hasDevRole = interaction.member.roles.cache.some(role => role.name === DEV_ROLE_NAME);
-            const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
-
-            if (!hasDevRole && !isAdmin) {
-                return interaction.reply({
-                    content: "❌ **অনুমতি নেই!** শুধুমাত্র **Developer** রোলধারীরা C++ অ্যাপের জন্য 1TIME KEY তৈরি করতে পারবেন।",
-                    flags: [MessageFlags.Ephemeral]
-                });
-            }
-
-            // C++ এর সাথে সিঙ্ক করে ফায়ারবেসে কী জেনারেট
-            const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
-            const keyRef = db.ref(`keys/${randomKey}`);
-            
-            await keyRef.set({
-                used: false,
-                generatedBy: interaction.user.tag,
-                userId: interaction.user.id,
-                createdAt: Date.now()
-            });
-
-            const keyEmbed = new EmbedBuilder()
-                .setTitle("🔑 1TIME KEY Generated Successfully!")
-                .setDescription(`আপনার ১-টাইম কী সফলভাবে তৈরি হয়েছে। C++ অ্যাপে লগইন করতে নিচের কী-টি ব্যবহার করুন:\n\n**KEY:** \`${randomKey}\``)
-                .setColor("#57F287")
-                .setFooter({ text: "নোট: এই কী-টি C++ অ্যাপে কেবল একবারই ব্যবহার করা যাবে।" });
-
-            return interaction.reply({ 
-                embeds: [keyEmbed], 
-                flags: [MessageFlags.Ephemeral] 
-            });
+            return handleOneTimeKeyGeneration(interaction);
         }
 
         let type = ""; let embedColor = ""; let buttonId = "";
@@ -873,7 +855,6 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    // 👤 CREATE ACCOUNT WITH AVATAR & USERNAME SYNC
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_create_account_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
@@ -883,8 +864,6 @@ client.on("interactionCreate", async (interaction) => {
         const customUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
         const customPass = interaction.fields.getTextInputValue("custom_password").trim();
         const userId = interaction.user.id;
-        const userAvatar = interaction.user.displayAvatarURL({ extension: "png" });
-        const discordTag = interaction.user.tag;
 
         const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
         const sessionSnap = await sessionRef.once("value");
@@ -909,13 +888,10 @@ client.on("interactionCreate", async (interaction) => {
 
             const expiryTimestamp = Date.now() + (days * 24 * 60 * 60 * 1000);
 
-            // 💾 ফায়ারবেসে Profile Picture সহ সেভ
             await db.ref(`users/${customUser}`).set({
                 username: customUser,
                 password: customPass,
                 discordId: userId,
-                discord_username: discordTag,
-                avatar_url: userAvatar,
                 category: category,
                 paidAmount: sessionData.totalPaid,
                 usedTxns: sessionData.usedTxns,
@@ -946,7 +922,6 @@ client.on("interactionCreate", async (interaction) => {
             const orderEmbed = new EmbedBuilder()
                 .setTitle(`🛍️ NEW MEMBERSHIP ORDER CONFIRMED`)
                 .setColor("#00FF00")
-                .setThumbnail(userAvatar)
                 .addFields(
                     { name: "👤 কাস্টমার", value: `${interaction.user}`, inline: true },
                     { name: "📦 প্যাকেজ", value: `\`${category.toUpperCase()}\``, inline: true },
@@ -974,7 +949,6 @@ client.on("interactionCreate", async (interaction) => {
                         `📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>`
                     )
                     .setColor("Green")
-                    .setThumbnail(userAvatar)
                     .setTimestamp();
 
                 await interaction.user.send({ embeds: [dmEmbed] });
@@ -1075,6 +1049,9 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("close_")) {
+        const orderLogs = getOrderLogs();
+        const currentOrder = orderLogs[interaction.channel.id];
+
         try {
             const transcript = await discordTranscripts.createTranscript(interaction.channel, {
                 limit: -1, returnType: 'attachment', filename: `${interaction.channel.name}-transcript.html`, saveImages: true, poweredBy: false
@@ -1117,35 +1094,73 @@ async function getDynamicOrderGuidePanel() {
     return { embeds: [embed] };
 }
 
-// 🌟 ১-টাইম কী ড্রপডাউন মেনু যুক্ত টিকেট প্যানেল
+// 🌟 সাধারণ টিকিট সাপোর্ট প্যানেল
 async function getDynamicTicketPanel() {
-    const { options, customDescription, customImage } = await fetchFirebasePanelData("ticket");
-    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট ও কি জেনারেটর প্যানেল** 🎟️\n\n*(নোট: 1TIME KEY কেবল ডেভেলপাররা তৈরি করতে পারবেন)*`;
+    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("ticket");
+    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট প্যানেল** 🎟️\n\nযে কোনো সমস্যা বা অনুসন্ধানের জন্য নিচের ড্রপডাউন সিলেক্ট করুন।`;
 
     const embed = new EmbedBuilder()
-        .setTitle("🎫 OFFICIAL SUPPORT & KEY PANEL")
+        .setTitle(fullData.title || "🎫 OFFICIAL SUPPORT PANEL")
         .setDescription(customDescription || defaultDesc)
         .setImage(customImage || COVER_IMAGES.TICKET)
         .setColor("#5865F2")
         .setFooter({ text: "Official Support Panel", iconURL: client.user.displayAvatarURL() });
 
-    const menu = new StringSelectMenuBuilder()
-        .setCustomId("select_product_ticket")
-        .setPlaceholder("👇 ড্রপডাউন মেনু থেকে সার্ভিস সিলেক্ট করুন...")
-        .addOptions([
-            {
-                label: "🔑 Generate 1TIME KEY (Dev Only)",
-                description: "C++ অ্যাপের জন্য ১-টাইম কী জেনারেট করুন",
-                value: "generate_1time_key"
-            },
+    let finalOptions = options;
+    if (options.length === 0 || (options.length === 1 && options[0].value === "none")) {
+        finalOptions = [
             {
                 label: "💬 General Support Ticket",
                 description: "সাধারণ সহায়তার জন্য টিকেট খুলুন",
                 value: "general_support"
             }
-        ]);
+        ];
+    }
+
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId("select_product_ticket")
+        .setPlaceholder("👇 ড্রপডাউন মেনু থেকে সহায়তার ক্যাটাগরি সিলেক্ট করুন...")
+        .addOptions(finalOptions);
 
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
+}
+
+// 🔑 ১-টাইম কী জেনারেটর প্যানেল
+async function getDynamicOneTimeKeyPanel() {
+    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("onetime_key");
+    const defaultDesc = `🔐 **DEVELOPER ONE-TIME KEY GENERATOR** 🔐\n\nC++ অ্যাপে ব্যবহারের জন্য ১-টাইম কী জেনারেট করতে ড্রপডাউন বা বাটনে চাপ দিন।\n*(শুধুমাত্র ডেভেলপারদের জন্য নির্দিষ্ট)*`;
+
+    const embed = new EmbedBuilder()
+        .setTitle(fullData.title || "🔑 1TIME KEY GENERATOR PANEL")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.TICKET)
+        .setColor("#F1C40F")
+        .setFooter({ text: "Developer Portal System", iconURL: client.user.displayAvatarURL() });
+
+    let finalOptions = options;
+    if (options.length === 0 || (options.length === 1 && options[0].value === "none")) {
+        finalOptions = [
+            {
+                label: "🔑 Generate 1TIME KEY (Dev Only)",
+                description: "C++ অ্যাপের জন্য ১-টাইম কী জেনারেট করুন",
+                value: "generate_1time_key"
+            }
+        ];
+    }
+
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId("select_key_category")
+        .setPlaceholder("👇 কী জেনারেট করতে নিচের ড্রপডাউন সিলেক্ট করুন...")
+        .addOptions(finalOptions);
+
+    const buttonRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId("btn_generate_1time_key")
+            .setLabel("⚡ Generate OneTime Key")
+            .setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu), buttonRow] };
 }
 
 async function getDynamicReportPanel() {
@@ -1193,7 +1208,7 @@ async function getDynamicPaymentPanel() {
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
 }
 
-// Commands
+// Admin Commands
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
 
@@ -1206,6 +1221,13 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
     if (message.content === "!payment" && message.channelId === CHANNELS.PAYMENT_PANEL) return message.channel.send(await getDynamicPaymentPanel());
     if (message.content === "!orderguide" && message.channelId === ORDER_GUIDE_CHANNEL_ID) return message.channel.send(await getDynamicOrderGuidePanel());
+    
+    // ১-টাইম কী জেনারেটর প্যানেল পাঠানোর কমান্ড (!onetimekey বা !onetime key)
+    if (message.content === "!onetime key" || message.content === "!onetimekey") {
+        if (ONETIME_KEY_CHANNEL_IDS.includes(message.channelId) || isServerAdmin) {
+            return message.channel.send(await getDynamicOneTimeKeyPanel());
+        }
+    }
 });
 
 // ================================
@@ -1234,6 +1256,27 @@ client.on("ready", async () => {
             }
         } catch (err) {
             console.error("❌ Realtime Sync Error on Payment Panel:", err);
+        }
+    });
+
+    db.ref("panels/onetime_key").on("value", async () => {
+        try {
+            for (const keyChanId of ONETIME_KEY_CHANNEL_IDS) {
+                const keyChan = guild.channels.cache.get(keyChanId);
+                if (!keyChan) continue;
+
+                const messages = await keyChan.messages.fetch({ limit: 5 }).catch(() => null);
+                const botMsg = messages?.find(m => m.author.id === client.user.id);
+
+                const updatedData = await getDynamicOneTimeKeyPanel();
+
+                if (botMsg) {
+                    await botMsg.edit(updatedData).catch(err => console.error("❌ OneTime Key Panel Edit Fail:", err));
+                    console.log(`✅ OneTime Key Panel Auto-Updated from Firebase for channel: ${keyChanId}`);
+                }
+            }
+        } catch (err) {
+            console.error("❌ Realtime Sync Error on OneTime Key Panel:", err);
         }
     });
 
