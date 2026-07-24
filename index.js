@@ -55,9 +55,10 @@ app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`);
 // 📱 Dynamic Realtime Settings (Firebase Sync)
 // ================================
 
-let PAYMENT_NUMBER = "01404548951"; 
-let VERIFICATION_LINK = "https://discord.gg/example"; 
+let PAYMENT_NUMBER = "01404548951"; // ডিফল্ট মোবাইল নম্বর
+let VERIFICATION_LINK = "https://discord.gg/example"; // ডিফল্ট লিঙ্ক
 
+// 🔄 ফায়ারবেস Realtime Database থেকে settings এর তথ্য লাইভ আপডেট রাখার লিসেনার
 db.ref("settings").on("value", (snapshot) => {
     if (snapshot.exists()) {
         const data = snapshot.val();
@@ -83,12 +84,13 @@ const VERIFIED_ROLE_ID = "1488333841402691664";
 const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 
+// অর্ডার ট্র্যাকিং চ্যানেল আইডি
 const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
+// নতুন অর্ডার গাইড চ্যানেল আইডি
 const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 
 const ROLES = {
     ADMIN: "1488332568372973568", 
-    DEVELOPER: "1523955414612578354", // 🛠️ আপনার দেওয়া ডেভেলপার রোল আইডি যুক্ত করা হয়েছে
     SUPPORT_TICKET_REPORT: "1488333580705861765", 
     SUPPORT_CUSTOMER: "1488335064873046086" 
 };
@@ -111,6 +113,7 @@ const COVER_IMAGES = {
 
 const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
+// 💰 প্যাকেজের মূল্য তালিকা
 const PACKAGE_PRICES = {
     weekly: 510,
     weekly_plan: 510,
@@ -132,6 +135,7 @@ function getNormalizedCategory(cat) {
     return "weekly";
 }
 
+// New Configs
 const STATS_VC_CHANNEL_ID = "1524321192079786005";
 const LEVEL_ROLE_ID = "1524322087295127552";
 const GIVEAWAY_CHANNEL_ID = "1488341249739198585";
@@ -141,6 +145,7 @@ const STAFF_ADMIN_LOG_ID = "1524324771502882877";
 const WEEKLY_REPORT_CHANNEL_ID = "1524326280923709550";
 const TRANSCRIPT_LOG_CHANNEL_ID = "1524326928268660807";
 
+// Databases
 const DATA_FILE = "./database.json";
 const WELCOME_LOG_FILE = "./welcome_messages.json";
 const PUNISH_FILE = "./punishments.json"; 
@@ -165,6 +170,7 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
+// 🎲 ইউনিক কুপন কোড জেনারেটর (e.g., AK-A1B2C3)
 function generateUniqueCouponCode() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let code = "AK-";
@@ -174,7 +180,7 @@ function generateUniqueCouponCode() {
     return code;
 }
 
-// 📌 Firebase থেকে ডায়নামিক ডেটা লোড করার ফাংশন
+// 📌 Firebase থেকে ডেটা নিয়ে আসার ফিক্সড ও ফ্লেক্সিবল ফাংশন
 async function fetchFirebasePanelData(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
@@ -304,13 +310,14 @@ client.on("messageDelete", async (message) => {
 // Automod + Activity XP System
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
-    if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN) || message.member.roles.cache.has(ROLES.DEVELOPER)) return;
+    if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
     
     const userId = message.author.id; 
     let triggerAutomod = false; 
     let reason = "";
     const contentLower = message.content.toLowerCase();
 
+    // 🛑 Caps-Lock Protection
     const upperCount = message.content.replace(/[^A-Z]/g, "").length;
     const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
     if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
@@ -320,6 +327,7 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
+    // 🎮 Activity Leveling (Firebase XP System)
     const xpRef = db.ref(`leveling/${userId}`);
     xpRef.transaction((current) => {
         if (!current) {
@@ -339,6 +347,7 @@ client.on("messageCreate", async (message) => {
         }
     });
 
+    // Anti-Link Spam
     const linkRegex = /(https?:\/\/[^\s]+)/g;
     if (linkRegex.test(message.content)) {
         try { await message.delete().catch(() => {}); } catch(e){}
@@ -347,6 +356,7 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
+    // লাইভ লিঙ্ক রেসপন্স
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
         return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
     }
@@ -406,6 +416,7 @@ client.on("interactionCreate", async (interaction) => {
         return;
     }
 
+    // Giveaway বাটনে ক্লিক ট্র্যাকিং
     if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
         const gwId = interaction.customId.split("_")[2];
         const participantRef = db.ref(`giveaways/${gwId}/participants/${interaction.user.id}`);
@@ -426,6 +437,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "✅ আপনি সফলভাবে গিভঅ্যাওয়েতে নাম এন্ট্রি করেছেন!", flags: [MessageFlags.Ephemeral] });
     }
 
+    // এডভান্সড টিকেট রেটিং ফিডব্যাক সিস্টেম
     if (interaction.isButton() && interaction.customId.startsWith("star_rating_")) {
         const [, , stars, staffId] = interaction.customId.split("_");
         
@@ -457,26 +469,57 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // 🔄 ড্রপডাউন সিলেকশন হ্যান্ডলার (ড্রপডাউন আটকা পড়া প্রতিরোধ ফিচার যুক্ত)
+    // 🌟 ড্রপডাউন সিলেকশন হ্যান্ডলার (1TIME KEY + TICKET HANDLING)
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_"))) {
-        const value = interaction.values[0].toLowerCase();
+        const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
 
-        // 🛠️ ড্রপডাউন মেনুটি রিসেট করে আবার আগের অবস্থায় ফিরিয়ে আনার লজিক
-        try {
-            const selectMenu = StringSelectMenuBuilder.from(interaction.component);
-            const updatedRow = new ActionRowBuilder().addComponents(selectMenu);
-            await interaction.update({ components: [updatedRow] }).catch(() => {});
-        } catch (e) {}
+        // 🔑 ১-টাইম কী তৈরির বিশেষ পারমিশন চেকিং
+        if (value === "generate_1time_key") {
+            const DEV_ROLE_NAME = "Developer"; // আপনার সার্ভারের ডেভেলপার রোলের নাম
+            const hasDevRole = interaction.member.roles.cache.some(role => role.name === DEV_ROLE_NAME);
+            const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+
+            if (!hasDevRole && !isAdmin) {
+                return interaction.reply({
+                    content: "❌ **অনুমতি নেই!** শুধুমাত্র **Developer** রোলধারীরা C++ অ্যাপের জন্য 1TIME KEY তৈরি করতে পারবেন।",
+                    flags: [MessageFlags.Ephemeral]
+                });
+            }
+
+            // C++ এর সাথে সিঙ্ক করে ফায়ারবেসে কী জেনারেট
+            const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
+            const keyRef = db.ref(`keys/${randomKey}`);
+            
+            await keyRef.set({
+                used: false,
+                generatedBy: interaction.user.tag,
+                userId: interaction.user.id,
+                createdAt: Date.now()
+            });
+
+            const keyEmbed = new EmbedBuilder()
+                .setTitle("🔑 1TIME KEY Generated Successfully!")
+                .setDescription(`আপনার ১-টাইম কী সফলভাবে তৈরি হয়েছে। C++ অ্যাপে লগইন করতে নিচের কী-টি ব্যবহার করুন:\n\n**KEY:** \`${randomKey}\``)
+                .setColor("#57F287")
+                .setFooter({ text: "নোট: এই কী-টি C++ অ্যাপে কেবল একবারই ব্যবহার করা যাবে।" });
+
+            return interaction.reply({ 
+                embeds: [keyEmbed], 
+                flags: [MessageFlags.Ephemeral] 
+            });
+        }
 
         let type = ""; let embedColor = ""; let buttonId = "";
-        if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${value}`; }
-        else if (interaction.customId === "select_report_category") { type = "report"; embedColor = "#ED4245"; buttonId = `create_report_${value}`; }
-        else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${value}`; }
-        else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${value}`; } 
+        const lowerVal = value.toLowerCase();
+
+        if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${lowerVal}`; }
+        else if (interaction.customId === "select_report_category") { type = "report"; embedColor = "#ED4245"; buttonId = `create_report_${lowerVal}`; }
+        else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${lowerVal}`; }
+        else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${lowerVal}`; } 
 
         if (type === "order") {
-            const modal = new ModalBuilder().setCustomId(`modal_coupon_${value}`).setTitle("🎟️ Coupon / Discount Code");
+            const modal = new ModalBuilder().setCustomId(`modal_coupon_${lowerVal}`).setTitle("🎟️ Coupon / Discount Code");
             const couponInput = new TextInputBuilder()
                 .setCustomId("coupon_code_input")
                 .setLabel("কুপন কোড দিন (না থাকলে SKIP লিখুন)")
@@ -486,12 +529,13 @@ client.on("interactionCreate", async (interaction) => {
             modal.addComponents(new ActionRowBuilder().addComponents(couponInput));
             return interaction.showModal(modal);
         } else if (type) {
-            const ephemeralEmbed = new EmbedBuilder().setTitle(`📌 Selected Category: ${value.toUpperCase().replace("_", " ")}`).setDescription(`চ্যানেল তৈরি বা সেলারের সাথে কথা বলতে নিচের বাটনে চাপ দিন।`).setColor(embedColor);
+            const ephemeralEmbed = new EmbedBuilder().setTitle(`📌 Selected Category: ${value.toUpperCase().replace("_", " ")}`).setDescription(`চ্যানেল তৈরি করতে নিচের বাটনে চাপ দিন।`).setColor(embedColor);
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(buttonId).setLabel(`Create ${type.toUpperCase()}`).setStyle(ButtonStyle.Success));
-            return interaction.followUp({ embeds: [ephemeralEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
+            return interaction.reply({ embeds: [ephemeralEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
         }
     }
 
+    // Modal Submit & Payment Handlers
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
@@ -557,7 +601,7 @@ client.on("interactionCreate", async (interaction) => {
                     `📦 **প্যাকেজের রেগুলার মূল্য:** \`${basePrice}\` BDT\n` +
                     `🎁 **কুপন ডিসকাউন্ট:** \`${appliedDiscountValue}\` BDT\n` +
                     `💰 **আপনাকে পেমেন্ট করতে হবে:** \`0\` BDT (সম্পূর্ণ ফ্রি!)\n\n` +
-                    `✨ আপনার কুপনের মাধ্যমে পুরো পেমেন্ট সম্পূর্ণ হয়েছে। আপনাকে কোনো Transaction ID দিতে হবে না।\n\n` +
+                    `✨ আপনার কুপনের মাধ্যমে পুরো পেমেন্ট সম্পূর্ণ হয়েছে।\n\n` +
                     `👉 অ্যাকাউন্ট তৈরির জন্য নিচের **"Create Account Credentials"** বাটনে ক্লিক করুন।`
                 )
                 .setColor("#00FF00");
@@ -855,7 +899,6 @@ client.on("interactionCreate", async (interaction) => {
 
             if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
             if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-            if (interaction.guild.roles.cache.has(ROLES.DEVELOPER)) permissionOverwrites.push({ id: ROLES.DEVELOPER, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
             const privateChannel = await interaction.guild.channels.create({
                 name: channelPrefix,
@@ -948,7 +991,6 @@ client.on("interactionCreate", async (interaction) => {
 
         if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
         if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-        if (interaction.guild.roles.cache.has(ROLES.DEVELOPER)) permissionOverwrites.push({ id: ROLES.DEVELOPER, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
         const privateChannel = await interaction.guild.channels.create({
             name: channelPrefix,
@@ -956,7 +998,7 @@ client.on("interactionCreate", async (interaction) => {
             permissionOverwrites
         });
 
-        const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")}`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ বা সেলার খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
+        const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")}`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
         const actionRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Secondary),
@@ -984,9 +1026,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
-        
-        // 🛠️ Developer Role ওয়ালা মেম্বাররাও ক্লেম করতে পারবে
-        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN) && !interaction.member.roles.cache.has(ROLES.DEVELOPER)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
+        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
         
         await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
         await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
@@ -1041,18 +1081,34 @@ async function getDynamicOrderGuidePanel() {
     return { embeds: [embed] };
 }
 
+// 🌟 ১-টাইম কী ড্রপডাউন মেনু যুক্ত টিকেট প্যানেল
 async function getDynamicTicketPanel() {
     const { options, customDescription, customImage } = await fetchFirebasePanelData("ticket");
-    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট টিকিটে স্বাগতম!** 🎟️`;
+    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট ও কি জেনারেটর প্যানেল** 🎟️\n\n*(নোট: 1TIME KEY কেবল ডেভেলপাররা তৈরি করতে পারবেন)*`;
 
     const embed = new EmbedBuilder()
-        .setTitle("🎫 OFFICIAL SUPPORT TICKET CENTER")
+        .setTitle("🎫 OFFICIAL SUPPORT & KEY PANEL")
         .setDescription(customDescription || defaultDesc)
         .setImage(customImage || COVER_IMAGES.TICKET)
         .setColor("#5865F2")
         .setFooter({ text: "Official Support Panel", iconURL: client.user.displayAvatarURL() });
 
-    const menu = new StringSelectMenuBuilder().setCustomId("select_product_ticket").setPlaceholder("❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...").addOptions(options);
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId("select_product_ticket")
+        .setPlaceholder("👇 ড্রপডাউন মেনু থেকে সার্ভিস সিলেক্ট করুন...")
+        .addOptions([
+            {
+                label: "🔑 Generate 1TIME KEY (Dev Only)",
+                description: "C++ অ্যাপের জন্য ১-টাইম কী জেনারেট করুন",
+                value: "generate_1time_key"
+            },
+            {
+                label: "💬 General Support Ticket",
+                description: "সাধারণ সহায়তার জন্য টিকেট খুলুন",
+                value: "general_support"
+            }
+        ]);
+
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
 }
 
@@ -1101,12 +1157,12 @@ async function getDynamicPaymentPanel() {
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
 }
 
-// Commands (🛠️ Admin + Developer Role Permission Added)
+// Commands
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
 
-    const hasAccess = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN) || message.member.roles.cache.has(ROLES.DEVELOPER);
-    if (!hasAccess) return;
+    const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN);
+    if (!isServerAdmin) return;
 
     if (message.content === "!setup") return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
     if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) return message.channel.send(await getDynamicTicketPanel());
