@@ -588,10 +588,9 @@ client.on("interactionCreate", async (interaction) => {
                     appliedDiscountValue = Number(couponData.couponValue || couponData.discountValue || 0);
                     finalPrice = Math.max(0, basePrice - appliedDiscountValue);
                     appliedCouponCode = couponEntered;
-
                     discountText = `🎉 **কুপন কোড \`${couponEntered}\` সফলভাবে অ্যাপ্লাই হয়েছে!**\n` +
-                                   `💸 **ছাড়ের পরিমাণ:** \`${appliedDiscountValue}\` ৳\n` +
-                                   `🏷️ **নতুন পরিশোধযোগ্য মূল্য:** \`${finalPrice}\` ৳`;
+                        `💸 **ছাড়ের পরিমাণ:** \`${appliedDiscountValue}\` ৳\n` +
+                        `🏷️ **নতুন পরিশোধযোগ্য মূল্য:** \`${finalPrice}\` ৳`;
                 }
             } else {
                 discountText = "⚠️ **অবৈধ কুপন কোড!** সিস্টেমের ডেটাবেজে এই কুপন পাওয়া যায়নি। মূল মূল্য প্রযোজ্য হবে।";
@@ -670,15 +669,14 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-        
+
         const modal = new ModalBuilder()
             .setCustomId(`modal_txn_${category}`)
             .setTitle("🔒 Submit Transaction ID");
 
         const txnInput = new TextInputBuilder()
             .setCustomId("txn_id_input")
-            .setLabel("Transaction ID (TxnID)")
-            .setPlaceholder("e.g. A1B2C3D4E5")
+            .setLabel("Transaction ID (TxnID) লিখুন")
             .setStyle(TextInputStyle.Short)
             .setRequired(true);
 
@@ -688,150 +686,102 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_txn_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        
+
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-        
-        const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
+        const txnId = interaction.fields.getTextInputValue("txn_id_input").trim().toUpperCase();
         const userId = interaction.user.id;
-        const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
 
-        try {
-            const txnRef = db.ref(`transactions/${txnId}`);
-            const txnSnap = await txnRef.once("value");
+        const txnRef = db.ref(`transactions/${txnId}`);
+        const txnSnap = await txnRef.once("value");
 
-            if (!txnSnap.exists()) {
-                return interaction.editReply("❌ **অকার্যকর Transaction ID!** সিস্টেমের ডেটাবেজে এই Transaction ID পাওয়া যায়নি।");
-            }
+        if (!txnSnap.exists()) {
+            return interaction.editReply("❌ **ভুল বা অকার্যকর Transaction ID!** সঠিক Transaction ID দিন।");
+        }
 
-            const txnData = txnSnap.val();
+        const txnData = txnSnap.val();
+        if (txnData.used) {
+            return interaction.editReply("⚠️ **এই Transaction ID টি ইতোমধ্যে ব্যবহার করা হয়েছে!**");
+        }
 
-            if (txnData.used === true) {
-                return interaction.editReply("🚫 **Duplicate Transaction!** এই Transaction ID-টি ইতোমধ্যে ব্যবহার করা হয়েছে।");
-            }
+        const paymentRef = db.ref(`pending_payments/${userId}_${category}`);
+        const paymentSnap = await paymentRef.once("value");
 
-            const sessionSnap = await sessionRef.once("value");
-            let sessionData = sessionSnap.val() || {};
+        let paymentData = paymentSnap.val() || {
+            targetPrice: PACKAGE_PRICES[category] || 510,
+            basePrice: PACKAGE_PRICES[category] || 510,
+            appliedCoupon: null,
+            appliedDiscount: 0,
+            totalPaid: 0,
+            usedTxns: []
+        };
 
-            let targetPrice = sessionData.targetPrice !== undefined ? sessionData.targetPrice : (PACKAGE_PRICES[category] || 510);
-            let currentTotalPaid = sessionData.totalPaid || 0;
-            let usedTxns = sessionData.usedTxns || [];
+        const txnAmount = Number(txnData.amount || 0);
+        paymentData.totalPaid += txnAmount;
 
-            if (usedTxns.includes(txnId)) {
-                return interaction.editReply("⚠️ এই Transaction ID-টি আপনি ইতোমধ্যে সাবমিট করেছেন।");
-            }
+        if (!paymentData.usedTxns) paymentData.usedTxns = [];
+        paymentData.usedTxns.push(txnId);
 
-            const newTxnAmount = Number(txnData.amount) || 0;
-            currentTotalPaid += newTxnAmount;
-            usedTxns.push(txnId);
+        await txnRef.update({
+            used: true,
+            usedBy: userId,
+            usedAt: Date.now()
+        });
 
-            await txnRef.update({
-                used: true,
+        if (paymentData.appliedCoupon) {
+            await db.ref(`coupons/${paymentData.appliedCoupon}`).update({
+                status: "used",
                 usedBy: userId,
                 usedAt: Date.now()
             });
+        }
 
-            await sessionRef.update({
-                category: category,
-                targetPrice: targetPrice,
-                totalPaid: currentTotalPaid,
-                usedTxns: usedTxns,
+        if (paymentData.totalPaid >= paymentData.targetPrice) {
+            await paymentRef.set({
+                ...paymentData,
                 lastUpdated: Date.now()
             });
 
-            if (currentTotalPaid < targetPrice) {
-                const remainingDue = targetPrice - currentTotalPaid;
-
-                const pendingEmbed = new EmbedBuilder()
-                    .setTitle("❌ Payment Verification Pending (আংশিক পেমেন্ট)")
-                    .setDescription(
-                        `আপনি **${category.toUpperCase()}** প্যাকেজ নির্বাচন করেছেন।\n\n` +
-                        `📌 **প্রয়োজনীয় মূল্য:** \`${targetPrice}\` BDT\n` +
-                        `💳 **প্রাপ্ত মোট টাকা:** \`${currentTotalPaid}\` BDT\n` +
-                        `📉 **বকেয়া টাকা:** \`${remainingDue}\` BDT\n\n` +
-                        `⚠️ অবশিষ্ট **${remainingDue} BDT** নিচের নম্বরে বানিয়ে নতুন Transaction ID সাবমিট করুন:\n` +
-                        `📱 **বিকাশ / নগদ (Personal):** \`${PAYMENT_NUMBER}\``
-                    )
-                    .setColor("Orange")
-                    .setTimestamp();
-
-                const row = new ActionRowBuilder().addComponents(
-                    new ButtonBuilder()
-                        .setCustomId(`submit_txn_${category}`)
-                        .setLabel("➕ Submit Additional TxnID")
-                        .setStyle(ButtonStyle.Secondary)
-                );
-
-                return interaction.editReply({ embeds: [pendingEmbed], components: [row] });
-            }
-
-            let extraPayment = currentTotalPaid - targetPrice;
-            let createdCouponCode = null;
-
-            if (extraPayment > 0) {
-                let isUnique = false;
-                while (!isUnique) {
-                    createdCouponCode = generateUniqueCouponCode();
-                    const checkCouponSnap = await db.ref(`coupons/${createdCouponCode}`).once("value");
-                    if (!checkCouponSnap.exists()) {
-                        isUnique = true;
-                    }
-                }
-
-                const newCouponObj = {
-                    couponCode: createdCouponCode,
-                    userId: userId,
-                    username: interaction.user.username,
-                    couponValue: extraPayment,
-                    extraPaymentAmount: extraPayment,
-                    createdAt: Date.now(),
-                    expiresAt: Date.now() + (90 * 24 * 60 * 60 * 1000),
-                    status: "active"
-                };
-
-                await db.ref(`coupons/${createdCouponCode}`).set(newCouponObj);
-            }
-
-            if (sessionData.appliedCoupon) {
-                await db.ref(`coupons/${sessionData.appliedCoupon}`).update({
-                    status: "used",
-                    usedBy: userId,
-                    usedAt: Date.now()
-                });
-            }
-
-            let extraInfoText = "";
-            if (extraPayment > 0 && createdCouponCode) {
-                extraInfoText = `\n\n🎁 **Extra Payment Reward Coupon Generated!**\n` +
-                                `আপনি প্যাকেজের মূল্যের চেয়ে **${extraPayment} ৳** বেশি পরিশোধ করেছেন।\n` +
-                                `আপনার জন্য একটি ডিসকাউন্ট কুপন তৈরি করা হয়েছে:\n` +
-                                `🎟️ **Coupon Code:** \`${createdCouponCode}\`\n` +
-                                `💸 **Discount Balance:** \`${extraPayment}\` ৳\n` +
-                                `📌 **Status:** Active`;
-            }
-
-            const successPayEmbed = new EmbedBuilder()
-                .setTitle("✅ Payment Successfully Verified!")
+            const successEmbed = new EmbedBuilder()
+                .setTitle(`✅ Payment Successful! (${category.toUpperCase().replace("_", " ")})`)
                 .setDescription(
-                    `আপনার পেমেন্ট সফলভাবে ভেরিফাই করা হয়েছে।\n\n` +
-                    `💰 **মোট পরিশোধিত:** \`${currentTotalPaid}\` BDT\n` +
-                    `📦 **প্যাকেজ:** \`${category.toUpperCase()}\`${extraInfoText}\n\n` +
-                    `👉 অ্যাকাউন্ট তৈরির জন্য নিচের **"Create Account Credentials"** বাটনে ক্লিক করুন।`
+                    `🎉 **অভিনন্দন! আপনার পেমেন্ট সফলভাবে ভেরিফাই করা হয়েছে।**\n\n` +
+                    `💰 **মোট পরিশোধিত মূল্য:** \`${paymentData.totalPaid}\` BDT\n` +
+                    `💳 **ব্যবহৃত TxnID:** \`${txnId}\`\n\n` +
+                    `👉 আপনার অ্যাকাউন্ট ব্যবহারের তথ্যাদি (Username & Password) তৈরি করতে নিচের **"Create Account Credentials"** বাটনে চাপ দিন।`
                 )
-                .setColor("Green");
+                .setColor("#00FF00");
 
-            const createAccRow = new ActionRowBuilder().addComponents(
+            const row = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(`open_cred_modal_${category}`)
                     .setLabel("🔑 Create Account Credentials")
                     .setStyle(ButtonStyle.Success)
             );
 
-            return interaction.editReply({ embeds: [successPayEmbed], components: [createAccRow] });
+            return interaction.editReply({ embeds: [successEmbed], components: [row] });
+        } else {
+            const dueAmount = paymentData.targetPrice - paymentData.totalPaid;
+            await paymentRef.set(paymentData);
 
-        } catch (err) {
-            console.error("❌ Txn Verification Error:", err);
-            return interaction.editReply("❌ **পেমেন্ট প্রক্রিয়াকরণে সমস্যা হয়েছে!** অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।");
+            const partialEmbed = new EmbedBuilder()
+                .setTitle(`⚠️ Partial Payment Received!`)
+                .setDescription(
+                    `💵 **পরিশোধ করা হয়েছে:** \`${paymentData.totalPaid}\` BDT\n` +
+                    `🏷️ **টার্গেট মূল্য:** \`${paymentData.targetPrice}\` BDT\n` +
+                    `❗ **বকেয়া (Due):** \`${dueAmount}\` BDT\n\n` +
+                    `বাকি টাকা পরিশোধ করতে পুনরায় **Submit TxnID** বাটনে ক্লিক করুন।`
+                )
+                .setColor("#FFA500");
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`submit_txn_${category}`)
+                    .setLabel("Submit TxnID")
+                    .setStyle(ButtonStyle.Primary)
+            );
+
+            return interaction.editReply({ embeds: [partialEmbed], components: [row] });
         }
     }
 
@@ -841,500 +791,84 @@ client.on("interactionCreate", async (interaction) => {
 
         const modal = new ModalBuilder()
             .setCustomId(`modal_create_account_${category}`)
-            .setTitle("👤 Create Your Custom Account");
+            .setTitle("🔑 Create Your Login Credentials");
 
-        const userInput = new TextInputBuilder()
-            .setCustomId("custom_username")
-            .setLabel("পছন্দমতো Username (ইংরেজিতে)")
+        const userValInput = new TextInputBuilder()
+            .setCustomId("acc_username")
+            .setLabel("ইউজারনেম (Username) লিখুন")
             .setStyle(TextInputStyle.Short)
             .setRequired(true);
 
-        const passInput = new TextInputBuilder()
-            .setCustomId("custom_password")
-            .setLabel("পছন্দমতো Password")
+        const passValInput = new TextInputBuilder()
+            .setCustomId("acc_password")
+            .setLabel("পাসওয়ার্ড (Password) লিখুন")
             .setStyle(TextInputStyle.Short)
             .setRequired(true);
 
         modal.addComponents(
-            new ActionRowBuilder().addComponents(userInput),
-            new ActionRowBuilder().addComponents(passInput)
+            new ActionRowBuilder().addComponents(userValInput),
+            new ActionRowBuilder().addComponents(passValInput)
         );
 
         return interaction.showModal(modal);
     }
 
-    // 🌟 FULL AUTOMATED ACCOUNT CREATION & SYNC FOR C++ APP
+    // 🟢 FIXED: Create User Account in Firebase (With username field)
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_create_account_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
         const rawCategory = interaction.customId.split("_")[3].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-
-        const customUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
-        const customPass = interaction.fields.getTextInputValue("custom_password").trim();
+        const usernameInput = interaction.fields.getTextInputValue("acc_username").trim();
+        const passwordInput = interaction.fields.getTextInputValue("acc_password").trim();
         const userId = interaction.user.id;
-        const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
-        const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
 
-        const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
-        const sessionSnap = await sessionRef.once("value");
-        const sessionData = sessionSnap.val();
+        const userRef = db.ref(`users/${usernameInput}`);
+        const userSnap = await userRef.once("value");
 
-        if (!sessionData || sessionData.totalPaid < sessionData.targetPrice) {
-            return interaction.editReply("❌ **পেমেন্ট অসম্পূর্ণ!** সম্পূর্ণ টাকা পরিশোধ করুন।");
+        if (userSnap.exists()) {
+            return interaction.editReply("❌ **এই ইউজারনেমটি ইতোমধ্যে ব্যবহৃত হয়েছে!** অনুগ্রহ করে অন্য একটি ইউজারনেম চেষ্টা করুন।");
         }
 
-        try {
-            const existingUserSnap = await db.ref(`users/${customUser}`).once("value");
-            if (existingUserSnap.exists()) {
-                const userData = existingUserSnap.val();
-                if (userData.expiresAt && userData.expiresAt > Date.now()) {
-                    return interaction.editReply(`❌ **Username Already Exists!** \`${customUser}\` নামটি অন্য কারো ব্যবহৃত।`);
-                }
-            }
+        let daysToAdd = 7;
+        if (category === "monthly") daysToAdd = 30;
+        else if (category === "2_months") daysToAdd = 60;
 
-            let days = 7;
-            let packageName = "Weekly";
-            if (category === "monthly") {
-                days = 30;
-                packageName = "Monthly";
-            } else if (category === "2_months") {
-                days = 60;
-                packageName = "2 Months";
-            }
+        const expiresAtMs = Date.now() + (daysToAdd * 24 * 60 * 60 * 1000);
 
-            const expiryTimestamp = Date.now() + (days * 24 * 60 * 60 * 1000);
-
-            // 🔥 C++ অ্যাপের সাথে সম্পূর্ণ সিঙ্ক রেখে সমস্ত তথ্য Firebase-এ সেভ
-            await db.ref(`users/${customUser}`).set({
-                username: customUser,
-                password: customPass,
-                discordId: userId,
-                avatarUrl: userAvatarUrl,    // C++ অ্যাপের জন্য Avatar Link
-                serverName: serverName,      // C++ অ্যাপের জন্য Server Name
-                category: category,          // category (weekly/monthly/2_months)
-                package: packageName,        // package (Weekly/Monthly)
-                paidAmount: sessionData.totalPaid,
-                usedTxns: sessionData.usedTxns,
-                createdAt: Date.now(),
-                expiresAt: expiryTimestamp,  // Expire Timestamp
-                status: "active"             // Account Status
-            });
-
-            const randomCode = Math.floor(1000 + Math.random() * 9000);
-            let supportRoleId = ROLES.SUPPORT_CUSTOMER;
-            let channelPrefix = `order-${randomCode}`;
-
-            const permissionOverwrites = [
-                { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-                { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
-                { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
-            ];
-
-            if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-            if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-
-            const privateChannel = await interaction.guild.channels.create({
-                name: channelPrefix,
-                type: 0,
-                permissionOverwrites
-            });
-
-            const orderEmbed = new EmbedBuilder()
-                .setTitle(`🛍️ NEW MEMBERSHIP ORDER CONFIRMED`)
-                .setColor("#00FF00")
-                .setThumbnail(userAvatarUrl)
-                .addFields(
-                    { name: "👤 কাস্টমার", value: `${interaction.user}`, inline: true },
-                    { name: "📦 প্যাকেজ", value: `\`${packageName.toUpperCase()}\``, inline: true },
-                    { name: "👤 Username", value: `\`${customUser}\``, inline: true },
-                    { name: "🔑 Password", value: `\`${customPass}\``, inline: true },
-                    { name: "💳 Total Paid", value: `\`${sessionData.totalPaid}\` BDT`, inline: true },
-                    { name: "📅 এক্সপায়ার ডেট", value: `<t:${Math.floor(expiryTimestamp / 1000)}:R>`, inline: true }
-                )
-                .setTimestamp();
-
-            const actionRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder().setCustomId(`claim_order`).setLabel("🛟 Claim").setStyle(ButtonStyle.Success),
-                new ButtonBuilder().setCustomId(`close_order`).setLabel("🔒 Close").setStyle(ButtonStyle.Secondary)
-            );
-
-            await privateChannel.send({ content: `${interaction.user} <@&${supportRoleId}>`, embeds: [orderEmbed], components: [actionRow] });
-
-            try {
-                const dmEmbed = new EmbedBuilder()
-                    .setTitle("🎉 Your Membership Account is Ready!")
-                    .setDescription(
-                        `👤 **Username:** \`${customUser}\`\n` +
-                        `🔑 **Password:** \`${customPass}\`\n` +
-                        `📦 **Package:** \`${packageName}\`\n` +
-                        `📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>`
-                    )
-                    .setThumbnail(userAvatarUrl)
-                    .setColor("Green")
-                    .setTimestamp();
-
-                await interaction.user.send({ embeds: [dmEmbed] });
-            } catch (dmErr) {}
-
-            const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
-            if (trackingChannel) {
-                const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "approved", null, null, sessionData.usedTxns ? sessionData.usedTxns.join(", ") : null);
-                trackingEmbed.addFields(
-                    { name: "👤 Registered Username", value: `\`${customUser}\``, inline: true },
-                    { name: "💰 Total Paid Amount", value: `\`${sessionData.totalPaid}\` BDT`, inline: true }
-                );
-
-                const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
-                if (trackingMsg) {
-                    saveOrderLog(privateChannel.id, trackingMsg.id, {
-                        userId: interaction.user.id,
-                        category: category,
-                        status: "approved",
-                        txnId: sessionData.usedTxns ? sessionData.usedTxns.join(", ") : "",
-                        username: customUser
-                    });
-                }
-            }
-
-            return interaction.editReply({
-                content: `✅ **পেমেন্ট সফলভাবে ভেরিফাই হয়েছে!**\n` +
-                         `আপনার কাস্টম অ্যাকাউন্ট তৈরি সম্পন্ন হয়েছে: ${privateChannel}`
-            });
-
-        } catch (err) {
-            console.error("❌ Account Creation Error:", err);
-            return interaction.editReply("❌ **অ্যাকাউন্ট তৈরিতে ত্রুটি ঘটেছে!**");
-        }
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith("create_")) {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const parts = interaction.customId.split("_");
-        const type = parts[1]; const category = parts.slice(2).join("_");
-
-        const randomCode = Math.floor(1000 + Math.random() * 9000);
-        let supportRoleId = ROLES.SUPPORT_TICKET_REPORT;
-        let channelPrefix = `${type}-${randomCode}`;
-
-        if (type === "customer") supportRoleId = ROLES.SUPPORT_CUSTOMER;
-
-        const permissionOverwrites = [
-            { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
-        ];
-
-        if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-        if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-
-        const privateChannel = await interaction.guild.channels.create({
-            name: channelPrefix,
-            type: 0,
-            permissionOverwrites
+        // 🎯 FIXED: username ফিল্ডটি ডেটাবেজে সঠিকভাবে সেভ হচ্ছে
+        await userRef.set({
+            username: usernameInput, // 👈 C++ অ্যাপ্লিকেশনে প্রদর্শন সহজ করার জন্য এটি আবশ্যক
+            password: passwordInput,
+            status: "active",
+            category: category,
+            discordId: userId,
+            createdAt: Date.now(),
+            expiresAt: expiresAtMs,
+            hwid: "" // প্রথমবার C++ থেকে লগইন করলে অটোমেটিক HWID সেট হয়ে যাবে
         });
 
-        const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")}`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
-        const actionRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId(`ban_panel_${type}`).setLabel("🚫 Support Ban").setStyle(ButtonStyle.Danger)
-        );
+        await db.ref(`pending_payments/${userId}_${category}`).remove();
 
-        await privateChannel.send({ content: `${interaction.user} <@&${supportRoleId}>`, embeds: [panelEmbed], components: [actionRow] });
+        const createdEmbed = new EmbedBuilder()
+            .setTitle("🎉 Account Created Successfully!")
+            .setDescription(
+                `আপনার C++ অ্যাপ্লিকেশন অ্যাকাউন্টটি সফলভাবে তৈরি করা হয়েছে।\n\n` +
+                `👤 **Username:** \`${usernameInput}\`\n` +
+                `🔒 **Password:** \`${passwordInput}\`\n` +
+                `⏳ **Validity:** \`${daysToAdd}\` দিন\n\n` +
+                `⚠️ **সতর্কতা:** এই লগইন তথ্যাদি অন্য কারো সাথে শেয়ার করবেন না।`
+            )
+            .setColor("#00FF00")
+            .setTimestamp();
 
-        const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
-        if (trackingChannel) {
-            const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending");
-            const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
-            if (trackingMsg) {
-                saveOrderLog(privateChannel.id, trackingMsg.id, {
-                    userId: interaction.user.id,
-                    category: category,
-                    status: "pending"
-                });
-            }
-        }
-
-        return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে: ${privateChannel}`);
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
-        const type = interaction.customId.split("_")[1];
-        let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
-        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
-        
-        await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
-        await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
-
-        db.ref(`staff_duty/${interaction.user.id}/claims`).transaction(c => (c || 0) + 1);
-        return;
-    }
-
-    if (interaction.isButton() && interaction.customId.startsWith("close_")) {
-        const orderLogs = getOrderLogs();
-        const currentOrder = orderLogs[interaction.channel.id];
-
-        try {
-            const transcript = await discordTranscripts.createTranscript(interaction.channel, {
-                limit: -1, returnType: 'attachment', filename: `${interaction.channel.name}-transcript.html`, saveImages: true, poweredBy: false
-            });
-
-            const transcriptLogChan = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
-            if (transcriptLogChan) {
-                await transcriptLogChan.send({
-                    content: `📜 **Transcript Log:** \`#${interaction.channel.name}\` | Closed by ${interaction.user}`,
-                    files: [transcript]
-                });
-            }
-        } catch (tErr) {}
-
-        await interaction.reply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
-
-        setTimeout(async () => {
-            await interaction.channel.delete().catch(() => {});
-        }, 5000);
+        return interaction.editReply({ embeds: [createdEmbed] });
     }
 });
 
 // ================================
-// ⚡ PART 4 - Live UI Panels Templates
+// 🚀 Bot Startup Logic
 // ================================
-
-async function getDynamicOrderGuidePanel() {
-    const { customDescription, customImage, fullData } = await fetchFirebasePanelData("order_guide");
-    const defaultTitle = "📦 HOW TO ORDER & SYSTEM GUIDE";
-    const defaultDesc = `🛒 **আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী** 🛒`;
-
-    const embed = new EmbedBuilder()
-        .setTitle(fullData.title || defaultTitle)
-        .setDescription(customDescription || defaultDesc)
-        .setColor("#FFAA00")
-        .setTimestamp()
-        .setFooter({ text: "Order Guide System", iconURL: client.user.displayAvatarURL() });
-
-    if (customImage) embed.setImage(customImage);
-    return { embeds: [embed] };
-}
-
-// 🌟 সাধারণ টিকিট সাপোর্ট প্যানেল
-async function getDynamicTicketPanel() {
-    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("ticket");
-    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট প্যানেল** 🎟️\n\nযে কোনো সমস্যা বা অনুসন্ধানের জন্য নিচের ড্রপডাউন সিলেক্ট করুন।`;
-
-    const embed = new EmbedBuilder()
-        .setTitle(fullData.title || "🎫 OFFICIAL SUPPORT PANEL")
-        .setDescription(customDescription || defaultDesc)
-        .setImage(customImage || COVER_IMAGES.TICKET)
-        .setColor("#5865F2")
-        .setFooter({ text: "Official Support Panel", iconURL: client.user.displayAvatarURL() });
-
-    let finalOptions = options;
-    if (options.length === 0 || (options.length === 1 && options[0].value === "none")) {
-        finalOptions = [
-            {
-                label: "💬 General Support Ticket",
-                description: "সাধারণ সহায়তার জন্য টিকেট খুলুন",
-                value: "general_support"
-            }
-        ];
-    }
-
-    const menu = new StringSelectMenuBuilder()
-        .setCustomId("select_product_ticket")
-        .setPlaceholder("👇 ড্রপডাউন মেনু থেকে সহায়তার ক্যাটাগরি সিলেক্ট করুন...")
-        .addOptions(finalOptions);
-
-    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
-}
-
-// 🔑 ১-টাইম কী জেনারেটর প্যানেল
-async function getDynamicOneTimeKeyPanel() {
-    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("onetime_key");
-    const defaultDesc = `🔐 **DEVELOPER ONE-TIME KEY GENERATOR** 🔐\n\nC++ অ্যাপে ব্যবহারের জন্য ১-টাইম কী জেনারেট করতে ড্রপডাউন বা বাটনে চাপ দিন।\n*(শুধুমাত্র ডেভেলপারদের জন্য নির্দিষ্ট)*`;
-
-    const embed = new EmbedBuilder()
-        .setTitle(fullData.title || "🔑 1TIME KEY GENERATOR PANEL")
-        .setDescription(customDescription || defaultDesc)
-        .setImage(customImage || COVER_IMAGES.TICKET)
-        .setColor("#F1C40F")
-        .setFooter({ text: "Developer Portal System", iconURL: client.user.displayAvatarURL() });
-
-    let finalOptions = options;
-    if (options.length === 0 || (options.length === 1 && options[0].value === "none")) {
-        finalOptions = [
-            {
-                label: "🔑 Generate 1TIME KEY (Dev Only)",
-                description: "C++ অ্যাপের জন্য ১-টাইম কী জেনারেট করুন",
-                value: "generate_1time_key"
-            }
-        ];
-    }
-
-    const menu = new StringSelectMenuBuilder()
-        .setCustomId("select_key_category")
-        .setPlaceholder("👇 কী জেনারেট করতে নিচের ড্রপডাউন সিলেক্ট করুন...")
-        .addOptions(finalOptions);
-
-    const buttonRow = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId("btn_generate_1time_key")
-            .setLabel("⚡ Generate OneTime Key")
-            .setStyle(ButtonStyle.Success)
-    );
-
-    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu), buttonRow] };
-}
-
-async function getDynamicReportPanel() {
-    const { options, customDescription, customImage } = await fetchFirebasePanelData("report");
-    const defaultDesc = `🚨 **মেম্বার বা স্টাফ রিপোর্ট করার স্থান** 🚨`;
-
-    const embed = new EmbedBuilder()
-        .setTitle("🚨 MEMBER & STAFF REPORT CENTER")
-        .setDescription(customDescription || defaultDesc)
-        .setImage(customImage || COVER_IMAGES.REPORT)
-        .setColor("#ED4245")
-        .setFooter({ text: "Report Center", iconURL: client.user.displayAvatarURL() });
-
-    const menu = new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder("❓ রিপোর্ট করার কারণ সিলেক্ট করুন...").addOptions(options);
-    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
-}
-
-async function getDynamicCustomerPanel() {
-    const { options, customDescription, customImage } = await fetchFirebasePanelData("customer");
-    const defaultDesc = `💬 **কাস্টমার সাপোর্ট অ্যান্ড কুয়েরি** 💬`;
-
-    const embed = new EmbedBuilder()
-        .setTitle("💬 VIP CUSTOMER SUPPORT CENTER")
-        .setDescription(customDescription || defaultDesc)
-        .setImage(customImage || COVER_IMAGES.CUSTOMER)
-        .setColor("#57F287")
-        .setFooter({ text: "Customer Support", iconURL: client.user.displayAvatarURL() });
-
-    const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder("❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...").addOptions(options);
-    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
-}
-
-async function getDynamicPaymentPanel() {
-    const { options, customDescription, customImage } = await fetchFirebasePanelData("payment");
-    const defaultDesc = `💳 **Premium Store & Automatic Payment Gateway** 💳`;
-
-    const embed = new EmbedBuilder()
-        .setTitle("🛍️ AUTOMATED SHOP & PAYMENT PANELS")
-        .setDescription(customDescription || defaultDesc)
-        .setImage(customImage || COVER_IMAGES.PAYMENT)
-        .setColor("#3498DB")
-        .setFooter({ text: "Automated Payment Bot", iconURL: client.user.displayAvatarURL() });
-
-    const menu = new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder("🛍️ আপনার কাঙ্ক্ষিত মেম্বারশিপ/সার্ভিস সিলেক্ট করুন...").addOptions(options);
-    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
-}
-
-// Admin Commands
-client.on("messageCreate", async (message) => {
-    if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
-
-    const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN);
-    if (!isServerAdmin) return;
-
-    if (message.content === "!setup") return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
-    if (message.content === "!ticket" && message.channelId === CHANNELS.TICKET_PANEL) return message.channel.send(await getDynamicTicketPanel());
-    if (message.content === "!report" && message.channelId === CHANNELS.REPORT_PANEL) return message.channel.send(await getDynamicReportPanel());
-    if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
-    if (message.content === "!payment" && message.channelId === CHANNELS.PAYMENT_PANEL) return message.channel.send(await getDynamicPaymentPanel());
-    if (message.content === "!orderguide" && message.channelId === ORDER_GUIDE_CHANNEL_ID) return message.channel.send(await getDynamicOrderGuidePanel());
-    
-    // ১-টাইম কী জেনারেটর প্যানেল পাঠানোর কমান্ড (!onetimekey বা !onetime key)
-    if (message.content === "!onetime key" || message.content === "!onetimekey") {
-        if (ONETIME_KEY_CHANNEL_IDS.includes(message.channelId) || isServerAdmin) {
-            return message.channel.send(await getDynamicOneTimeKeyPanel());
-        }
-    }
-});
-
-// ================================
-// 🔄 REALTIME FIREBASE SYNC LISTENER
-// ================================
-client.on("ready", async () => {
-    console.log(`🤖 Logged in as ${client.user.tag}!`);
-    setBotPresence();
-
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
-    if (!guild) return;
-
-    db.ref("panels/payment").on("value", async () => {
-        try {
-            const payChan = guild.channels.cache.get(CHANNELS.PAYMENT_PANEL);
-            if (!payChan) return;
-
-            const messages = await payChan.messages.fetch({ limit: 10 }).catch(() => null);
-            const botMsg = messages?.find(m => m.author.id === client.user.id);
-
-            const updatedData = await getDynamicPaymentPanel();
-
-            if (botMsg) {
-                await botMsg.edit(updatedData).catch(err => console.error("❌ Payment Panel Edit Fail:", err));
-                console.log("✅ Payment Panel Auto-Updated from Firebase!");
-            }
-        } catch (err) {
-            console.error("❌ Realtime Sync Error on Payment Panel:", err);
-        }
-    });
-
-    db.ref("panels/onetime_key").on("value", async () => {
-        try {
-            for (const keyChanId of ONETIME_KEY_CHANNEL_IDS) {
-                const keyChan = guild.channels.cache.get(keyChanId);
-                if (!keyChan) continue;
-
-                const messages = await keyChan.messages.fetch({ limit: 5 }).catch(() => null);
-                const botMsg = messages?.find(m => m.author.id === client.user.id);
-
-                const updatedData = await getDynamicOneTimeKeyPanel();
-
-                if (botMsg) {
-                    await botMsg.edit(updatedData).catch(err => console.error("❌ OneTime Key Panel Edit Fail:", err));
-                    console.log(`✅ OneTime Key Panel Auto-Updated from Firebase for channel: ${keyChanId}`);
-                }
-            }
-        } catch (err) {
-            console.error("❌ Realtime Sync Error on OneTime Key Panel:", err);
-        }
-    });
-
-    db.ref("panels").on("value", async (snapshot) => {
-        const ticketChan = guild.channels.cache.get(CHANNELS.TICKET_PANEL);
-        if (ticketChan) {
-            const messages = await ticketChan.messages.fetch({ limit: 5 }).catch(() => null);
-            const botMsg = messages?.find(m => m.author.id === client.user.id);
-            if (botMsg) {
-                const updatedData = await getDynamicTicketPanel();
-                await botMsg.edit(updatedData).catch(() => {});
-            }
-        }
-
-        const reportChan = guild.channels.cache.get(CHANNELS.REPORT_PANEL);
-        if (reportChan) {
-            const messages = await reportChan.messages.fetch({ limit: 5 }).catch(() => null);
-            const botMsg = messages?.find(m => m.author.id === client.user.id);
-            if (botMsg) {
-                const updatedData = await getDynamicReportPanel();
-                await botMsg.edit(updatedData).catch(() => {});
-            }
-        }
-
-        const custChan = guild.channels.cache.get(CHANNELS.CUSTOMER_PANEL);
-        if (custChan) {
-            const messages = await custChan.messages.fetch({ limit: 5 }).catch(() => null);
-            const botMsg = messages?.find(m => m.author.id === client.user.id);
-            if (botMsg) {
-                const updatedData = await getDynamicCustomerPanel();
-                await botMsg.edit(updatedData).catch(() => {});
-            }
-        }
-    });
-});
 
 function setBotPresence() {
     client.user.setPresence({
@@ -1352,5 +886,10 @@ function startBot() {
         console.error("❌ Discord Login Failed:", err);
     });
 }
+
+client.once("ready", () => {
+    console.log(`✅ Logged in as ${client.user.tag}`);
+    setBotPresence();
+});
 
 startBot();
