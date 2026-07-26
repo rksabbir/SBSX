@@ -166,7 +166,8 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessageReactions
+        GatewayIntentBits.GuildMessageReactions,
+        GatewayIntentBits.GuildPresences // 👈 এটি যুক্ত করা হলো
     ],
     partials: [Partials.Channel, Partials.GuildMember, Partials.Message, Partials.Reaction]
 });
@@ -1256,6 +1257,95 @@ client.on("messageCreate", async (message) => {
 // ================================
 // 🔄 REALTIME FIREBASE SYNC LISTENER
 // ================================
+// ================================
+// ⚡ QUEUE SYSTEM FOR SAFE BULK AVATAR & USERNAME UPDATES
+// ================================
+
+const updateQueue = new Map(); 
+let isProcessingQueue = false;
+
+// 📥 ২০টি ২০টি করে ব্যাচ প্রসেস করার ফাংশন
+async function processUpdateQueue() {
+    if (isProcessingQueue || updateQueue.size === 0) return;
+    isProcessingQueue = true;
+
+    // কিউ থেকে একসাথে প্রথম ২০ জন ইউজারকে বের করা
+    const queueEntries = Array.from(updateQueue.entries()).slice(0, 20);
+
+    for (const [userId, data] of queueEntries) {
+        try {
+            const { newAvatar, newUsername } = data;
+
+            // 1️⃣ users নোড আপডেট (ফায়ারবেস)
+            const usersRef = db.ref("users");
+            const snapshot = await usersRef.orderByChild("discordId").equalTo(userId).once("value");
+
+            if (snapshot.exists()) {
+                snapshot.forEach((childSnapshot) => {
+                    childSnapshot.ref.update({
+                        avatarUrl: newAvatar,
+                        discordUsername: newUsername,
+                        lastUpdated: Date.now()
+                    });
+                });
+                console.log(`⚡ [Queue Sync] Updated user node for Discord ID: ${userId}`);
+            }
+
+            // 2️⃣ keys (1TIME Key) নোড আপডেট (ফায়ারবেস)
+            const keysRef = db.ref("keys");
+            const keySnap = await keysRef.orderByChild("userId").equalTo(userId).once("value");
+
+            if (keySnap.exists()) {
+                keySnap.forEach((childSnapshot) => {
+                    childSnapshot.ref.update({
+                        avatarUrl: newAvatar,
+                        username: newUsername,
+                        lastUpdated: Date.now()
+                    });
+                });
+                console.log(`⚡ [Queue Sync] Updated keys node for Discord ID: ${userId}`);
+            }
+
+        } catch (err) {
+            console.error(`❌ Queue Update Error for User ${userId}:`, err);
+        } finally {
+            // প্রসেস হওয়া ইউজারকে কিউ থেকে সরিয়ে ফেলা
+            updateQueue.delete(userId);
+        }
+    }
+
+    isProcessingQueue = false;
+
+    // যদি ২০ জনের বেশি ইউজার থাকে, তবে ২ সেকেন্ড বিরতি দিয়ে পরবর্তী ২০ জন প্রসেস করবে
+    if (updateQueue.size > 0) {
+        setTimeout(processUpdateQueue, 2000); // ২ সেকেন্ড বিরতি
+    }
+}
+
+// --------------------------------
+// ⚡ DISCORD PROFILE CHANGE LISTENERS
+// --------------------------------
+
+// ১. মেম্বার সার্ভার প্রোফাইল বা অবতার চেঞ্জ করলে
+client.on("guildMemberUpdate", (oldMember, newMember) => {
+    const userId = newMember.id;
+    const newAvatar = newMember.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+    const newUsername = newMember.user.username;
+
+    // কিউতে তথ্য যোগ করা
+    updateQueue.set(userId, { newAvatar, newUsername });
+    processUpdateQueue();
+});
+
+// ২. মেম্বার গ্লোবাল ডিসকর্ড অবতার চেঞ্জ করলে
+client.on("userUpdate", (oldUser, newUser) => {
+    const userId = newUser.id;
+    const newAvatar = newUser.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+    const newUsername = newUser.username;
+
+    updateQueue.set(userId, { newAvatar, newUsername });
+    processUpdateQueue();
+});
 client.on("ready", async () => {
     console.log(`🤖 Logged in as ${client.user.tag}!`);
     setBotPresence();
