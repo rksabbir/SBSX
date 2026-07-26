@@ -96,7 +96,7 @@ const ROLES = {
     ADMIN: "1488332568372973568", 
     SUPPORT_TICKET_REPORT: "1488333580705861765", 
     SUPPORT_CUSTOMER: "1488335064873046086",
-    DEVELOPER: "1523955414612578354"
+    DEVELOPER: "1523955414612578354" // Developer রোলের ID
 };
 
 const CHANNELS = {
@@ -150,6 +150,7 @@ const cooldowns = new Map();
 const userMsgCounter = new Map(); 
 const userWarns = new Map(); 
 
+// 🟢 এখানে Intents Syntax Error টি ফিক্সড করা হয়েছে
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -222,8 +223,6 @@ client.on("messageCreate", async (message) => {
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
     
     const userId = message.author.id; 
-    let triggerAutomod = false; 
-    let reason = "";
     const contentLower = message.content.toLowerCase();
 
     // Anti-Link
@@ -235,13 +234,13 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    if (contentLower.includes("link") || contentLower.includes("লিংক")) {
+    if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
         return message.reply(`👋 আমাদের ভেরিফিকেশন লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
     }
 });
 
 // ================================
-// ⚡ PART 3 - Interaction Handling (NO RESPONSE FIXED)
+// ⚡ PART 3 - Interaction Handling (NO RESPONSE & ERROR FIXED)
 // ================================
 
 client.on("interactionCreate", async (interaction) => {
@@ -250,7 +249,6 @@ client.on("interactionCreate", async (interaction) => {
     try {
         // ------------------ 🔒 1. UNIVERSAL VERIFY BUTTON (FIXED) ------------------
         if (interaction.isButton() && interaction.customId === "universal_verify_button") {
-            // তাৎক্ষণিক ডিসকর্ডকে জানানো যেন ৩ সেকেন্ডে "No Response" না আসে
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
             const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
@@ -270,7 +268,7 @@ client.on("interactionCreate", async (interaction) => {
         // ------------------ 🔒 2. DIGITAL / HWID LOCK SELECT MENU ------------------
         if (interaction.isStringSelectMenu() && interaction.customId === "select_lock_type") {
             await interaction.deferUpdate();
-            const selectedLock = interaction.values[0]; // "HWID" অথবা "DIGITAL"
+            const selectedLock = interaction.values[0]; 
             const userId = interaction.user.id;
 
             await db.ref(`pending_locks/${userId}`).set({
@@ -289,7 +287,7 @@ client.on("interactionCreate", async (interaction) => {
             return handleOneTimeKeyGeneration(interaction);
         }
 
-        // 🎟️ 4. Dropdown Panel Selection (Buy / Ticket / Report)
+        // 🎟️ 4. Dropdown Panel Selection
         if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_") || interaction.customId.startsWith("select_key_"))) {
             const value = interaction.values[0];
             if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -323,7 +321,7 @@ client.on("interactionCreate", async (interaction) => {
             }
         }
 
-        // 🎟️ 5. Coupon Modal Submit (Buy Panel)
+        // 🎟️ 5. Coupon Modal Submit
         if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
@@ -376,7 +374,6 @@ client.on("interactionCreate", async (interaction) => {
                 usedTxns: []
             });
 
-            // 🔒 Lock Type Select Menu Dropdown
             const lockTypeRow = new ActionRowBuilder().addComponents(
                 new StringSelectMenuBuilder()
                     .setCustomId("select_lock_type")
