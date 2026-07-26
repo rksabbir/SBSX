@@ -166,7 +166,6 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessageReactions
         GatewayIntentBits.GuildMessageReactions,
         GatewayIntentBits.GuildPresences // 👈 এটি যুক্ত করা হলো
     ],
@@ -1331,6 +1330,9 @@ async function processUpdateQueue() {
 client.on("guildMemberUpdate", (oldMember, newMember) => {
     const userId = newMember.id;
     const newAvatar = newMember.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+    const newAvatar = newMember.uconst rawAvatar = newMember.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+// URL এর সাথে ইউনিক টাইমস্ট্যাম্প যুক্ত করা হচ্ছে
+const newAvatar = `${rawAvatar}?t=${Date.now()}`;ser.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
     const newUsername = newMember.user.username;
 
     // কিউতে তথ্য যোগ করা
