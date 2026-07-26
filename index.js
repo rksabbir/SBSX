@@ -96,7 +96,7 @@ const ROLES = {
     ADMIN: "1488332568372973568", 
     SUPPORT_TICKET_REPORT: "1488333580705861765", 
     SUPPORT_CUSTOMER: "1488335064873046086",
-    DEVELOPER: "1523955414612578354" // Developer রোলের ID
+    DEVELOPER: "1523955414612578354"
 };
 
 const CHANNELS = {
@@ -216,40 +216,7 @@ function getWelcomeLogs() { if (!fs.existsSync(WELCOME_LOG_FILE)) fs.writeFileSy
 function getPunishments() { if (!fs.existsSync(PUNISH_FILE)) fs.writeFileSync(PUNISH_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(PUNISH_FILE, "utf8")); }
 function savePunishment(userId, status, durationMs = null) { const punishments = getPunishments(); if (status === null) { delete punishments[userId]; } else { punishments[userId] = { status: status, time: Date.now(), expiresAt: durationMs ? Date.now() + durationMs : null }; } fs.writeFileSync(PUNISH_FILE, JSON.stringify(punishments, null, 2), "utf8"); }
 
-function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyTime = null) {
-    let statusText = "❌ Unverified"; let color = "#FFA500"; 
-    let thumbnail = member.user ? member.user.displayAvatarURL({ extension: "png", size: 512 }) : null;
-    let tag = member.user ? member.user.tag : member.userId || "Unknown Member";
-    let id = member.id || member.userId;
-    let joinedTime = member.joinedTimestamp ? `<t:${Math.floor(member.joinedTimestamp / 1000)}:R>` : "Unknown";
-
-    if (status === "verified") { statusText = "✅ Verified"; color = "#00FF00"; }
-    else if (status === "left") { statusText = "🚫 Left Server"; color = "#FF0000"; }
-
-    const embed = new EmbedBuilder().setColor(color).setTitle("🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম").setDescription(`✨ স্বাগতম <@${id}> আমাদের সার্ভারে!\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️`).addFields({ name: "👤 Username", value: `${tag}`, inline: true }, { name: "🆔 User ID", value: `${id}`, inline: true }, { name: "⏰ Joined Server", value: joinedTime, inline: true }, { name: "🛡️ Verification Status", value: `**${statusText}**`, inline: true }).setTimestamp();
-    if (thumbnail) embed.setThumbnail(thumbnail);
-    if (member.guild) embed.addFields({ name: "👥 Total Members", value: `${member.guild.memberCount}`, inline: true });
-    if (verifyTime) embed.addFields({ name: "⚡ Verified At", value: `<t:${Math.floor(verifyTime / 1000)}:R>`, inline: true });
-    if (isOfflineHook) embed.setFooter({ text: "⚠️ বট অফলাইন থাকার সময় এই অ্যাকশনটি ঘটেছিল।" });
-    else embed.setFooter({ text: "Professional Security Management System" });
-    return embed;
-}
-
-// Ghost Ping Track
-client.on("messageDelete", async (message) => {
-    if (!message.guild || message.author?.bot) return;
-    if (message.mentions.users.size > 0 || message.mentions.roles.size > 0) {
-        const targets = [...message.mentions.users.values()].map(u => u.toString()).join(" ") || [...message.mentions.roles.values()].map(r => r.toString()).join(" ");
-        const ghostEmbed = new EmbedBuilder()
-            .setColor("Red")
-            .setTitle("🛑 Ghost Ping Detected")
-            .setDescription(`**কারা করেছে:** ${message.author}\n**চ্যানেল:** ${message.channel}\n**যাকে ট্যাগ করা হয়েছিল:** ${targets}\n**মেসেজ:** ${message.content || "*কোনো লেখা নেই*"}`)
-            .setTimestamp();
-        message.channel.send({ embeds: [ghostEmbed] }).then(m => setTimeout(() => m.delete().catch(() => {}), 10000));
-    }
-});
-
-// Automod
+// Automod & Messages
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
@@ -259,17 +226,7 @@ client.on("messageCreate", async (message) => {
     let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // Caps-Lock Protection
-    const upperCount = message.content.replace(/[^A-Z]/g, "").length;
-    const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
-    if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
-        try { await message.delete().catch(() => {}); } catch(e){}
-        const capsWarn = await message.channel.send(`⚠️ <@${userId}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর ব্যবহার করবেন না।`);
-        setTimeout(() => capsWarn.delete().catch(() => {}), 5000);
-        return;
-    }
-
-    // Anti-Link Spam
+    // Anti-Link
     const linkRegex = /(https?:\/\/[^\s]+)/g;
     if (linkRegex.test(message.content)) {
         try { await message.delete().catch(() => {}); } catch(e){}
@@ -278,49 +235,39 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
+    if (contentLower.includes("link") || contentLower.includes("লিংক")) {
         return message.reply(`👋 আমাদের ভেরিফিকেশন লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
-    }
-
-    if (BAD_WORDS.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
-    if (!triggerAutomod) {
-        const now = Date.now(); if (!userMsgCounter.has(userId)) userMsgCounter.set(userId, []);
-        const timestamps = userMsgCounter.get(userId); timestamps.push(now);
-        const expirationTime = now - 5000; const activeTimestamps = timestamps.filter(time => time > expirationTime);
-        userMsgCounter.set(userId, activeTimestamps);
-        if (activeTimestamps.length >= 5) { triggerAutomod = true; reason = "অতিরিক্ত স্প্যামিং করা"; }
-    }
-    if (triggerAutomod) {
-        try { await message.delete().catch(() => {}); } catch(e){}
-        let warns = (userWarns.get(userId) || 0) + 1; userWarns.set(userId, warns);
-        if (warns < 3) {
-            const warnEmbed = new EmbedBuilder().setColor("Yellow").setDescription(`⚠️ <@${userId}>, সার্ভারে **${reason}** নিষিদ্ধ! আপনি এটি **${warns}/৩** বার করেছেন।`);
-            const warnMsg = await message.channel.send({ embeds: [warnEmbed] }); setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
-        } else {
-            userWarns.set(userId, 0); savePunishment(userId, "Muted", 10 * 60 * 1000); 
-            try { await message.member.timeout(10 * 60 * 1000, "Automod: Limit Exceeded"); const muteEmbed = new EmbedBuilder().setColor("Red").setTitle("🚫 মেম্বার মিউটেড").setDescription(`<@${userId}> কে ১০ মিনিটের জন্য মিউট করা হয়েছে।`); await message.channel.send({ embeds: [muteEmbed] }); } catch (err) {}
-        }
     }
 });
 
 // ================================
-// ⚡ PART 3 - Interaction Handling (FIXED ALL BUTTON & NO RESPONSE ISSUES)
+// ⚡ PART 3 - Interaction Handling (NO RESPONSE FIXED)
 // ================================
 
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
     try {
-        // Cooldown check
-        if (interaction.isButton() || interaction.isStringSelectMenu()) {
-            const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
-            if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_") && !interaction.customId.startsWith("modal_coupon_") && interaction.customId !== "select_lock_type") {
-                return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
+        // ------------------ 🔒 1. UNIVERSAL VERIFY BUTTON (FIXED) ------------------
+        if (interaction.isButton() && interaction.customId === "universal_verify_button") {
+            // তাৎক্ষণিক ডিসকর্ডকে জানানো যেন ৩ সেকেন্ডে "No Response" না আসে
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+
+            const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
+            if (!role) return interaction.editReply("❌ ভেরিফাইড রোলটি পাওয়া যায়নি!");
+
+            if (interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) {
+                return interaction.editReply("⚠️ আপনি ইতোমধ্যেই ভেরিফাই হয়ে আছেন।");
             }
-            cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
+
+            await interaction.member.roles.add(role);
+            await interaction.editReply("✅ আপনি সফলভাবে ভেরিফাই সম্পন্ন করেছেন!");
+            
+            db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
+            return;
         }
 
-        // ------------------ 🔒 LOCK SYSTEM SELECT MENU ------------------
+        // ------------------ 🔒 2. DIGITAL / HWID LOCK SELECT MENU ------------------
         if (interaction.isStringSelectMenu() && interaction.customId === "select_lock_type") {
             await interaction.deferUpdate();
             const selectedLock = interaction.values[0]; // "HWID" অথবা "DIGITAL"
@@ -337,23 +284,12 @@ client.on("interactionCreate", async (interaction) => {
             });
         }
 
-        // Verify Button
-        if (interaction.isButton() && interaction.customId === "universal_verify_button") {
-            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
-            if (!role) return interaction.editReply("❌ Role not found!");
-            if (interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
-            await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
-            db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
-            return;
-        }
-
-        // 🔑 Button 1Time Key Handler
+        // 🔑 3. 1Time Key Generation
         if (interaction.isButton() && (interaction.customId === "btn_generate_1time_key" || interaction.customId === "generate_1time_key")) {
             return handleOneTimeKeyGeneration(interaction);
         }
 
-        // 🎟️ Dropdown Select Menu Handler (Buy Panel, Ticket, etc.)
+        // 🎟️ 4. Dropdown Panel Selection (Buy / Ticket / Report)
         if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_") || interaction.customId.startsWith("select_key_"))) {
             const value = interaction.values[0];
             if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -370,7 +306,6 @@ client.on("interactionCreate", async (interaction) => {
             else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${lowerVal}`; }
             else if (interaction.customId === "select_buy_category") { type = "order"; } 
 
-            // Buy Panel Modal Trigger
             if (type === "order") {
                 const modal = new ModalBuilder().setCustomId(`modal_coupon_${lowerVal}`).setTitle("🎟️ Coupon / Discount Code");
                 const couponInput = new TextInputBuilder()
@@ -388,7 +323,7 @@ client.on("interactionCreate", async (interaction) => {
             }
         }
 
-        // 🎟️ Modal Submit Handler (With Digital Lock Option)
+        // 🎟️ 5. Coupon Modal Submit (Buy Panel)
         if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
@@ -476,28 +411,11 @@ client.on("interactionCreate", async (interaction) => {
     } catch (err) {
         console.error("❌ Interaction Handling Error:", err);
         if (!interaction.replied && !interaction.deferred) {
-            return interaction.reply({ content: "❌ এটি সম্পন্ন করার সময় একটি এরর তৈরি হয়েছে!", flags: [MessageFlags.Ephemeral] });
+            return interaction.reply({ content: "❌ এটি সম্পূর্ণ করার সময় একটি এরর হয়েছে!", flags: [MessageFlags.Ephemeral] }).catch(() => {});
         } else {
-            return interaction.editReply("❌ এটি সম্পন্ন করার সময় একটি এরর তৈরি হয়েছে!");
+            return interaction.editReply("❌ এটি সম্পূর্ণ করার সময় একটি এরর হয়েছে!").catch(() => {});
         }
     }
-});
-
-// Member Profile Avatar Update
-client.on("guildMemberUpdate", (oldMember, newMember) => {
-    const userId = newMember.id;
-    const rawAvatar = newMember.user.displayAvatarURL({ extension: "png", size: 512 });
-    const newAvatar = `${rawAvatar}?t=${Date.now()}`;
-    const newUsername = newMember.user.username;
-
-    db.ref(`users/${userId}`).once("value", (snapshot) => {
-        if (snapshot.exists()) {
-            db.ref(`users/${userId}`).update({
-                avatarUrl: newAvatar,
-                username: newUsername
-            });
-        }
-    });
 });
 
 function setBotPresence() {
