@@ -245,11 +245,11 @@ async function handleOneTimeKeyGeneration(interaction) {
     
     const keyRef = db.ref(`keys/${randomKey}`);
     
-    // 🟢 C++ অ্যাপের সঠিক রিডের জন্য username, generatedBy, avatarUrl, serverName সেভ করা হলো
+    // 🟢 ফিক্সড: C++ অ্যাপের সঠিক রিডের জন্য avatarUrl ও অন্যান্য ফিল্ড নিশ্চিত করা হয়েছে
     await keyRef.set({
         used: false,
         generatedBy: interaction.user.tag,
-        username: interaction.user.username, // C++ অ্যাপের ড্যাশবোর্ডে নাম ডিসপ্লে নিশ্চিত করার জন্য
+        username: interaction.user.username,
         userId: interaction.user.id,
         avatarUrl: userAvatarUrl,
         serverName: serverName,
@@ -905,20 +905,20 @@ client.on("interactionCreate", async (interaction) => {
 
             const expiryTimestamp = Date.now() + (days * 24 * 60 * 60 * 1000);
 
-            // 🔥 C++ অ্যাপের সাথে সম্পূর্ণ সিঙ্ক রেখে সমস্ত তথ্য (username সহ) Firebase-এ সেভ
+            // 🔥 ফিক্সড: C++ অ্যাপের সাথে সিঙ্ক রাখার জন্য এখানে avatarUrl ও username সঠিকভাবে সেভ করা হলো
             await db.ref(`users/${customUser}`).set({
-                username: customUser,         // 🎯 C++ অ্যাপের ইউজার ড্যাশবোর্ডে নাম দেখানোর জন্য এটি সেভ করা হলো
+                username: customUser,         
                 password: customPass,
                 discordId: userId,
-                avatarUrl: userAvatarUrl,    // C++ অ্যাপের জন্য Avatar Link
-                serverName: serverName,      // C++ অ্যাপের জন্য Server Name
-                category: category,          // category (weekly/monthly/2_months)
-                package: packageName,        // package (Weekly/Monthly)
+                avatarUrl: userAvatarUrl,    
+                serverName: serverName,      
+                category: category,          
+                package: packageName,        
                 paidAmount: sessionData.totalPaid,
                 usedTxns: sessionData.usedTxns,
                 createdAt: Date.now(),
-                expiresAt: expiryTimestamp,  // Expire Timestamp
-                status: "active"             // Account Status
+                expiresAt: expiryTimestamp,  
+                status: "active"             
             });
 
             const randomCode = Math.floor(1000 + Math.random() * 9000);
