@@ -84,9 +84,8 @@ const VERIFIED_ROLE_ID = "1488333841402691664";
 const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 
-// অর্ডার ট্র্যাকিং চ্যানেল আইডি
+// অর্ডার ট্র্যাকিং ও গাইড চ্যানেল আইডি
 const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
-// নতুন অর্ডার গাইড চ্যানেল আইডি
 const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 
 // ১-টাইম কী জেনারেটর চ্যানেল আইডি
@@ -96,7 +95,7 @@ const ROLES = {
     ADMIN: "1488332568372973568", 
     SUPPORT_TICKET_REPORT: "1488333580705861765", 
     SUPPORT_CUSTOMER: "1488335064873046086",
-    DEVELOPER: "1523955414612578354" // Developer রোলের ID
+    DEVELOPER: "1523955414612578354"
 };
 
 const CHANNELS = {
@@ -139,17 +138,8 @@ function getNormalizedCategory(cat) {
     return "weekly";
 }
 
-// New Configs
-const STATS_VC_CHANNEL_ID = "1524321192079786005";
 const LEVEL_ROLE_ID = "1524322087295127552";
-const GIVEAWAY_CHANNEL_ID = "1488341249739198585";
-const EMBED_NOTICE_CHANNEL_ID = "1488338739850772641";
-const SOCIAL_FEED_CHANNEL_ID = "1488338739850772641";
-const STAFF_ADMIN_LOG_ID = "1524324771502882877";
-const WEEKLY_REPORT_CHANNEL_ID = "1524326280923709550";
-const TRANSCRIPT_LOG_CHANNEL_ID = "1524326928268660807";
 
-// Databases
 const DATA_FILE = "./database.json";
 const WELCOME_LOG_FILE = "./welcome_messages.json";
 const PUNISH_FILE = "./punishments.json"; 
@@ -174,57 +164,6 @@ const client = new Client({
 
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
-
-// 🎲 ইউনিক কুপন কোড জেনারেটর
-function generateUniqueCouponCode() {
-    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let code = "AK-";
-    for (let i = 0; i < 6; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return code;
-}
-
-// 📌 Firebase থেকে ডেটা নিয়ে আসার ফাংশন
-async function fetchFirebasePanelData(panelType) {
-    try {
-        const snapshot = await db.ref(`panels/${panelType}`).once("value");
-        const data = snapshot.val() || {};
-        
-        const customDescription = data.description || null;
-        const customImage = data.image || null;
-
-        let options = [];
-
-        if (data.options && typeof data.options === "object") {
-            options = Object.keys(data.options).map(key => ({
-                label: String(data.options[key].label || data.options[key]),
-                value: String(data.options[key].value || key)
-            }));
-        } else {
-            options = Object.keys(data)
-                .filter(key => !["description", "image", "title", "options"].includes(key))
-                .map(key => ({
-                    label: String(data[key]),
-                    value: String(key)
-                }));
-        }
-
-        if (options.length === 0) {
-            options.push({ label: "No Options Found", value: "none" });
-        }
-
-        return { options, customDescription, customImage, fullData: data };
-    } catch (error) {
-        console.error(`❌ Firebase Panel Data Fetch Error (${panelType}):`, error);
-        return { 
-            options: [{ label: "Error Loading Data", value: "error" }], 
-            customDescription: null, 
-            customImage: null,
-            fullData: {}
-        };
-    }
-}
 
 // ================================
 // 🔑 Key Generation Core Function
@@ -269,22 +208,10 @@ async function handleOneTimeKeyGeneration(interaction) {
     });
 }
 
-// ================================
-// 📂 Database Helper Functions
-// ================================
-
-function getSavedMembers() { if (!fs.existsSync(DATA_FILE)) fs.writeFileSync(DATA_FILE, JSON.stringify([]), "utf8"); return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
-function saveMembers(memberIds) { fs.writeFileSync(DATA_FILE, JSON.stringify(memberIds, null, 2), "utf8"); }
+// Helper Functions
 function getWelcomeLogs() { if (!fs.existsSync(WELCOME_LOG_FILE)) fs.writeFileSync(WELCOME_LOG_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(WELCOME_LOG_FILE, "utf8")); }
-function saveWelcomeLog(userId, messageId, data = {}) { const logs = getWelcomeLogs(); logs[userId] = { messageId, ...data }; fs.writeFileSync(WELCOME_LOG_FILE, JSON.stringify(logs, null, 2), "utf8"); }
 function getPunishments() { if (!fs.existsSync(PUNISH_FILE)) fs.writeFileSync(PUNISH_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(PUNISH_FILE, "utf8")); }
 function savePunishment(userId, status, durationMs = null) { const punishments = getPunishments(); if (status === null) { delete punishments[userId]; } else { punishments[userId] = { status: status, time: Date.now(), expiresAt: durationMs ? Date.now() + durationMs : null }; } fs.writeFileSync(PUNISH_FILE, JSON.stringify(punishments, null, 2), "utf8"); }
-function getOrderLogs() { if (!fs.existsSync(ORDER_LOG_FILE)) fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(ORDER_LOG_FILE, "utf8")); }
-function saveOrderLog(channelId, trackingMessageId, orderDetails) { const logs = getOrderLogs(); logs[channelId] = { trackingMessageId, ...orderDetails }; fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify(logs, null, 2), "utf8"); }
-
-// ================================
-// 🎉 Dynamic Welcome Embed Builder
-// ================================
 
 function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyTime = null) {
     let statusText = "❌ Unverified"; let color = "#FFA500"; 
@@ -305,43 +232,7 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
     return embed;
 }
 
-// ================================
-// 🛒 Order Status Embed Builder
-// ================================
-function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
-    let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
-    
-    if (status === "approved") { color = "#00FF00"; statusString = `✅ APPROVED & RUNNING (কাজ চলছে)`; }
-    else if (status === "closed") { color = "#FF0000"; statusString = "🔒 CLOSED (টিকিট বন্ধ করা হয়েছে)"; }
-    else if (status === "banned") { color = "#2F3136"; statusString = `🚫 FAKE TICKET BAN (${reason || "ফানি টিকিট"})`; }
-
-    const embed = new EmbedBuilder()
-        .setTitle("📦 ORDER TRACKING SYSTEM")
-        .setColor(color)
-        .addFields(
-            { name: "👤 কাস্টমার", value: `${user}`, inline: true },
-            { name: "🛒 প্রোডাক্ট/ক্যাটাগরি", value: `\`${category.toUpperCase().replace("_", " ")}\``, inline: true },
-            { name: "📁 টিকিট চ্যানেল", value: `${ticketChannel}`, inline: true },
-            { name: "📊 বর্তমান স্ট্যাটাস", value: `**${statusString}**`, inline: false }
-        )
-        .setTimestamp()
-        .setFooter({ text: "Order Update System" });
-
-    if (txnId) {
-        let maskedTxnId = txnId;
-        if (txnId.length > 4) {
-            maskedTxnId = txnId.substring(0, 2) + "****" + txnId.substring(txnId.length - 2);
-        } else {
-            maskedTxnId = "****";
-        }
-        embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
-    }
-    
-    if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
-    return embed;
-}
-
-// Ghost Ping ট্র্যাকিং
+// Ghost Ping Track
 client.on("messageDelete", async (message) => {
     if (!message.guild || message.author?.bot) return;
     if (message.mentions.users.size > 0 || message.mentions.roles.size > 0) {
@@ -355,7 +246,7 @@ client.on("messageDelete", async (message) => {
     }
 });
 
-// Automod + Activity XP System
+// Automod
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
@@ -365,35 +256,15 @@ client.on("messageCreate", async (message) => {
     let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // 🛑 Caps-Lock Protection
+    // Caps-Lock Protection
     const upperCount = message.content.replace(/[^A-Z]/g, "").length;
     const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
     if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
         try { await message.delete().catch(() => {}); } catch(e){}
-        const capsWarn = await message.channel.send(`⚠️ <@${userId}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর (Caps Lock) ব্যবহার করবেন না।`);
+        const capsWarn = await message.channel.send(`⚠️ <@${userId}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর ব্যবহার করবেন না।`);
         setTimeout(() => capsWarn.delete().catch(() => {}), 5000);
         return;
     }
-
-    // 🎮 Activity Leveling (Firebase XP System)
-    const xpRef = db.ref(`leveling/${userId}`);
-    xpRef.transaction((current) => {
-        if (!current) {
-            return { xp: 10, level: 1 };
-        } else {
-            let nextXp = (current.xp || 0) + Math.floor(Math.random() * 5) + 5;
-            let nextLevel = current.level || 1;
-            let neededXp = nextLevel * 100;
-            if (nextXp >= neededXp) {
-                nextXp -= neededXp;
-                nextLevel += 1;
-                
-                message.channel.send(`🎉 অভিনন্দন <@${userId}>! আপনি লেভেল **${nextLevel}** এ উন্নীত হয়েছেন।`).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
-                message.member.roles.add(LEVEL_ROLE_ID).catch(() => {});
-            }
-            return { xp: nextXp, level: nextLevel };
-        }
-    });
 
     // Anti-Link Spam
     const linkRegex = /(https?:\/\/[^\s]+)/g;
@@ -404,9 +275,8 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // লাইভ লিঙ্ক রেসপন্স
     if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
-        return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
+        return message.reply(`👋 আমাদের ভেরিফিকেশন লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
     }
 
     if (BAD_WORDS.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
@@ -434,17 +304,14 @@ client.on("messageCreate", async (message) => {
 // ⚡ PART 3 - Interaction Handling
 // ================================
 
-const verificationRow = new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("universal_verify_button").setLabel("Verify Me").setStyle(ButtonStyle.Success)
-);
-function createVerificationEmbed() { return new EmbedBuilder().setTitle("🚨 Verification Required").setDescription("👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন").setColor("Blue").setImage(COVER_IMAGES.VERIFY).setTimestamp(); }
-
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
     if (interaction.isButton() || interaction.isStringSelectMenu()) {
         const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
-        if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_") && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_") && interaction.customId !== "select_lock_type") return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
+        if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_") && !interaction.customId.startsWith("modal_coupon_") && interaction.customId !== "select_lock_type") {
+            return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
+        }
         cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
@@ -452,10 +319,9 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isStringSelectMenu() && interaction.customId === "select_lock_type") {
         try {
             await interaction.deferUpdate();
-            const selectedLock = interaction.values[0]; // "HWID" অথবা "DIGITAL"
+            const selectedLock = interaction.values[0]; // "HWID" or "DIGITAL"
             const userId = interaction.user.id;
 
-            // ইউজার HWID নাকি DIGITAL পছন্দ করলো তা ফায়ারবেসে সেভ হবে
             await db.ref(`pending_locks/${userId}`).set({
                 lockType: selectedLock
             });
@@ -469,8 +335,8 @@ client.on("interactionCreate", async (interaction) => {
         }
         return;
     }
-    // -------------------------------------------------------------
 
+    // Verify Button
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
         try {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -480,72 +346,16 @@ client.on("interactionCreate", async (interaction) => {
             await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
             
             db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
-
-            const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
-            if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(interaction.member, "verified", userLog.isOffline, Date.now()); await msg.edit({ embeds: [updatedEmbed] }); } } catch (e) {} }
         } catch (err) { console.error(err); }
         return;
     }
 
-    // 🔑 Button ভিত্তিক OneTime Key Handler
+    // 🔑 Button 1Time Key Handler
     if (interaction.isButton() && (interaction.customId === "btn_generate_1time_key" || interaction.customId === "generate_1time_key")) {
         return handleOneTimeKeyGeneration(interaction);
     }
 
-    // Giveaway বাটনে ক্লিক ট্র্যাকিং
-    if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
-        const gwId = interaction.customId.split("_")[2];
-        const participantRef = db.ref(`giveaways/${gwId}/participants/${interaction.user.id}`);
-        const snap = await participantRef.once("value");
-        if (snap.exists()) {
-            return interaction.reply({ content: "❌ আপনি অলরেডি এই গিভঅ্যাওয়েতে জয়েন করেছেন!", flags: [MessageFlags.Ephemeral] });
-        }
-        await participantRef.set(interaction.user.tag);
-        
-        const fullSnap = await db.ref(`giveaways/${gwId}`).once("value");
-        const gwData = fullSnap.val();
-        const count = Object.keys(gwData.participants || {}).length;
-        
-        const embed = EmbedBuilder.from(interaction.message.embeds[0]);
-        embed.setFields({ name: "🎉 এন্ট্রি সংখ্যা", value: `\`${count}\` জন মেম্বার`, inline: true });
-        await interaction.message.edit({ embeds: [embed] });
-
-        return interaction.reply({ content: "✅ আপনি সফলভাবে গিভঅ্যাওয়েতে নাম এন্ট্রি করেছেন!", flags: [MessageFlags.Ephemeral] });
-    }
-
-    // এডভান্সড টিকেট রেটিং ফিডব্যাক সিস্টেম
-    if (interaction.isButton() && interaction.customId.startsWith("star_rating_")) {
-        const [, , stars, staffId] = interaction.customId.split("_");
-        
-        const modal = new ModalBuilder().setCustomId(`modal_feedback_${stars}_${staffId}`).setTitle("📝 Ticket Support Feedback");
-        const commentInput = new TextInputBuilder().setCustomId("feedback_comment").setLabel("আপনার মূল্যবান মতামতটি লিখুন (ঐচ্ছিক)").setStyle(TextInputStyle.Paragraph).setRequired(false);
-        modal.addComponents(new ActionRowBuilder().addComponents(commentInput));
-        return interaction.showModal(modal);
-    }
-
-    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_feedback_")) {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        const [, , stars, staffId] = interaction.customId.split("_");
-        const comment = interaction.fields.getTextInputValue("feedback_comment") || "কোনো কমেন্ট নেই।";
-        
-        const reviewChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
-        if (reviewChannel) {
-            const reviewEmbed = new EmbedBuilder()
-                .setTitle("⭐ NEW SUPPORT FEEDBACK")
-                .setColor("Gold")
-                .addFields(
-                    { name: "👤 কাস্টমার", value: `${interaction.user}`, inline: true },
-                    { name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `<@${staffId}>`, inline: true },
-                    { name: "📊 রেটিং স্কোর", value: `${"⭐".repeat(parseInt(stars))}`, inline: false },
-                    { name: "💬 কাস্টমার কমেন্ট", value: `\`\`\`${comment}\`\`\``, inline: false }
-                )
-                .setTimestamp();
-            await reviewChannel.send({ embeds: [reviewEmbed] });
-        }
-        return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
-    }
-
-    // 🌟 ড্রপডাউন সিলেকশন হ্যান্ডলার (1TIME KEY + TICKET HANDLING + BUY/PAYMENT PANEL)
+    // 🎟️ BUY / PAYMENT PANEL SELECTION (Dropdown)
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_") || interaction.customId.startsWith("select_key_"))) {
         const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -560,8 +370,9 @@ client.on("interactionCreate", async (interaction) => {
         if (interaction.customId === "select_product_ticket") { type = "ticket"; embedColor = "#5865F2"; buttonId = `create_ticket_${lowerVal}`; }
         else if (interaction.customId === "select_report_category") { type = "report"; embedColor = "#ED4245"; buttonId = `create_report_${lowerVal}`; }
         else if (interaction.customId === "select_customer_category") { type = "customer"; embedColor = "#57F287"; buttonId = `create_customer_${lowerVal}`; }
-        else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${lowerVal}`; } 
+        else if (interaction.customId === "select_buy_category") { type = "order"; } 
 
+        // 🛒 Buy Panel modal trigger
         if (type === "order") {
             const modal = new ModalBuilder().setCustomId(`modal_coupon_${lowerVal}`).setTitle("🎟️ Coupon / Discount Code");
             const couponInput = new TextInputBuilder()
@@ -578,16 +389,108 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ embeds: [ephemeralEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
         }
     }
+
+    // 🎟️ MODAL SUBMIT HANDLER FOR BUY PANEL (FIXED NO RESPONSE ISSUE)
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
+        try {
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+
+            // customId থেকে ক্যাটাগরি এক্সট্রাক্ট করা
+            const rawCategory = interaction.customId.replace("modal_coupon_", "").toLowerCase();
+            const category = getNormalizedCategory(rawCategory);
+            
+            const couponInput = interaction.fields.getTextInputValue("coupon_code_input");
+            const couponEntered = couponInput ? couponInput.trim().toUpperCase() : "SKIP";
+            const userId = interaction.user.id;
+
+            let basePrice = PACKAGE_PRICES[category] || 510;
+            let finalPrice = basePrice;
+            let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
+            let appliedCouponCode = null;
+            let appliedDiscountValue = 0;
+
+            if (couponEntered !== "SKIP") {
+                const couponRef = db.ref(`coupons/${couponEntered}`);
+                const couponSnap = await couponRef.once("value");
+
+                if (couponSnap.exists()) {
+                    const couponData = couponSnap.val();
+                    const now = Date.now();
+
+                    if (couponData.status === "used") {
+                        discountText = "❌ **কুপন কোডটি ইতোমধ্যে ব্যবহার করা হয়েছে!** মূল মূল্য প্রযোজ্য হবে।";
+                    } else if (couponData.expiresAt && couponData.expiresAt < now) {
+                        await couponRef.update({ status: "expired" });
+                        discountText = "❌ **কুপন কোডটির মেয়াদ শেষ হয়ে গেছে!** মূল মূল্য প্রযোজ্য হবে।";
+                    } else if (couponData.status === "active") {
+                        appliedDiscountValue = Number(couponData.couponValue || couponData.discountValue || 0);
+                        finalPrice = Math.max(0, basePrice - appliedDiscountValue);
+                        appliedCouponCode = couponEntered;
+
+                        discountText = `🎉 **কুপন কোড \`${couponEntered}\` সফলভাবে অ্যাপ্লাই হয়েছে!**\n` +
+                                       `💸 **ছাড়ের পরিমাণ:** \`${appliedDiscountValue}\` ৳\n` +
+                                       `🏷️ **নতুন মূল্য:** \`${finalPrice}\` ৳`;
+                    }
+                } else {
+                    discountText = "⚠️ **অবৈধ কুপন কোড!** মূল মূল্য প্রযোজ্য হবে।";
+                }
+            }
+
+            // ফায়ারবেসে পেন্ডিং পেমেন্ট আপডেট
+            await db.ref(`pending_payments/${userId}_${category}`).set({
+                targetPrice: finalPrice,
+                basePrice: basePrice,
+                appliedCoupon: appliedCouponCode,
+                appliedDiscount: appliedDiscountValue,
+                totalPaid: 0,
+                usedTxns: []
+            });
+
+            // Lock Type Select Menu Component
+            const lockTypeRow = new ActionRowBuilder().addComponents(
+                new StringSelectMenuBuilder()
+                    .setCustomId("select_lock_type")
+                    .setPlaceholder("🔒 আপনার লকিং সিস্টেম সিলেক্ট করুন...")
+                    .addOptions([
+                        { label: "🖥️ Hardware Lock (HWID)", description: "শুধুমাত্র ১টি নির্ধারিত PC-তে ব্যাকগ্রাউন্ডে লক থাকবে।", value: "HWID" },
+                        { label: "🌐 Digital Lock (Session Lock)", description: "যেকোনো PC-তে লগইন করা যাবে, তবে একসাথে ২টিতে নয়।", value: "DIGITAL" }
+                    ])
+            );
+
+            const payEmbed = new EmbedBuilder()
+                .setTitle(`💳 Payment Gateway: ${category.toUpperCase().replace("_", " ")}`)
+                .setDescription(
+                    `📦 **প্যাকেজের রেগুলার মূল্য:** \`${basePrice}\` BDT\n` +
+                    `💰 **আপনাকে পেমেন্ট করতে হবে:** \`${finalPrice}\` BDT\n\n` +
+                    `📱 **বিকাশ / নগদ (Personal):** \`${PAYMENT_NUMBER}\`\n\n` +
+                    `টাকা পাঠানোর পর প্রাপ্ত Transaction ID (TxnID) দিয়ে নিচের **"Submit TxnID"** বাটনে ক্লিক করুন।\n\n` +
+                    `🎁 **কুপন ও ডিসকাউন্ট স্ট্যাটাস:**\n${discountText}`
+                )
+                .setColor("#9B59B6");
+
+            const btnRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`submit_txn_${category}`)
+                    .setLabel("Submit TxnID")
+                    .setStyle(ButtonStyle.Primary)
+            );
+
+            return interaction.editReply({ embeds: [payEmbed], components: [lockTypeRow, btnRow] });
+
+        } catch (err) {
+            console.error("❌ Buy Panel Handler Error:", err);
+            return interaction.editReply("❌ পেমেন্ট প্রসেস করার সময় ইন্টারনাল এরর হয়েছে!");
+        }
+    }
 });
 
-// ১. মেম্বার সার্ভার প্রোফাইল বা অবতার চেঞ্জ করলে
+// Member Profile Avatar Update
 client.on("guildMemberUpdate", (oldMember, newMember) => {
     const userId = newMember.id;
     const rawAvatar = newMember.user.displayAvatarURL({ extension: "png", size: 512 });
     const newAvatar = `${rawAvatar}?t=${Date.now()}`;
     const newUsername = newMember.user.username;
 
-    // ইউজার ফায়ারবেসে থাকলে তার Avatar আপডেট করা
     db.ref(`users/${userId}`).once("value", (snapshot) => {
         if (snapshot.exists()) {
             db.ref(`users/${userId}`).update({
