@@ -440,6 +440,8 @@ const verificationRow = new ActionRowBuilder().addComponents(
 );
 function createVerificationEmbed() { return new EmbedBuilder().setTitle("🚨 Verification Required").setDescription("👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন").setColor("Blue").setImage(COVER_IMAGES.VERIFY).setTimestamp(); }
 
+
+
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
@@ -449,6 +451,34 @@ client.on("interactionCreate", async (interaction) => {
         cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
     }
 
+
+
+
+// ------------------ 🔒 lockType Select Menu ------------------
+    if (interaction.isStringSelectMenu() && interaction.customId === "select_lock_type") {
+        try {
+            await interaction.deferUpdate();
+            const selectedLock = interaction.values[0]; // "HWID" অথবা "DIGITAL"
+            const userId = interaction.user.id;
+
+            // ইউজার HWID নাকি DIGITAL পছন্দ করলো তা ফায়ারবেসে সেভ হবে
+            await db.ref(`pending_locks/${userId}`).set({
+                lockType: selectedLock
+            });
+
+            await interaction.followUp({
+                content: `✅ আপনি সফলভাবে **${selectedLock === "HWID" ? "Hardware (HWID)" : "Digital Session"} Lock** বেছে নিয়েছেন!`,
+                flags: [MessageFlags.Ephemeral]
+            });
+        } catch (err) {
+            console.error("Lock select menu error:", err);
+        }
+        return;
+    }
+    // -------------------------------------------------------------
+
+
+    
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
         try {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
@@ -906,21 +936,29 @@ client.on("interactionCreate", async (interaction) => {
 
             const expiryTimestamp = Date.now() + (days * 24 * 60 * 60 * 1000);
 
-            // 🔥 ফিক্সড: C++ অ্যাপের সাথে সিঙ্ক রাখার জন্য এখানে avatarUrl ও username সঠিকভাবে সেভ করা হলো
-            await db.ref(`users/${customUser}`).set({
-                username: customUser,         
-                password: customPass,
-                discordId: userId,
-                avatarUrl: userAvatarUrl,    
-                serverName: serverName,      
-                category: category,          
-                package: packageName,        
-                paidAmount: sessionData.totalPaid,
-                usedTxns: sessionData.usedTxns,
-                createdAt: Date.now(),
-                expiresAt: expiryTimestamp,  
-                status: "active"             
-            });
+         // ইউজারের সিলেক্ট করা লক টাইপ রিড করা (ডিফল্ট HWID থাকবে যদি পছন্দ না করে থাকে)
+const userLockSnap = await db.ref(`pending_locks/${userId}`).once("value");
+const selectedLock = userLockSnap.exists() ? userLockSnap.val().lockType : "HWID";
+
+await db.ref(`users/${customUser}`).set({
+    username: customUser,
+    password: customPass,
+    discordId: userId,
+    avatarUrl: userAvatarUrl,
+    serverName: serverName,
+    category: category,
+    package: packageName,
+    paidAmount: sessionData.totalPaid,
+    usedTxns: sessionData.usedTxns,
+    createdAt: Date.now(),
+    expiresAt: expiryTimestamp,
+    status: "active",
+    
+    // ⬇️ নতুন লকিং ফিল্ডসমূহ ⬇️
+    lockType: selectedLock,      // "HWID" অথবা "DIGITAL"
+    isLoggedIn: false,           // অ্যাপ চালু আছে কিনা
+    lastActive: 0                // ডিজিটাল লকের টাইমস্ট্যাম্প
+});
 
             const randomCode = Math.floor(1000 + Math.random() * 9000);
             let supportRoleId = ROLES.SUPPORT_CUSTOMER;
