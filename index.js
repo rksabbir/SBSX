@@ -139,6 +139,7 @@ function getNormalizedCategory(cat) {
     return "weekly";
 }
 
+// New Configs
 const STATS_VC_CHANNEL_ID = "1524321192079786005";
 const LEVEL_ROLE_ID = "1524322087295127552";
 const GIVEAWAY_CHANNEL_ID = "1488341249739198585";
@@ -174,7 +175,7 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// 🎲 ইউনিক কুপন কোড জেনারেটর
+// 🎲 ইউনিক কুপন কোড জেনারেটর (e.g., AK-A1B2C3)
 function generateUniqueCouponCode() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let code = "AK-";
@@ -305,7 +306,7 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
 }
 
 // ================================
-// 🛒 Order Status Embed Builder
+// 🛒 Order Status Embed Builder (Updated with Lock Type)
 // ================================
 function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null, lockType = "digital") {
     let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
@@ -322,7 +323,7 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         .addFields(
             { name: "👤 কাস্টমার", value: `${user}`, inline: true },
             { name: "🛒 প্রোডাক্ট/ক্যাটাগরি", value: `\`${category.toUpperCase().replace("_", " ")}\``, inline: true },
-            { name: "🛡️ লকিং সিস্টেম", value: `\`${lockString}\``, inline: true },
+            { name: "🛡️ সিকিউরিটি টাইপ", value: `\`${lockString}\``, inline: true },
             { name: "📁 টিকিট চ্যানেল", value: `${ticketChannel}`, inline: true },
             { name: "📊 বর্তমান স্ট্যাটাস", value: `**${statusString}**`, inline: false }
         )
@@ -367,7 +368,7 @@ client.on("messageCreate", async (message) => {
     let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // Caps-Lock Protection
+    // 🛑 Caps-Lock Protection
     const upperCount = message.content.replace(/[^A-Z]/g, "").length;
     const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
     if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
@@ -377,7 +378,7 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    // Activity Leveling
+    // 🎮 Activity Leveling (Firebase XP System)
     const xpRef = db.ref(`leveling/${userId}`);
     xpRef.transaction((current) => {
         if (!current) {
@@ -440,6 +441,10 @@ const verificationRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("universal_verify_button").setLabel("Verify Me").setStyle(ButtonStyle.Success)
 );
 
+function createVerificationEmbed() {
+    return new EmbedBuilder().setTitle("🚨 Verification Required").setDescription("👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন").setColor("Blue").setImage(COVER_IMAGES.VERIFY).setTimestamp();
+}
+
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
@@ -459,6 +464,18 @@ client.on("interactionCreate", async (interaction) => {
             await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
             
             db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
+            const logs = getWelcomeLogs();
+            const userLog = logs[interaction.user.id];
+            const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
+            if (userLog && welcomeChannel) {
+                try {
+                    const msg = await welcomeChannel.messages.fetch(userLog.messageId);
+                    if (msg) {
+                        const embed = buildDynamicWelcomeEmbed(interaction.member, "verified", false, Date.now());
+                        await msg.edit({ embeds: [embed] });
+                    }
+                } catch (e) {}
+            }
         } catch (err) { console.error(err); }
         return;
     }
@@ -468,11 +485,11 @@ client.on("interactionCreate", async (interaction) => {
         return handleOneTimeKeyGeneration(interaction);
     }
 
-    // 🛒 3. Panel Buy Selection Menu Handler (Lock Type Step Added)
+    // 🛒 3. Buy Panel Menu Handler -> HWID vs Digital Lock Option Selection
     if (interaction.isStringSelectMenu() && (interaction.customId === "buy_panel_menu" || interaction.customId === "select_buy_option")) {
         const selectedCategory = interaction.values[0];
-        
-        // লক টাইপ চয়েস ড্রপডাউন মেনু
+
+        // লক টাইপ সিলেকশন ড্রপডাউন
         const lockTypeMenu = new StringSelectMenuBuilder()
             .setCustomId(`select_lock_type_${selectedCategory}`)
             .setPlaceholder("🔐 সিকিউরিটি / লক টাইপ সিলেক্ট করুন")
@@ -497,13 +514,13 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription(`আপনি **${selectedCategory.toUpperCase()}** প্যাকেজটি নির্বাচন করেছেন।\n\nঅনুগ্রহ করে নিচে থেকে আপনার সুবিধাজনক **Lock Type** সিলেক্ট করুন:`)
             .addFields(
                 { name: "🔒 HWID Lock", value: "আপনার অ্যাকাউন্ট বা কিটি একটি নির্দিষ্ট পিসির সাথে আবদ্ধ থাকবে।" },
-                { name: "🔑 Digital Lock (Active Session)", value: "আপনি যেকোনো পিসিতে লগইন করতে পারবেন। প্যানেলটি যে পিসিতে খোলা থাকবে শুধুমাত্র সেটিই একটিভ থাকবে। প্যানেল বন্ধ করলে সাথে সাথেই অন্য পিসিতে লগইন করতে পারবেন।" }
+                { name: "🔑 Digital Lock (Active Session)", value: "আপনি যেকোনো পিসিতে লগইন করতে পারবেন। প্যানেল বন্ধ করলে সাথে সাথেই অন্য পিসিতে লগইন করতে পারবেন।" }
             );
 
         return interaction.reply({ embeds: [lockEmbed], components: [row], flags: [MessageFlags.Ephemeral] });
     }
 
-    // 🔒 4. Lock Type Selected -> Modal Open Handler
+    // 🔒 4. Lock Type Selected -> Modal Popup Open
     if (interaction.isStringSelectMenu() && interaction.customId.startsWith("select_lock_type_")) {
         const category = interaction.customId.replace("select_lock_type_", "");
         const lockType = interaction.values[0];
@@ -537,7 +554,7 @@ client.on("interactionCreate", async (interaction) => {
     // 📥 5. Payment Modal Submission Handler
     if (interaction.isModalSubmit() && interaction.customId.startsWith("buy_panel_modal_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        
+
         const parts = interaction.customId.split("_");
         const category = parts[3];
         const lockType = parts[4] || "digital";
@@ -545,7 +562,6 @@ client.on("interactionCreate", async (interaction) => {
         const trxId = interaction.fields.getTextInputValue("trx_id").trim();
         const senderNumber = interaction.fields.getTextInputValue("sender_number").trim();
 
-        // ফায়ারবেসে কাস্টমারের অ্যাকাউন্ট ও অর্ডার ডাটা সেভ
         const orderId = "ORD-" + Date.now().toString().slice(-6);
         const orderRef = db.ref(`orders/${orderId}`);
 
@@ -574,7 +590,7 @@ client.on("interactionCreate", async (interaction) => {
         });
 
         const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, ticketChannel, "pending", null, null, trxId, lockType);
-        
+
         const trackingChan = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
         let trackingMsg;
         if (trackingChan) {
@@ -596,6 +612,13 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.editReply({ embeds: [successEmbed] });
     }
 });
+
+function setBotPresence() {
+    client.user.setPresence({
+        activities: [{ name: "Security & Verification", type: ActivityType.Watching }],
+        status: "online"
+    });
+}
 
 function startBot() {
     if (!TOKEN) {
