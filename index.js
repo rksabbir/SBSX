@@ -5,6 +5,7 @@
 const express = require("express");
 const fs = require("fs");
 const admin = require("firebase-admin"); // Firebase Admin SDK
+const crypto = require("crypto");
 
 const {
     Client,
@@ -52,6 +53,98 @@ const app = express();
 app.get("/", (req, res) => { res.send("Bot is running!"); });
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
+
+// ================================
+// 🛡️ PHASE 1 - CORE SAFE HELPER UTILITIES
+// ================================
+
+/**
+ * Clean & Sanitize user inputs for Firebase Path keys
+ */
+function sanitizeFirebaseKey(key) {
+    if (!key || typeof key !== "string") return "invalid_key";
+    return key.replace(/[.#$\/[\]]/g, "_").trim();
+}
+
+/**
+ * Firebase Atomic Transaction Wrapper
+ */
+async function runAtomicTransaction(path, updateFunction) {
+    const ref = db.ref(path);
+    try {
+        const result = await ref.transaction(updateFunction);
+        return result;
+    } catch (err) {
+        console.error(`❌ Atomic Transaction Error at path [${path}]:`, err);
+        return { committed: false, snapshot: null, error: err };
+    }
+}
+
+/**
+ * Unique Safe Atomic Counter Generator (e.g., ORD-000001)
+ */
+async function getNextAtomicCounter(counterName, prefix = "ORD") {
+    const safeCounterName = sanitizeFirebaseKey(counterName);
+    const counterRef = db.ref(`counters/${safeCounterName}`);
+    
+    const result = await counterRef.transaction((currentValue) => {
+        return (currentValue || 0) + 1;
+    });
+
+    if (result.committed) {
+        const num = result.snapshot.val();
+        const padded = String(num).padStart(6, "0");
+        return `${prefix}-${padded}`;
+    } else {
+        const fallback = Date.now().toString().slice(-6);
+        return `${prefix}-${fallback}`;
+    }
+}
+
+/**
+ * Idempotency Check & Set Protection
+ */
+async function checkAndSetIdempotency(requestId, ttlSeconds = 10) {
+    const safeReqId = sanitizeFirebaseKey(requestId);
+    const reqRef = db.ref(`idempotency/${safeReqId}`);
+    const now = Date.now();
+    const expiry = now + (ttlSeconds * 1000);
+
+    const result = await reqRef.transaction((currentData) => {
+        if (currentData && currentData.expiresAt > now) {
+            return; // Abort: already processed / processing
+        }
+        return { status: "PROCESSING", createdAt: now, expiresAt: expiry };
+    });
+
+    return result.committed;
+}
+
+/**
+ * Audit Logger Helper Engine (Sanitizes Sensitive Fields)
+ */
+async function safeLogAudit(action, actorId, targetId, details = {}) {
+    try {
+        const logId = db.ref("audit_logs").push().key;
+        const cleanDetails = { ...details };
+        
+        // Ensure sensitive parameters are never printed into Audit Logs
+        delete cleanDetails.password;
+        delete cleanDetails.customPass;
+        delete cleanDetails.token;
+        delete cleanDetails.secret;
+
+        await db.ref(`audit_logs/${logId}`).set({
+            action: String(action),
+            actorId: String(actorId),
+            targetId: String(targetId || "N/A"),
+            details: cleanDetails,
+            timestamp: Date.now()
+        });
+    } catch (err) {
+        console.error("❌ safeLogAudit Error:", err);
+    }
+}
 
 // ================================
 // 📱 Dynamic Realtime Settings (Firebase Sync)
@@ -177,12 +270,13 @@ const client = new Client({
 process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
 process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
 
-// 🎲 ইউনিক কুপন কোড জেনারেটর (e.g., AK-A1B2C3)
+// 🎲 ইউনিক কুপন কোড জেনারেটর (Crypto Safe Multi-byte execution)
 function generateUniqueCouponCode() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let code = "AK-";
+    const bytes = crypto.randomBytes(6);
     for (let i = 0; i < 6; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
+        code += chars.charAt(bytes[i] % chars.length);
     }
     return code;
 }
@@ -190,7 +284,8 @@ function generateUniqueCouponCode() {
 // 📌 Firebase থেকে ডেটা নিয়ে আসার ফাংশন
 async function fetchFirebasePanelData(panelType) {
     try {
-        const snapshot = await db.ref(`panels/${panelType}`).once("value");
+        const safePanelType = sanitizeFirebaseKey(panelType);
+        const snapshot = await db.ref(`panels/${safePanelType}`).once("value");
         const data = snapshot.val() || {};
         
         const customDescription = data.description || null;
@@ -242,11 +337,13 @@ async function handleOneTimeKeyGeneration(interaction) {
         });
     }
 
-    const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
+    const randomBytesStr = crypto.randomBytes(3).toString("hex").toUpperCase();
+    const randomKey = `KEY-${randomBytesStr}-${Date.now().toString().slice(-4)}`;
     const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
     const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
     
-    const keyRef = db.ref(`keys/${randomKey}`);
+    const safeKey = sanitizeFirebaseKey(randomKey);
+    const keyRef = db.ref(`keys/${safeKey}`);
     
     await keyRef.set({
         used: false,
@@ -257,6 +354,8 @@ async function handleOneTimeKeyGeneration(interaction) {
         serverName: serverName,
         createdAt: Date.now()
     });
+
+    await safeLogAudit("ONE_TIME_KEY_GENERATE", interaction.user.id, null, { key: randomKey });
 
     const keyEmbed = new EmbedBuilder()
         .setTitle("🔑 1TIME KEY Generated Successfully!")
@@ -378,7 +477,8 @@ client.on("messageCreate", async (message) => {
     }
 
     // 🎮 Activity Leveling (Firebase XP System)
-    const xpRef = db.ref(`leveling/${userId}`);
+    const safeUserId = sanitizeFirebaseKey(userId);
+    const xpRef = db.ref(`leveling/${safeUserId}`);
     xpRef.transaction((current) => {
         if (!current) {
             return { xp: 10, level: 1 };
@@ -459,6 +559,7 @@ client.on("interactionCreate", async (interaction) => {
             await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
             
             db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
+            await safeLogAudit("USER_VERIFIED", interaction.user.id, interaction.user.id);
 
             const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
             if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(interaction.member, "verified", userLog.isOffline, Date.now()); await msg.edit({ embeds: [updatedEmbed] }); } } catch (e) {} }
@@ -473,13 +574,18 @@ client.on("interactionCreate", async (interaction) => {
 
     // Giveaway বাটনে ক্লিক ট্র্যাকিং
     if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
-        const gwId = interaction.customId.split("_")[2];
-        const participantRef = db.ref(`giveaways/${gwId}/participants/${interaction.user.id}`);
-        const snap = await participantRef.once("value");
-        if (snap.exists()) {
+        const gwId = sanitizeFirebaseKey(interaction.customId.split("_")[2]);
+        const safeUserId = sanitizeFirebaseKey(interaction.user.id);
+        const participantRef = db.ref(`giveaways/${gwId}/participants/${safeUserId}`);
+        
+        const result = await participantRef.transaction((currentData) => {
+            if (currentData) return; // Already entered
+            return interaction.user.tag;
+        });
+
+        if (!result.committed) {
             return interaction.reply({ content: "❌ আপনি অলরেডি এই গিভঅ্যাওয়েতে জয়েন করেছেন!", flags: [MessageFlags.Ephemeral] });
         }
-        await participantRef.set(interaction.user.tag);
         
         const fullSnap = await db.ref(`giveaways/${gwId}`).once("value");
         const gwData = fullSnap.val();
@@ -562,10 +668,18 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
+        const idempotencyKey = `coupon_${interaction.user.id}_${interaction.customId}`;
+        const isFirst = await checkAndSetIdempotency(idempotencyKey, 10);
+        if (!isFirst) {
+            return interaction.editReply("⚠️ **Duplicate Submission!** আপনার অনুরোধটি ইতোমধ্যে প্রসেস করা হচ্ছে।");
+        }
+
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-        const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
+        const rawCoupon = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
+        const couponEntered = sanitizeFirebaseKey(rawCoupon);
         const userId = interaction.user.id;
+        const safeUserId = sanitizeFirebaseKey(userId);
         
         let basePrice = PACKAGE_PRICES[category] || 510;
         let finalPrice = basePrice;
@@ -601,7 +715,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (finalPrice <= 0) {
-            await db.ref(`pending_payments/${userId}_${category}`).set({
+            await db.ref(`pending_payments/${safeUserId}_${category}`).set({
                 targetPrice: 0,
                 basePrice: basePrice,
                 appliedCoupon: appliedCouponCode,
@@ -639,7 +753,7 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply({ embeds: [zeroPriceEmbed], components: [row] });
         }
 
-        await db.ref(`pending_payments/${userId}_${category}`).set({
+        await db.ref(`pending_payments/${safeUserId}_${category}`).set({
             targetPrice: finalPrice,
             basePrice: basePrice,
             appliedCoupon: appliedCouponCode,
@@ -694,23 +808,41 @@ client.on("interactionCreate", async (interaction) => {
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
         
-        const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
+        const rawTxnInput = interaction.fields.getTextInputValue("txn_id_input").trim();
+        const txnId = sanitizeFirebaseKey(rawTxnInput);
         const userId = interaction.user.id;
-        const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
+        const safeUserId = sanitizeFirebaseKey(userId);
+
+        const idempotencyKey = `txn_${userId}_${txnId}`;
+        const isFirstRequest = await checkAndSetIdempotency(idempotencyKey, 10);
+        if (!isFirstRequest) {
+            return interaction.editReply("⚠️ **Duplicate Submission!** আপনার পেমেন্ট ভেরিফিকেশন অনুরোধটি ইতোমধ্যে প্রক্রিয়াধীন আছে।");
+        }
+
+        const sessionRef = db.ref(`pending_payments/${safeUserId}_${category}`);
 
         try {
             const txnRef = db.ref(`transactions/${txnId}`);
-            const txnSnap = await txnRef.once("value");
+            
+            // 🔒 PHASE 2 - ATOMIC TRANSACTION LIFECYCLE MUTEX (AVAILABLE -> CLAIMING -> CLAIMED)
+            const claimResult = await txnRef.transaction((currentData) => {
+                if (currentData === null) return currentData; 
+                if (currentData.used === true || currentData.status === "CLAIMED" || currentData.status === "CLAIMING") {
+                    return; // Abort atomic update
+                }
+                return {
+                    ...currentData,
+                    status: "CLAIMING",
+                    claimedBy: userId,
+                    claimedAt: Date.now()
+                };
+            });
 
-            if (!txnSnap.exists()) {
-                return interaction.editReply("❌ **অকার্যকর Transaction ID!** সিস্টেমের ডেটাবেজে এই Transaction ID পাওয়া যায়নি।");
+            if (!claimResult.committed || !claimResult.snapshot.exists()) {
+                return interaction.editReply("❌ **অকার্যকর বা ব্যবহৃত Transaction ID!** এই Transaction ID-টি সিস্টেমে নেই বা ইতোমধ্যে ব্যবহার করা হয়েছে।");
             }
 
-            const txnData = txnSnap.val();
-
-            if (txnData.used === true) {
-                return interaction.editReply("🚫 **Duplicate Transaction!** এই Transaction ID-টি ইতোমধ্যে ব্যবহার করা হয়েছে।");
-            }
+            const txnData = claimResult.snapshot.val();
 
             const sessionSnap = await sessionRef.once("value");
             let sessionData = sessionSnap.val() || {};
@@ -720,6 +852,8 @@ client.on("interactionCreate", async (interaction) => {
             let usedTxns = sessionData.usedTxns || [];
 
             if (usedTxns.includes(txnId)) {
+                // Revert lifecycle claim status safely
+                await txnRef.update({ status: "AVAILABLE", claimedBy: null, claimedAt: null });
                 return interaction.editReply("⚠️ এই Transaction ID-টি আপনি ইতোমধ্যে সাবমিট করেছেন।");
             }
 
@@ -727,8 +861,10 @@ client.on("interactionCreate", async (interaction) => {
             currentTotalPaid += newTxnAmount;
             usedTxns.push(txnId);
 
+            // Finalize Atomic State Lock
             await txnRef.update({
                 used: true,
+                status: "CLAIMED",
                 usedBy: userId,
                 usedAt: Date.now()
             });
@@ -740,6 +876,8 @@ client.on("interactionCreate", async (interaction) => {
                 usedTxns: usedTxns,
                 lastUpdated: Date.now()
             });
+
+            await safeLogAudit("PAYMENT_TXN_CLAIMED", userId, txnId, { amount: newTxnAmount, category });
 
             if (currentTotalPaid < targetPrice) {
                 const remainingDue = targetPrice - currentTotalPaid;
@@ -791,11 +929,13 @@ client.on("interactionCreate", async (interaction) => {
                     status: "active"
                 };
 
-                await db.ref(`coupons/${createdCouponCode}`).set(newCouponObj);
+                const safeCouponCode = sanitizeFirebaseKey(createdCouponCode);
+                await db.ref(`coupons/${safeCouponCode}`).set(newCouponObj);
             }
 
             if (sessionData.appliedCoupon) {
-                await db.ref(`coupons/${sessionData.appliedCoupon}`).update({
+                const safeAppCoupon = sanitizeFirebaseKey(sessionData.appliedCoupon);
+                await db.ref(`coupons/${safeAppCoupon}`).update({
                     status: "used",
                     usedBy: userId,
                     usedAt: Date.now()
@@ -869,16 +1009,25 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_create_account_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
 
+        const idempotencyKey = `create_acc_${interaction.user.id}_${interaction.customId}`;
+        const isFirst = await checkAndSetIdempotency(idempotencyKey, 15);
+        if (!isFirst) {
+            return interaction.editReply("⚠️ **Duplicate Submission!** আপনার অ্যাকাউন্ট তৈরি করার অনুরোধটি ইতোমধ্যে প্রসেস হচ্ছে।");
+        }
+
         const rawCategory = interaction.customId.split("_")[3].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
 
-        const customUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
+        const rawUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
+        const customUser = sanitizeFirebaseKey(rawUser);
         const customPass = interaction.fields.getTextInputValue("custom_password").trim();
         const userId = interaction.user.id;
+        const safeUserId = sanitizeFirebaseKey(userId);
+        
         const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
         const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
 
-        const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
+        const sessionRef = db.ref(`pending_payments/${safeUserId}_${category}`);
         const sessionSnap = await sessionRef.once("value");
         const sessionData = sessionSnap.val();
 
@@ -921,6 +1070,30 @@ client.on("interactionCreate", async (interaction) => {
                 expiresAt: expiryTimestamp,  
                 status: "active"             
             });
+
+            // Persistent Orders Database Tracking Insertion
+            const orderId = await getNextAtomicCounter("orders", "ORD");
+            await db.ref(`orders/${orderId}`).set({
+                orderId: orderId,
+                userId: userId,
+                category: category,
+                package: packageName,
+                basePrice: sessionData.basePrice || sessionData.targetPrice,
+                discount: sessionData.appliedDiscount || 0,
+                finalPrice: sessionData.targetPrice,
+                payment: {
+                    requiredAmount: sessionData.targetPrice,
+                    totalPaid: sessionData.totalPaid,
+                    status: "PAID",
+                    transactions: sessionData.usedTxns || []
+                },
+                status: "APPROVED",
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                paidAt: Date.now()
+            });
+
+            await safeLogAudit("ACCOUNT_CREATED", userId, customUser, { orderId: orderId, package: packageName });
 
             const randomCode = Math.floor(1000 + Math.random() * 9000);
             let supportRoleId = ROLES.SUPPORT_CUSTOMER;
@@ -1014,9 +1187,11 @@ client.on("interactionCreate", async (interaction) => {
         const parts = interaction.customId.split("_");
         const type = parts[1]; const category = parts.slice(2).join("_");
 
-        const randomCode = Math.floor(1000 + Math.random() * 9000);
+        const prefixCode = type.toUpperCase().slice(0, 3);
+        const sequenceId = await getNextAtomicCounter(`counter_${type}`, prefixCode);
+
         let supportRoleId = ROLES.SUPPORT_TICKET_REPORT;
-        let channelPrefix = `${type}-${randomCode}`;
+        let channelPrefix = `${type}-${sequenceId.toLowerCase()}`;
 
         if (type === "customer") supportRoleId = ROLES.SUPPORT_CUSTOMER;
 
@@ -1035,7 +1210,7 @@ client.on("interactionCreate", async (interaction) => {
             permissionOverwrites
         });
 
-        const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")}`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
+        const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")} [${sequenceId}]`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
         const actionRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Secondary),
@@ -1068,7 +1243,9 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
         await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
 
-        db.ref(`staff_duty/${interaction.user.id}/claims`).transaction(c => (c || 0) + 1);
+        const safeStaffId = sanitizeFirebaseKey(interaction.user.id);
+        db.ref(`staff_duty/${safeStaffId}/claims`).transaction(c => (c || 0) + 1);
+        await safeLogAudit("TICKET_CLAIMED", interaction.user.id, interaction.channel.id);
         return;
     }
 
@@ -1088,6 +1265,7 @@ client.on("interactionCreate", async (interaction) => {
         } catch (tErr) {}
 
         await interaction.reply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
+        await safeLogAudit("TICKET_CLOSED", interaction.user.id, interaction.channel.id);
 
         setTimeout(async () => {
             await interaction.channel.delete().catch(() => {});
@@ -1266,6 +1444,7 @@ async function processUpdateQueue() {
     for (const [userId, data] of queueEntries) {
         try {
             const { newAvatar, newUsername } = data;
+            const safeUserId = sanitizeFirebaseKey(userId);
 
             const usersRef = db.ref("users");
             const snapshot = await usersRef.orderByChild("discordId").equalTo(userId).once("value");
