@@ -166,7 +166,6 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessageReactions
         GatewayIntentBits.GuildMessageReactions,
         GatewayIntentBits.GuildPresences // 👈 এটি যুক্ত করা হলো
     ],
@@ -191,7 +190,7 @@ async function fetchFirebasePanelData(panelType) {
     try {
         const snapshot = await db.ref(`panels/${panelType}`).once("value");
         const data = snapshot.val() || {};
-
+        
         const customDescription = data.description || null;
         const customImage = data.image || null;
 
@@ -244,9 +243,9 @@ async function handleOneTimeKeyGeneration(interaction) {
     const randomKey = "KEY-" + Math.random().toString(36).substring(2, 8).toUpperCase() + "-" + Date.now().toString().slice(-4);
     const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
     const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
-
+    
     const keyRef = db.ref(`keys/${randomKey}`);
-
+    
     // 🟢 ফিক্সড: C++ অ্যাপের সঠিক রিডের জন্য avatarUrl ও অন্যান্য ফিল্ড নিশ্চিত করা হয়েছে
     await keyRef.set({
         used: false,
@@ -312,7 +311,7 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
 // ================================
 function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
     let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
-
+    
     if (status === "approved") { color = "#00FF00"; statusString = `✅ APPROVED & RUNNING (কাজ চলছে)`; }
     else if (status === "closed") { color = "#FF0000"; statusString = "🔒 CLOSED (টিকিট বন্ধ করা হয়েছে)"; }
     else if (status === "banned") { color = "#2F3136"; statusString = `🚫 FAKE TICKET BAN (${reason || "ফানি টিকিট"})`; }
@@ -338,7 +337,7 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
         }
         embed.addFields({ name: "💳 Transaction ID", value: `\`${maskedTxnId}\``, inline: true });
     }
-
+    
     if (staff) embed.addFields({ name: "🛟 দায়িত্বপ্রাপ্ত স্টাফ", value: `${staff}`, inline: true });
     return embed;
 }
@@ -361,7 +360,7 @@ client.on("messageDelete", async (message) => {
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
-
+    
     const userId = message.author.id; 
     let triggerAutomod = false; 
     let reason = "";
@@ -389,7 +388,7 @@ client.on("messageCreate", async (message) => {
             if (nextXp >= neededXp) {
                 nextXp -= neededXp;
                 nextLevel += 1;
-
+                
                 message.channel.send(`🎉 অভিনন্দন <@${userId}>! আপনি লেভেল **${nextLevel}** এ উন্নীত হয়েছেন।`).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
                 message.member.roles.add(LEVEL_ROLE_ID).catch(() => {});
             }
@@ -457,7 +456,7 @@ client.on("interactionCreate", async (interaction) => {
             if (!role) return interaction.editReply("❌ Role not found!");
             if (interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
             await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
-
+            
             db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
 
             const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
@@ -480,11 +479,11 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.reply({ content: "❌ আপনি অলরেডি এই গিভঅ্যাওয়েতে জয়েন করেছেন!", flags: [MessageFlags.Ephemeral] });
         }
         await participantRef.set(interaction.user.tag);
-
+        
         const fullSnap = await db.ref(`giveaways/${gwId}`).once("value");
         const gwData = fullSnap.val();
         const count = Object.keys(gwData.participants || {}).length;
-
+        
         const embed = EmbedBuilder.from(interaction.message.embeds[0]);
         embed.setFields({ name: "🎉 এন্ট্রি সংখ্যা", value: `\`${count}\` জন মেম্বার`, inline: true });
         await interaction.message.edit({ embeds: [embed] });
@@ -495,7 +494,7 @@ client.on("interactionCreate", async (interaction) => {
     // এডভান্সড টিকেট রেটিং ফিডব্যাক সিস্টেম
     if (interaction.isButton() && interaction.customId.startsWith("star_rating_")) {
         const [, , stars, staffId] = interaction.customId.split("_");
-
+        
         const modal = new ModalBuilder().setCustomId(`modal_feedback_${stars}_${staffId}`).setTitle("📝 Ticket Support Feedback");
         const commentInput = new TextInputBuilder().setCustomId("feedback_comment").setLabel("আপনার মূল্যবান মতামতটি লিখুন (ঐচ্ছিক)").setStyle(TextInputStyle.Paragraph).setRequired(false);
         modal.addComponents(new ActionRowBuilder().addComponents(commentInput));
@@ -506,7 +505,7 @@ client.on("interactionCreate", async (interaction) => {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const [, , stars, staffId] = interaction.customId.split("_");
         const comment = interaction.fields.getTextInputValue("feedback_comment") || "কোনো কমেন্ট নেই।";
-
+        
         const reviewChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
         if (reviewChannel) {
             const reviewEmbed = new EmbedBuilder()
@@ -561,12 +560,12 @@ client.on("interactionCreate", async (interaction) => {
     // Modal Submit & Payment Handlers
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-
+        
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
         const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
         const userId = interaction.user.id;
-
+        
         let basePrice = PACKAGE_PRICES[category] || 510;
         let finalPrice = basePrice;
         let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
@@ -672,7 +671,7 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-
+        
         const modal = new ModalBuilder()
             .setCustomId(`modal_txn_${category}`)
             .setTitle("🔒 Submit Transaction ID");
@@ -690,10 +689,10 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_txn_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-
+        
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-
+        
         const txnId = interaction.fields.getTextInputValue("txn_id_input").trim();
         const userId = interaction.user.id;
         const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
@@ -1065,7 +1064,7 @@ client.on("interactionCreate", async (interaction) => {
         const type = interaction.customId.split("_")[1];
         let reqRole = (type === "customer" || type === "order") ? ROLES.SUPPORT_CUSTOMER : ROLES.SUPPORT_TICKET_REPORT;
         if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(ROLES.ADMIN)) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
-
+        
         await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
         await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
 
@@ -1246,7 +1245,7 @@ client.on("messageCreate", async (message) => {
     if (message.content === "!customer" && message.channelId === CHANNELS.CUSTOMER_PANEL) return message.channel.send(await getDynamicCustomerPanel());
     if (message.content === "!payment" && message.channelId === CHANNELS.PAYMENT_PANEL) return message.channel.send(await getDynamicPaymentPanel());
     if (message.content === "!orderguide" && message.channelId === ORDER_GUIDE_CHANNEL_ID) return message.channel.send(await getDynamicOrderGuidePanel());
-
+    
     // ১-টাইম কী জেনারেটর প্যানেল পাঠানোর কমান্ড (!onetime key বা !onetimekey)
     if (message.content === "!onetime key" || message.content === "!onetimekey") {
         if (ONETIME_KEY_CHANNEL_IDS.includes(message.channelId) || isServerAdmin) {
