@@ -4,6 +4,9 @@ require("dotenv").config();
 // ================================
 
 const express = require("express");
+const http = require("http");
+const { spawn } = require("child_process");
+const { WebSocketServer, WebSocket } = require("ws");
 const fs = require("fs");
 const crypto = require("crypto");
 const { promisify } = require("util");
@@ -39,6 +42,7 @@ const {
     isAssignableDiscordRole
 } = require("./discord-admin-policy");
 const { sanitizeVoiceSpeech, formatVerifiedAnnouncement, formatRoleChangeAnnouncement, formatLevelUpAnnouncement } = require("./discord-bengali-automation");
+const { normalizeRecorderMimeType, extractOneTimeTicketFromProtocols, packRemotePcmFrame } = require("./live-voice-protocol");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -781,14 +785,151 @@ app.post("/api/admin/discord/role", async (req, res) => {
     } catch (err) { return adminApiError(res, err); }
 });
 
-// Admin-only voice speaker controls. Bengali speech text is sent to an external TTS provider.
+// Admin-only voice controls. Live microphone PCM is kept in memory and never written to disk.
 const adminVoiceSessions = new Map();
+const liveVoiceTickets = new Map();
+const LIVE_VOICE_TICKET_TTL_MS = 30_000;
+const LIVE_VOICE_MAX_BYTES_PER_SECOND = 300 * 1024;
+const LIVE_VOICE_MAX_DURATION_MS = Math.min(2 * 60 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_VOICE_MAX_DURATION_MS || 30 * 60 * 1000)));
 function getVoiceDependencies() {
     if (!process.env.FFMPEG_PATH) {
         try { process.env.FFMPEG_PATH = require("ffmpeg-static") || ""; } catch (_) {}
     }
-    return { voice: require("@discordjs/voice"), googleTts: require("google-tts-api") };
+    return { voice: require("@discordjs/voice"), googleTts: require("google-tts-api"), OpusScript: require("opusscript") };
 }
+function sendLiveVoiceJson(socket, data) {
+    if (socket && socket.readyState === WebSocket.OPEN) {
+        try { socket.send(JSON.stringify(data)); } catch (_) {}
+    }
+}
+function stopLiveMicProcess(session) {
+    const proc = session?.liveProcess;
+    if (!proc) return;
+    session.liveProcess = null;
+    try { if (proc.stdin && !proc.stdin.destroyed && !proc.stdin.writableEnded) proc.stdin.end(); } catch (_) {}
+    const killer = setTimeout(() => { if (proc.exitCode === null && !proc.killed) { try { proc.kill("SIGKILL"); } catch (_) {} } }, 2500);
+    if (typeof killer.unref === "function") killer.unref();
+}
+function closeLiveVoiceSocket(session, code = 1001, reason = "voice session ended") {
+    if (!session) return;
+    const socket = session.liveSocket;
+    session.liveSocket = null;
+    stopLiveMicProcess(session);
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+        try { socket.close(code, String(reason).slice(0, 120)); } catch (_) { try { socket.terminate(); } catch (_) {} }
+    }
+}
+async function beginLiveMicStream(socket, session, actorUid, mimeType) {
+    const format = normalizeRecorderMimeType(mimeType);
+    if (!format) throw Object.assign(new Error("Unsupported microphone recording format"), { apiError: "live_voice_unsupported_audio", statusCode: 415 });
+    const { voice } = getVoiceDependencies();
+    if (!session?.connection || session.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Voice connection is not ready"), { apiError: "voice_not_connected", statusCode: 409 });
+    if (session.liveProcess || session.player?.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player is busy"), { apiError: "voice_busy", statusCode: 409 });
+    if (session.liveStartedAt && Date.now() - session.liveStartedAt > LIVE_VOICE_MAX_DURATION_MS) throw Object.assign(new Error("Live voice duration limit reached"), { apiError: "live_voice_duration_limit", statusCode: 429 });
+    let ffmpegPath = String(process.env.FFMPEG_PATH || "");
+    if (!ffmpegPath) { try { ffmpegPath = require("ffmpeg-static") || ""; } catch (_) {} }
+    if (!ffmpegPath) throw Object.assign(new Error("FFmpeg is not installed"), { apiError: "ffmpeg_unavailable", statusCode: 503 });
+    const proc = spawn(ffmpegPath, [
+        "-hide_banner", "-loglevel", "error", "-probesize", "32768", "-analyzeduration", "150000",
+        "-f", format, "-i", "pipe:0", "-vn", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-f", "s16le", "pipe:1"
+    ], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+    session.liveProcess = proc;
+    session.liveStartedAt = Date.now();
+    session.liveActorUid = actorUid;
+    const resource = voice.createAudioResource(proc.stdout, { inputType: voice.StreamType.Raw, metadata: { adminUid: actorUid, source: "live-admin-microphone" } });
+    session.liveResource = resource;
+    proc.once("spawn", () => {
+        if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket) { stopLiveMicProcess(session); return; }
+        try {
+            session.player.play(resource);
+            sendLiveVoiceJson(socket, { type: "mic-ready", sampleRate: 48000, channels: 2 });
+        } catch (_) {
+            sendLiveVoiceJson(socket, { type: "error", error: "live_voice_player_failed" });
+            stopLiveMicProcess(session);
+        }
+    });
+    proc.once("error", () => {
+        if (session.liveProcess === proc) session.liveProcess = null;
+        sendLiveVoiceJson(socket, { type: "error", error: "ffmpeg_unavailable" });
+    });
+    proc.once("close", code => {
+        const endedUnexpectedly = socket.liveStarted && session.liveSocket === socket;
+        if (session.liveProcess === proc) session.liveProcess = null;
+        if (session.liveResource === resource) session.liveResource = null;
+        if (endedUnexpectedly) {
+            socket.liveStarted = false;
+            if (socket.readyState === WebSocket.OPEN) sendLiveVoiceJson(socket, { type: "error", error: code === 0 ? "live_voice_stream_ended" : "live_voice_transcode_failed" });
+        } else if (code && code !== 0 && socket.readyState === WebSocket.OPEN) {
+            sendLiveVoiceJson(socket, { type: "error", error: "live_voice_transcode_failed" });
+        }
+    });
+}
+function startLiveDiscordAudioRelay(socket, session, guild) {
+    const { voice, OpusScript } = getVoiceDependencies();
+    const subscriptions = new Map();
+    const connection = session.connection;
+    const onSpeakingStart = userId => {
+        if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket || subscriptions.has(userId)) return;
+        const member = guild.members.cache.get(userId);
+        if (!member || member.user?.bot || userId === client.user?.id) return;
+        let stream;
+        let decoder;
+        try {
+            stream = connection.receiver.subscribe(userId, { end: { behavior: voice.EndBehaviorType.AfterSilence, duration: 650 } });
+            decoder = new OpusScript(48000, 2, OpusScript.Application.VOIP);
+        } catch (err) {
+            console.error("Live voice receive setup failed:", err.message);
+            return;
+        }
+        subscriptions.set(userId, { stream, decoder });
+        sendLiveVoiceJson(socket, { type: "remote-speaking", userId, username: String(member.displayName || member.user.username || "Discord member").slice(0, 80) });
+        stream.on("data", packet => {
+            if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket || socket.bufferedAmount > 768 * 1024) return;
+            try {
+                const pcm = decoder.decode(Buffer.from(packet));
+                if (pcm?.length) socket.send(packRemotePcmFrame(userId, Buffer.from(pcm)), { binary: true });
+            } catch (_) { /* An undecodable Discord frame is dropped; no audio is persisted. */ }
+        });
+        let streamCleaned = false;
+        const cleanup = () => {
+            if (streamCleaned) return;
+            streamCleaned = true;
+            if (subscriptions.get(userId)?.stream === stream) subscriptions.delete(userId);
+            try { if (typeof decoder.delete === "function") decoder.delete(); } catch (_) {}
+            sendLiveVoiceJson(socket, { type: "remote-stopped", userId });
+        };
+        stream.once("end", cleanup);
+        stream.once("close", cleanup);
+        stream.once("error", cleanup);
+    };
+    connection.receiver.speaking.on("start", onSpeakingStart);
+    return () => {
+        connection.receiver.speaking.off("start", onSpeakingStart);
+        for (const [userId, item] of subscriptions) {
+            try { item.stream.destroy(); } catch (_) {}
+            try { if (typeof item.decoder.delete === "function") item.decoder.delete(); } catch (_) {}
+            sendLiveVoiceJson(socket, { type: "remote-stopped", userId });
+        }
+        subscriptions.clear();
+    };
+}
+app.post("/api/admin/discord/voice/live-ticket", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-live-ticket", 5, 60_000)) return;
+        const guild = await getReadyAdminGuild();
+        const session = adminVoiceSessions.get(guild.id);
+        const { voice } = getVoiceDependencies();
+        if (!session?.connection || session.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Bot is not connected to voice"), { statusCode: 409, apiError: "voice_not_connected" });
+        if (session.liveSocket && [WebSocket.OPEN, WebSocket.CONNECTING, WebSocket.CLOSING].includes(session.liveSocket.readyState)) throw Object.assign(new Error("A live browser voice session is already active"), { statusCode: 409, apiError: "live_voice_already_active" });
+        const now = Date.now();
+        for (const [key, value] of liveVoiceTickets) if (value.expiresAt <= now) liveVoiceTickets.delete(key);
+        const ticket = crypto.randomBytes(32).toString("base64url");
+        const digest = crypto.createHash("sha256").update(ticket).digest("hex");
+        liveVoiceTickets.set(digest, { uid: actor.uid, guildId: guild.id, expiresAt: now + LIVE_VOICE_TICKET_TTL_MS });
+        return res.json({ ok: true, ticket, expiresInMs: LIVE_VOICE_TICKET_TTL_MS, channelName: session.channelName || "voice channel" });
+    } catch (err) { return adminApiError(res, err, "live_voice_ticket_failed"); }
+});
 app.get("/api/admin/discord/voice/channels", async (req, res) => {
     try {
         await verifyAdminApiRequest(req);
@@ -823,12 +964,17 @@ app.post("/api/admin/discord/voice/join", async (req, res) => {
         const { voice } = getVoiceDependencies();
         const existing = adminVoiceSessions.get(guild.id);
         if (existing?.connection && existing.channelId === channel.id && existing.connection.state.status === voice.VoiceConnectionStatus.Ready) return res.json({ok:true,connected:true,channelId,channelName:channel.name,alreadyConnected:true});
-        if (existing?.connection) existing.connection.destroy();
+        if (existing?.connection) { closeLiveVoiceSocket(existing, 1001, "voice channel changed"); existing.player?.stop(true); existing.connection.destroy(); }
         const player = voice.createAudioPlayer({behaviors:{noSubscriber:voice.NoSubscriberBehavior.Pause}});
         player.on("error", err => console.error("Admin voice player error:", err.message));
         const connection = voice.joinVoiceChannel({channelId:channel.id,guildId:guild.id,adapterCreator:guild.voiceAdapterCreator,selfDeaf:false,selfMute:false});
         connection.on("stateChange", (_oldState, newState) => {
-            if (newState.status === voice.VoiceConnectionStatus.Destroyed && adminVoiceSessions.get(guild.id)?.connection === connection) adminVoiceSessions.delete(guild.id);
+            if (newState.status === voice.VoiceConnectionStatus.Destroyed && adminVoiceSessions.get(guild.id)?.connection === connection) {
+                const ended = adminVoiceSessions.get(guild.id);
+                closeLiveVoiceSocket(ended, 1001, "Discord voice connection ended");
+                ended?.player?.stop(true);
+                adminVoiceSessions.delete(guild.id);
+            }
         });
         connection.subscribe(player);
         try { await voice.entersState(connection,voice.VoiceConnectionStatus.Ready,15000); }
@@ -845,6 +991,7 @@ app.post("/api/admin/discord/voice/leave", async (req, res) => {
         const guild = await getReadyAdminGuild();
         const current = adminVoiceSessions.get(guild.id);
         if (!current?.connection) return res.json({ok:true,connected:false,alreadyDisconnected:true});
+        closeLiveVoiceSocket(current, 1001, "Admin ended voice session");
         current.player?.stop(true); current.connection.destroy(); adminVoiceSessions.delete(guild.id);
         await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_leave",timestamp:Date.now(),summary:`Bot left voice channel ${current.channelName || current.channelId}`}).catch(err=>console.error("Voice audit write failed:",err.message));
         return res.json({ok:true,connected:false});
@@ -1187,7 +1334,104 @@ app.post("/api/cpp/log", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
+const server = http.createServer(app);
+const liveVoiceWss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 256 * 1024,
+    perMessageDeflate: false,
+    handleProtocols: protocols => protocols.has("rkbackles-live-v1") ? "rkbackles-live-v1" : false
+});
+server.on("upgrade", (request, socket, head) => {
+    let parsed;
+    try { parsed = new URL(request.url || "/", "http://localhost"); } catch (_) { socket.destroy(); return; }
+    if (parsed.pathname !== "/api/admin/discord/voice/live") { socket.destroy(); return; }
+    const origin = String(request.headers.origin || "");
+    if (!origin || !ADMIN_PANEL_ORIGINS.has(origin)) { socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
+    const ticket = extractOneTimeTicketFromProtocols(request.headers["sec-websocket-protocol"]);
+    if (!ticket) { socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
+    const digest = crypto.createHash("sha256").update(ticket).digest("hex");
+    const record = liveVoiceTickets.get(digest);
+    if (!record || record.expiresAt <= Date.now()) { liveVoiceTickets.delete(digest); socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
+    liveVoiceTickets.delete(digest); // consume before any further checks so rejected tickets cannot be replayed
+    const session = adminVoiceSessions.get(record.guildId);
+    if (!session?.connection || (session.liveSocket && [WebSocket.OPEN, WebSocket.CONNECTING, WebSocket.CLOSING].includes(session.liveSocket.readyState))) {
+        socket.write("HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n"); socket.destroy(); return;
+    }
+    liveVoiceWss.handleUpgrade(request, socket, head, ws => liveVoiceWss.emit("connection", ws, request, record, session));
+});
+liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
+    const guild = client.guilds.cache.get(ticketRecord.guildId);
+    if (!guild || session.connection?.state?.status !== require("@discordjs/voice").VoiceConnectionStatus.Ready) {
+        socket.close(1011, "Discord voice connection unavailable");
+        return;
+    }
+    session.liveSocket = socket;
+    socket.liveStarted = false;
+    socket.liveByteWindowStartedAt = Date.now();
+    socket.liveBytesInWindow = 0;
+    const stopReceiver = startLiveDiscordAudioRelay(socket, session, guild);
+    const maxTimer = setTimeout(() => {
+        sendLiveVoiceJson(socket, { type: "error", error: "live_voice_duration_limit" });
+        closeLiveVoiceSocket(session, 1000, "live voice maximum duration reached");
+    }, LIVE_VOICE_MAX_DURATION_MS);
+    if (typeof maxTimer.unref === "function") maxTimer.unref();
+    const authCheckTimer = setInterval(async () => {
+        try {
+            const authSnapshot = await db.ref(`adminUids/${ticketRecord.uid}`).once("value");
+            if (authSnapshot.val() !== true) closeLiveVoiceSocket(session, 1008, "Admin permission revoked");
+        } catch (_) {
+            // Fail closed on repeated auth lookup errors rather than leaving a microphone open indefinitely.
+            closeLiveVoiceSocket(session, 1011, "Admin authorization could not be revalidated");
+        }
+    }, 30_000);
+    if (typeof authCheckTimer.unref === "function") authCheckTimer.unref();
+    socket.on("message", (data, isBinary) => {
+        if (isBinary) {
+            if (!socket.liveStarted || session.liveSocket !== socket || !session.liveProcess || !session.liveProcess.stdin || session.liveProcess.stdin.destroyed) {
+                sendLiveVoiceJson(socket, { type: "error", error: "live_voice_mic_not_started" });
+                return;
+            }
+            const now = Date.now();
+            if (now - socket.liveByteWindowStartedAt >= 1000) { socket.liveByteWindowStartedAt = now; socket.liveBytesInWindow = 0; }
+            socket.liveBytesInWindow += data.length;
+            if (socket.liveBytesInWindow > LIVE_VOICE_MAX_BYTES_PER_SECOND) { socket.close(1008, "microphone bitrate limit exceeded"); return; }
+            try { session.liveProcess.stdin.write(data); }
+            catch (_) { socket.close(1011, "microphone stream failed"); }
+            return;
+        }
+        let payload;
+        try { payload = JSON.parse(Buffer.from(data).toString("utf8")); } catch (_) { socket.close(1003, "invalid control message"); return; }
+        if (!payload || typeof payload !== "object") { socket.close(1003, "invalid control message"); return; }
+        if (payload.type === "start") {
+            if (socket.liveStarted) { sendLiveVoiceJson(socket, { type: "error", error: "live_voice_already_started" }); return; }
+            socket.liveStarted = true;
+            beginLiveMicStream(socket, session, ticketRecord.uid, payload.mimeType).catch(err => {
+                socket.liveStarted = false;
+                sendLiveVoiceJson(socket, { type: "error", error: String(err.apiError || "live_voice_start_failed") });
+            });
+        } else if (payload.type === "stop") {
+            socket.liveStarted = false;
+            stopLiveMicProcess(session);
+        } else {
+            socket.close(1003, "unknown control message");
+        }
+    });
+    socket.once("close", () => {
+        clearTimeout(maxTimer);
+        clearInterval(authCheckTimer);
+        stopReceiver();
+        if (session.liveSocket === socket) session.liveSocket = null;
+        stopLiveMicProcess(session);
+        if (session.liveResource && session.player?.state?.resource === session.liveResource) session.player.stop(true);
+        session.liveResource = null;
+        session.liveStartedAt = 0;
+        db.ref("auditLog").push({ adminUid: ticketRecord.uid, actionType: "discord_live_voice_end", timestamp: Date.now(), summary: `Admin live microphone session ended in ${session.channelName || session.channelId}; audio not stored` }).catch(err => console.error("Live voice audit write failed:", err.message));
+    });
+    socket.once("error", err => console.error("Admin live voice websocket error:", err.message));
+    db.ref("auditLog").push({ adminUid: ticketRecord.uid, actionType: "discord_live_voice_start", timestamp: Date.now(), summary: `Admin opened two-way live voice relay in ${session.channelName || session.channelId}; audio not stored` }).catch(err => console.error("Live voice audit write failed:", err.message));
+    sendLiveVoiceJson(socket, { type: "connected", channelName: session.channelName || "voice channel", audioIsNotStored: true });
+});
+server.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
 // ================================
 // 📱 Dynamic Realtime Settings (Firebase Sync)
