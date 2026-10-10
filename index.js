@@ -535,6 +535,66 @@ app.post("/api/admin/accounts/lookup", async (req, res) => {
         return res.json({ ok: true, account: safe });
     } catch (err) { return res.status(Number(err.statusCode) || 401).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "unauthorized" }); }
 });
+app.post("/api/admin/accounts/create", async (req, res) => {
+    if (!checkCppRateLimit(req, res, "admin-account-create", 20, 10 * 60 * 1000)) return;
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const username = String(req.body?.username || "").trim().toLowerCase();
+        const password = String(req.body?.password || "");
+        const hwid = String(req.body?.hwid || "").trim();
+        const lockType = String(req.body?.lockType || "HWID").toUpperCase();
+        const status = String(req.body?.status || "active").toLowerCase();
+        const category = String(req.body?.category || "weekly").toLowerCase();
+        const days = Number(req.body?.expiresDays);
+        if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ ok: false, error: "invalid_username" });
+        if (password.length < 8 || password.length > 128) return res.status(400).json({ ok: false, error: "invalid_password" });
+        if (hwid && !/^[A-Za-z0-9_-]{1,80}$/.test(hwid)) return res.status(400).json({ ok: false, error: "invalid_hwid" });
+        if (!["HWID", "ONLINE"].includes(lockType) || !["active", "suspended", "disabled"].includes(status)) return res.status(400).json({ ok: false, error: "invalid_settings" });
+        if (!["weekly", "monthly", "2_months"].includes(category)) return res.status(400).json({ ok: false, error: "invalid_package" });
+        if (!Number.isInteger(days) || days < 1 || days > 3650) return res.status(400).json({ ok: false, error: "invalid_expiry" });
+
+        const now = Date.now();
+        const packageName = category === "weekly" ? "Weekly" : category === "monthly" ? "Monthly" : "2 Months";
+        const passwordHash = await hashCppPassword(password);
+        const account = {
+            username,
+            passwordHash,
+            category,
+            package: packageName,
+            status,
+            lockType,
+            createdAt: now,
+            expiresAt: now + days * 24 * 60 * 60 * 1000,
+            paidAmount: 0,
+            usedTxns: [],
+            adminCreated: true,
+            source: "admin_panel",
+            createdByAdmin: actor.uid,
+            adminUpdatedAt: now,
+            adminUpdatedBy: actor.uid,
+            activeSessionId: null,
+            isLoggedIn: false,
+            lastActive: 0
+        };
+        if (hwid) account.hwid = hwid;
+
+        // Atomic creation: never overwrite an existing record, even if it is expired.
+        const userRef = db.ref(`users/${username}`);
+        const claim = await userRef.transaction(current => current ? undefined : account, undefined, false);
+        if (!claim.committed) return res.status(409).json({ ok: false, error: "username_conflict" });
+        await db.ref("auditLog").push({
+            adminUid: actor.uid,
+            actionType: "cpp_account_create",
+            timestamp: now,
+            summary: `Created admin-managed C++ account ${username}; package=${packageName}; days=${days}; lock=${lockType}; status=${status}; hwid=${hwid ? "set" : "unbound"}; payment=not_recorded`
+        });
+        return res.status(201).json({ ok: true, username, package: packageName, category, status, lockType, expiresAt: account.expiresAt, paidAmount: 0, source: "admin_panel" });
+    } catch (err) {
+        console.error("Admin account create failed:", err.message);
+        return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : Number(err.statusCode) === 401 ? "unauthorized" : "create_failed" });
+    }
+});
+
 app.post("/api/admin/accounts/update", async (req, res) => {
     try {
         const actor = await verifyAdminApiRequest(req);
