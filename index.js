@@ -8,6 +8,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { promisify } = require("util");
 const os = require("os");
+const { Readable } = require("stream");
 const admin = require("firebase-admin"); // Firebase Admin SDK
 
 const {
@@ -21,6 +22,7 @@ const {
     ActivityType,
     StringSelectMenuBuilder,
     PermissionFlagsBits,
+    ChannelType,
     Routes,
     MessageFlags,
     ModalBuilder,
@@ -36,6 +38,7 @@ const {
     isProtectedDiscordTarget,
     isAssignableDiscordRole
 } = require("./discord-admin-policy");
+const { sanitizeVoiceSpeech, formatVerifiedAnnouncement, formatRoleChangeAnnouncement, formatLevelUpAnnouncement } = require("./discord-bengali-automation");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -778,6 +781,96 @@ app.post("/api/admin/discord/role", async (req, res) => {
     } catch (err) { return adminApiError(res, err); }
 });
 
+// Admin-only voice speaker controls. Bengali speech text is sent to an external TTS provider.
+const adminVoiceSessions = new Map();
+function getVoiceDependencies() {
+    if (!process.env.FFMPEG_PATH) {
+        try { process.env.FFMPEG_PATH = require("ffmpeg-static") || ""; } catch (_) {}
+    }
+    return { voice: require("@discordjs/voice"), googleTts: require("google-tts-api") };
+}
+app.get("/api/admin/discord/voice/channels", async (req, res) => {
+    try {
+        await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-voice-channels", 20, 60000)) return;
+        const guild = await getReadyAdminGuild();
+        const botMember = getBotGuildMember(guild);
+        const channels = [...guild.channels.cache.values()].filter(channel => channel.type === ChannelType.GuildVoice).map(channel => {
+            const permissions = channel.permissionsFor(botMember);
+            const missingPermissions = [];
+            for (const [name, flag] of [["ViewChannel",PermissionFlagsBits.ViewChannel],["Connect",PermissionFlagsBits.Connect],["Speak",PermissionFlagsBits.Speak]]) {
+                if (!permissions?.has(flag)) missingPermissions.push(name);
+            }
+            return { id: channel.id, name: String(channel.name || "Voice channel").slice(0,100), userLimit: channel.userLimit || 0,
+                canJoin: missingPermissions.length === 0, missingPermissions };
+        }).sort((a,b) => a.name.localeCompare(b.name));
+        const active = adminVoiceSessions.get(guild.id);
+        return res.json({ ok: true, channels, connected: Boolean(active?.connection), channelId: active?.channelId || "",
+            speaking: Boolean(active?.player && active.player.state.status !== "idle") });
+    } catch (err) { return adminApiError(res, err, "voice_directory_failed"); }
+});
+app.post("/api/admin/discord/voice/join", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-voice-join", 6, 60000)) return;
+        const channelId = validateDiscordSnowflake(req.body?.channelId);
+        const guild = await getReadyAdminGuild();
+        const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+        if (!channel || channel.guildId !== guild.id || channel.type !== ChannelType.GuildVoice) throw Object.assign(new Error("Voice channel not found"), {statusCode:404,apiError:"voice_channel_not_found"});
+        const botMember = getBotGuildMember(guild);
+        const permissions = channel.permissionsFor(botMember);
+        if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.Connect) || !permissions?.has(PermissionFlagsBits.Speak)) throw Object.assign(new Error("Bot needs View Channel, Connect and Speak"), {statusCode:403,apiError:"missing_voice_permission"});
+        const { voice } = getVoiceDependencies();
+        const existing = adminVoiceSessions.get(guild.id);
+        if (existing?.connection && existing.channelId === channel.id && existing.connection.state.status === voice.VoiceConnectionStatus.Ready) return res.json({ok:true,connected:true,channelId,channelName:channel.name,alreadyConnected:true});
+        if (existing?.connection) existing.connection.destroy();
+        const player = voice.createAudioPlayer({behaviors:{noSubscriber:voice.NoSubscriberBehavior.Pause}});
+        player.on("error", err => console.error("Admin voice player error:", err.message));
+        const connection = voice.joinVoiceChannel({channelId:channel.id,guildId:guild.id,adapterCreator:guild.voiceAdapterCreator,selfDeaf:false,selfMute:false});
+        connection.on("stateChange", (_oldState, newState) => {
+            if (newState.status === voice.VoiceConnectionStatus.Destroyed && adminVoiceSessions.get(guild.id)?.connection === connection) adminVoiceSessions.delete(guild.id);
+        });
+        connection.subscribe(player);
+        try { await voice.entersState(connection,voice.VoiceConnectionStatus.Ready,15000); }
+        catch (_) { connection.destroy(); throw Object.assign(new Error("Voice connection timed out"), {statusCode:502,apiError:"voice_connection_failed"}); }
+        adminVoiceSessions.set(guild.id,{connection,player,channelId:channel.id,channelName:channel.name,connectedAt:Date.now(),connectedBy:actor.uid});
+        await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_join",timestamp:Date.now(),summary:`Bot joined voice channel ${channel.name} (${channel.id})`}).catch(err=>console.error("Voice audit write failed:",err.message));
+        return res.json({ok:true,connected:true,channelId,channelName:channel.name});
+    } catch (err) { return adminApiError(res,err,"voice_join_failed"); }
+});
+app.post("/api/admin/discord/voice/leave", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req,res,"admin-discord-voice-leave",10,60000)) return;
+        const guild = await getReadyAdminGuild();
+        const current = adminVoiceSessions.get(guild.id);
+        if (!current?.connection) return res.json({ok:true,connected:false,alreadyDisconnected:true});
+        current.player?.stop(true); current.connection.destroy(); adminVoiceSessions.delete(guild.id);
+        await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_leave",timestamp:Date.now(),summary:`Bot left voice channel ${current.channelName || current.channelId}`}).catch(err=>console.error("Voice audit write failed:",err.message));
+        return res.json({ok:true,connected:false});
+    } catch (err) { return adminApiError(res,err,"voice_leave_failed"); }
+});
+app.post("/api/admin/discord/voice/speak", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req,res,"admin-discord-voice-speak",8,60000)) return;
+        const text = sanitizeVoiceSpeech(req.body?.text);
+        if (!text) throw Object.assign(new Error("Speech text is empty"),{statusCode:400,apiError:"invalid_speech_text"});
+        const guild = await getReadyAdminGuild();
+        const session = adminVoiceSessions.get(guild.id);
+        if (!session?.connection || !session?.player) throw Object.assign(new Error("Bot not in voice"),{statusCode:409,apiError:"voice_not_connected"});
+        const { voice, googleTts } = getVoiceDependencies();
+        if (session.player.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player busy"),{statusCode:409,apiError:"voice_busy"});
+        const audioUrl = googleTts.getAudioUrl(text,{lang:"bn",slow:false,host:"https://translate.google.com"});
+        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.8"}});
+        if (!response.ok || !response.body) throw Object.assign(new Error("TTS provider failed"),{statusCode:502,apiError:"tts_provider_failed"});
+        const resource = voice.createAudioResource(Readable.fromWeb(response.body),{inputType:voice.StreamType.Arbitrary,metadata:{adminUid:actor.uid,queuedAt:Date.now()}});
+        session.player.play(resource);
+        await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_speak",timestamp:Date.now(),summary:`Admin requested Bengali voice message (${text.length} characters) in ${session.channelName || session.channelId}`}).catch(err=>console.error("Voice audit write failed:",err.message));
+        return res.json({ok:true,speaking:true,characterCount:text.length,channelName:session.channelName || session.channelId});
+    } catch (err) { return adminApiError(res,err,"voice_speak_failed"); }
+});
+
 app.post("/api/admin/accounts/lookup", async (req, res) => {
     try {
         const actor = await verifyAdminApiRequest(req);
@@ -1264,7 +1357,8 @@ function getConfiguredChannelId(key) {
         paymentPanel: CHANNELS.PAYMENT_PANEL, giveaway: GIVEAWAY_CHANNEL_ID,
         weeklyReport: WEEKLY_REPORT_CHANNEL_ID, voiceStats: STATS_VC_CHANNEL_ID,
         transcriptLog: TRANSCRIPT_LOG_CHANNEL_ID, staffAdminLog: STAFF_ADMIN_LOG_ID,
-        embedNotice: EMBED_NOTICE_CHANNEL_ID, socialFeed: SOCIAL_FEED_CHANNEL_ID
+        embedNotice: EMBED_NOTICE_CHANNEL_ID, socialFeed: SOCIAL_FEED_CHANNEL_ID,
+        announcement: String(process.env.ANNOUNCEMENT_CHANNEL_ID || "").trim()
     };
     return fallback[key] || "";
 }
@@ -1286,6 +1380,37 @@ function getConfiguredRoleId(key) {
     };
     return fallback[key] || "";
 }
+// Automatic Bengali announcements use an explicit channel configured in Automation & routing.
+const suppressedDiscordRoleAnnouncements = new Map();
+const recentDiscordRoleAnnouncements = new Map();
+function discordRoleAnnouncementKey(memberId, roleId, action) { return `${memberId}:${roleId}:${action}`; }
+function suppressNextDiscordRoleAnnouncement(memberId, roleId, action, ttlMs = 10000) {
+    suppressedDiscordRoleAnnouncements.set(discordRoleAnnouncementKey(memberId, roleId, action), Date.now() + ttlMs);
+}
+function consumeSuppressedDiscordRoleAnnouncement(memberId, roleId, action) {
+    const key = discordRoleAnnouncementKey(memberId, roleId, action);
+    const expiresAt = suppressedDiscordRoleAnnouncements.get(key) || 0;
+    suppressedDiscordRoleAnnouncements.delete(key);
+    return expiresAt >= Date.now();
+}
+async function sendBengaliAnnouncement(guild, content, userId = "") {
+    const channelId = getConfiguredChannelId("announcement");
+    if (!channelId || !guild) return { sent: false, reason: "announcement_channel_not_configured" };
+    let channel = guild.channels.cache.get(channelId);
+    if (!channel) channel = await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel?.isTextBased?.() || typeof channel.send !== "function") {
+        console.warn("Bengali announcement skipped: configured channel is missing or not text-based.");
+        return { sent: false, reason: "invalid_announcement_channel" };
+    }
+    try {
+        await channel.send({ content: String(content || "").slice(0, 1900), allowedMentions: userId ? { parse: [], users: [String(userId)] } : { parse: [] } });
+        return { sent: true };
+    } catch (err) {
+        console.error("Bengali announcement send failed:", err.message);
+        return { sent: false, reason: "send_failed" };
+    }
+}
+
 function getAutomodSettings() {
     const cfg = ADMIN_BOT_CONFIG.automod || {};
     const num = (value, fallback, min, max) => Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : fallback));
@@ -1684,7 +1809,13 @@ async function awardMessageXp(message) {
         await message.channel.send(formatBotMessage("levelUp", "🎉 অভিনন্দন <@{user}>! আপনি লেভেল **{level}** এ উন্নীত হয়েছেন।", { user: message.author.id, level: finalLevel }).slice(0, 1900))
             .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
             .catch(() => {});
-        await message.member.roles.add(getConfiguredRoleId("level")).catch(() => {});
+        await sendBengaliAnnouncement(message.guild, formatLevelUpAnnouncement(message.author.id, finalLevel), message.author.id);
+        const levelRoleId = getConfiguredRoleId("level");
+        const levelRole = levelRoleId ? message.guild.roles.cache.get(levelRoleId) : null;
+        if (levelRole && !message.member.roles.cache.has(levelRole.id)) {
+            suppressNextDiscordRoleAnnouncement(message.author.id, levelRole.id, "add");
+            await message.member.roles.add(levelRole).catch(err => console.error("Level reward role assignment failed:", err.message));
+        }
     }
 }
 
@@ -1859,8 +1990,10 @@ client.on("interactionCreate", async (interaction) => {
             const role = interaction.guild.roles.cache.get(getConfiguredRoleId("verified"));
             if (!role) return interaction.editReply("❌ Role not found!");
             if (interaction.member.roles.cache.has(getConfiguredRoleId("verified"))) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
-            await interaction.member.roles.add(role); await interaction.editReply(formatBotMessage("verificationSuccess", "✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!", { user: interaction.user.id }).slice(0, 1800));
-            
+            suppressNextDiscordRoleAnnouncement(interaction.user.id, role.id, "add");
+            await interaction.member.roles.add(role);
+            await interaction.editReply(formatBotMessage("verificationSuccess", "✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!", { user: interaction.user.id }).slice(0, 1800));
+            await sendBengaliAnnouncement(interaction.guild, formatVerifiedAnnouncement(interaction.user.id), interaction.user.id);
             db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
 
             const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(getConfiguredChannelId("welcome"));
@@ -3457,6 +3590,34 @@ async function countWeeklyMessage(message) {
     } catch (err) { console.error("Weekly message stats update failed:", err.message); }
 }
 client.on("messageCreate", message => { countWeeklyMessage(message).catch(err => console.error(err.message)); });
+
+client.on("guildMemberUpdate", async (oldMember, newMember) => {
+    try {
+        if (!newMember.guild || newMember.guild.id !== ALLOWED_GUILD_ID || newMember.user?.bot) return;
+        const before = oldMember.roles.cache, after = newMember.roles.cache, changes = [];
+        for (const [roleId, role] of after) {
+            if (roleId === newMember.guild.id || before.has(roleId)) continue;
+            if (consumeSuppressedDiscordRoleAnnouncement(newMember.id, roleId, "add")) continue;
+            changes.push({roleId,roleName:role.name,action:"add"});
+        }
+        for (const [roleId, role] of before) {
+            if (roleId === newMember.guild.id || after.has(roleId)) continue;
+            if (consumeSuppressedDiscordRoleAnnouncement(newMember.id, roleId, "remove")) continue;
+            changes.push({roleId,roleName:role.name,action:"remove"});
+        }
+        for (const change of changes.slice(0,10)) {
+            const key = discordRoleAnnouncementKey(newMember.id,change.roleId,change.action), now = Date.now();
+            if (now - (recentDiscordRoleAnnouncements.get(key)||0) < 8000) continue;
+            recentDiscordRoleAnnouncements.set(key,now);
+            await sendBengaliAnnouncement(newMember.guild,formatRoleChangeAnnouncement({memberId:newMember.id,displayName:newMember.displayName||newMember.user.username,roleName:change.roleName,action:change.action}),newMember.id);
+        }
+        if (suppressedDiscordRoleAnnouncements.size > 1000 || recentDiscordRoleAnnouncements.size > 2000) {
+            for (const [key, expiry] of suppressedDiscordRoleAnnouncements) if (expiry < Date.now()) suppressedDiscordRoleAnnouncements.delete(key);
+            const cutoff=Date.now()-60000;
+            for (const [key, seenAt] of recentDiscordRoleAnnouncements) if (seenAt < cutoff) recentDiscordRoleAnnouncements.delete(key);
+        }
+    } catch (err) { console.error("Automatic Bengali role announcement failed:",err.message); }
+});
 
 client.on("voiceStateUpdate", async (oldState, newState) => {
     if (!isFeatureEnabled("voiceStatsEnabled")) return;
