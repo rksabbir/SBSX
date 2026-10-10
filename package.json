@@ -1,12 +1,13 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.0",
+  "version": "1.5.2",
   "private": true,
   "description": "discord.js v14 bot with Firebase admin configuration, advanced checkout, and secure C++ custom-auth/SSE bridge",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js"
+    "check": "node --check index.js",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=20"

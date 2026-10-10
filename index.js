@@ -183,9 +183,10 @@ const READER_AUTO_WATCH_TIMEOUT_MS = Math.max(60_000, Number(process.env.READER_
 const readerWatchLocks = new Set();
 const readerCheckLocks = new Set();
 const readerCheckLastAt = new Map();
-const paymentTxnLocks = new Set();
-const paymentTxnLastAt = new Map();
-const PAYMENT_TXN_SUBMIT_COOLDOWN_MS = Math.max(10_000, Number(process.env.PAYMENT_TXN_SUBMIT_COOLDOWN_MS || 15_000));
+// Firebase-backed lease prevents a crashed/stale checkout from remaining "checking_reader" forever.
+const READER_CHECK_LEASE_MS = Math.max(30_000, Number(process.env.READER_CHECK_LEASE_MS || 60_000));
+
+const { claimReaderCheckState, finishReaderCheckState, releaseReaderCheckState } = require("./reader-check-state");
 
 async function getPaymentReaderState() {
     if (TRUSTED_READER_UIDS.size === 0) {
@@ -1767,40 +1768,58 @@ client.on("interactionCreate", async (interaction) => {
         const provider = match[1];
         const category = getNormalizedCategory(match[2]);
         const lockKey = `${interaction.user.id}:${category}`;
+
+        // Acknowledge first. Duplicate button presses should not edit the message being handled by the owner.
         if (readerCheckLocks.has(lockKey)) {
             await interaction.deferUpdate().catch(() => {});
             return;
         }
         readerCheckLocks.add(lockKey);
-        readerCheckLastAt.set(interaction.user.id, Date.now());
+        const checkToken = crypto.randomUUID();
+        const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
+        let ownsCheck = false;
         try {
-            await interaction.update({ content: "🟠 **ONLINE CHECK চলছে...** Reader online না হওয়া পর্যন্ত পেমেন্ট নম্বর দেখানো হবে না।", embeds: [], components: [] });
-            const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
+            await interaction.deferUpdate();
             const sessionSnap = await sessionRef.once("value");
             const session = sessionSnap.val();
-            if (!session || session.status !== "select_provider") {
-                return interaction.editReply({ content: "⚠️ এই checkout আর নির্বাচনযোগ্য নয়। আবার package নির্বাচন করুন।", embeds: [], components: [] });
+            if (!session) {
+                return interaction.editReply({ content: "⚠️ এই checkout পাওয়া যায়নি। Shop থেকে আবার package নির্বাচন করুন।", embeds: [], components: [] });
             }
-            const selected = await sessionRef.transaction(current => {
-                if (!current || current.status !== "select_provider") return;
-                return { ...current, provider, status: "checking_reader", providerSelectedAt: Date.now(), lastReaderCheckAt: Date.now() };
-            }, undefined, false);
+
+            const claimTime = Date.now();
+            const selected = await sessionRef.transaction(current =>
+                claimReaderCheckState(current, provider, checkToken, claimTime), undefined, false);
             if (!selected.committed) {
-                return interaction.editReply({ content: "⚠️ এই checkout-এ আরেকটি payment check চলছে। একই বাটন বারবার চাপার প্রয়োজন নেই।", embeds: [], components: [] });
+                // Another handler owns the current lease, or checkout moved to another state. Do not clobber its UI.
+                return;
             }
+            ownsCheck = true;
+            readerCheckLastAt.set(interaction.user.id, claimTime);
+            await interaction.editReply({ content: "🟠 **ONLINE CHECK চলছে...** Reader online না হওয়া পর্যন্ত পেমেন্ট নম্বর দেখানো হবে না।", embeds: [], components: [] });
+
             const readerState = await getPaymentReaderState();
             const paymentNumber = getPaymentNumber(provider);
-            const updatedSession = { ...(selected.snapshot.val() || {}), provider };
-            if (readerState.online && paymentNumber) {
-                updatedSession.status = "awaiting_txn";
-                updatedSession.readerCheckedAt = Date.now();
-                updatedSession.readerDeviceUid = readerState.deviceUid;
-                updatedSession.numberShownAt = Date.now();
-            } else {
-                updatedSession.status = readerState.online ? "number_not_configured" : "reader_offline";
-                updatedSession.lastReaderCheckAt = Date.now();
-            }
-            await sessionRef.update(updatedSession);
+            const now = Date.now();
+            const patch = readerState.online && paymentNumber
+                ? {
+                    status: "awaiting_txn",
+                    readerCheckedAt: now,
+                    readerDeviceUid: readerState.deviceUid,
+                    numberShownAt: now,
+                    lastReaderCheckAt: now
+                }
+                : {
+                    status: readerState.online ? "number_not_configured" : "reader_offline",
+                    lastReaderCheckAt: now
+                };
+
+            // Only the interaction holding the token can publish its result. This prevents an expired worker
+            // from overwriting a newer check after a process restart or stale lease recovery.
+            const finished = await sessionRef.transaction(current =>
+                finishReaderCheckState(current, checkToken, patch), undefined, false);
+            if (!finished.committed) return;
+            ownsCheck = false; // The lease was atomically removed by finishReaderCheckState.
+            const updatedSession = finished.snapshot.val() || {};
             const reply = await interaction.editReply({ content: "", ...buildPaymentPage(category, updatedSession, readerState, paymentNumber) });
             if (!readerState.online && TRUSTED_READER_UIDS.size > 0) {
                 void autoWatchReaderOnline(interaction, category, sessionRef, provider);
@@ -1808,7 +1827,34 @@ client.on("interactionCreate", async (interaction) => {
             return reply;
         } catch (err) {
             console.error("Payment provider selection/online check failed:", err);
-            return interaction.editReply({ content: "❌ ONLINE CHECK করা যায়নি। নম্বর নিরাপত্তার জন্য লুকানো রাখা হয়েছে। পরে আবার check করুন।", embeds: [], components: [] }).catch(() => {});
+            let released = false;
+            let releaseResultKnown = false;
+            if (ownsCheck) {
+                try {
+                    const result = await sessionRef.transaction(current =>
+                        releaseReaderCheckState(current, checkToken), undefined, false);
+                    released = result.committed;
+                    releaseResultKnown = true;
+                } catch (releaseErr) {
+                    console.error("Unable to release failed Reader check lease:", releaseErr.message);
+                }
+            }
+            // If this worker no longer owns the lease, never overwrite the newer worker's Discord message.
+            if (ownsCheck && releaseResultKnown && !released) return;
+            if (released) {
+                const retryRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`pay_provider_bkash_${category}`).setLabel("bKash আবার চেষ্টা করুন").setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId(`pay_provider_nagad_${category}`).setLabel("Nagad আবার চেষ্টা করুন").setStyle(ButtonStyle.Success)
+                );
+                return interaction.editReply({
+                    content: "❌ ONLINE CHECK ব্যর্থ হয়েছে। নিরাপত্তার জন্য payment number দেখানো হয়নি। নিচের বাটন দিয়ে আবার চেষ্টা করুন।",
+                    embeds: [], components: [retryRow]
+                }).catch(() => {});
+            }
+            return interaction.editReply({
+                content: "❌ ONLINE CHECK ব্যর্থ হয়েছে। Payment number লুকানো আছে। Shop থেকে package নির্বাচন করে আবার চেষ্টা করুন।",
+                embeds: [], components: []
+            }).catch(() => {});
         } finally {
             readerCheckLocks.delete(lockKey);
         }
