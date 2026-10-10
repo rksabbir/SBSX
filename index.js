@@ -1,11 +1,14 @@
+require("dotenv").config();
 // ================================
 // 🚀 PART 1 - Setup + Express + Firebase + Config
 // ================================
 
 const express = require("express");
 const fs = require("fs");
-const admin = require("firebase-admin"); // Firebase Admin SDK
 const crypto = require("crypto");
+const { promisify } = require("util");
+const os = require("os");
+const admin = require("firebase-admin"); // Firebase Admin SDK
 
 const {
     Client,
@@ -24,10 +27,10 @@ const {
     TextInputStyle
 } = require("discord.js");
 
-// html-transcripts import
+// html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
 
-// Load logic from Render Environment Variable or local json
+// রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
 try {
     if (process.env.FIREBASE_CONFIG) {
@@ -36,145 +39,723 @@ try {
         serviceAccount = require("./firebase-service-account.json");
     }
 } catch (e) {
-    console.error("❌ Firebase Config Load Error:", e);
+    console.error("❌ Firebase config load failed. Set FIREBASE_CONFIG or add firebase-service-account.json.", e.message);
+    process.exit(1);
 }
 
-// Firebase Initialization
-const firebaseURL = process.env.FIREBASE_DB_URL || "YOUR_FIREBASE_DATABASE_URL";
-if (!admin.apps.length) {
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-        databaseURL: firebaseURL
-    });
+const firebaseURL = process.env.FIREBASE_DB_URL;
+if (!serviceAccount || !firebaseURL || !/^https?:\/\//i.test(firebaseURL)) {
+    console.error("❌ Firebase configuration is incomplete. FIREBASE_CONFIG (or firebase-service-account.json) and a valid FIREBASE_DB_URL are required.");
+    process.exit(1);
 }
+
+// ফায়ারবেস ইনিশিয়ালাইজেশন
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: firebaseURL
+});
 const db = admin.database();
+const scryptAsync = promisify(crypto.scrypt);
+
+// C++ app account passwords are stored as scrypt hashes after first successful login.
+// Existing plaintext records are verified once and migrated automatically.
+async function hashCppPassword(password) {
+    const salt = crypto.randomBytes(16).toString("hex");
+    const derived = await scryptAsync(String(password), salt, 64);
+    return `scrypt$${salt}$${Buffer.from(derived).toString("hex")}`;
+}
+async function verifyCppPassword(password, record) {
+    if (record && typeof record.passwordHash === "string") {
+        const parts = record.passwordHash.split("$");
+        if (parts.length !== 3 || parts[0] !== "scrypt" || !/^[a-f0-9]{32}$/i.test(parts[1]) || !/^[a-f0-9]{128}$/i.test(parts[2])) return false;
+        const derived = Buffer.from(await scryptAsync(String(password), parts[1], 64));
+        const stored = Buffer.from(parts[2], "hex");
+        return derived.length === stored.length && crypto.timingSafeEqual(derived, stored);
+    }
+    if (!record || typeof record.password !== "string") return false;
+    const supplied = Buffer.from(String(password), "utf8");
+    const stored = Buffer.from(record.password, "utf8");
+    return supplied.length === stored.length && crypto.timingSafeEqual(supplied, stored);
+}
+function validRtdbSegment(value, max = 128) {
+    return typeof value === "string" && value.length > 0 && value.length <= max && !/[.#$\[\]\/]/.test(value);
+}
+function makeCppUid(kind, identifier) {
+    return `cpp${kind}_${crypto.createHash("sha256").update(`${kind}:${identifier}`).digest("hex").slice(0, 48)}`;
+}
+function getSafeCppProfile(uid, record, kind = "user", extra = {}) {
+    const source = record && typeof record === "object" ? record : {};
+    const now = Date.now();
+    const expiresAt = Number(source.expiresAt) || 0;
+    const rawStatus = String(source.status || (kind === "key" ? "VIP Access" : "active")).slice(0, 60);
+    const expired = kind === "user" && expiresAt > 0 && expiresAt <= now;
+    const active = !!record && (kind === "key"
+        ? source.revoked !== true && source.disabled !== true && !!source.used
+        : rawStatus.toLowerCase() === "active" && !expired);
+    return {
+        uid,
+        username: String(source.username || source.discordUsername || source.generatedBy || (kind === "key" ? "VIP User" : "")).slice(0, 80),
+        discordUsername: String(source.discordUsername || source.username || source.generatedBy || "").slice(0, 80),
+        status: !record ? "revoked" : (expired ? "expired" : (active ? rawStatus : (kind === "key" ? "revoked" : rawStatus))),
+        category: String(source.category || (kind === "key" ? "1-Time Key" : "Standard")).slice(0, 80),
+        avatarUrl: String(source.avatarUrl || "").slice(0, 1000),
+        serverName: String(source.serverName || "").slice(0, 160),
+        usedKey: String(extra.usedKey || "").slice(0, 100),
+        isDevKeyUser: kind === "key",
+        expiresAt,
+        remainingDays: expiresAt > now ? Math.floor((expiresAt - now) / 86400000) : 0,
+        accessRevoked: !active,
+        updatedAt: now
+    };
+}
+const cppProfileWatchers = new Map();
+const cppProfileFingerprints = new Map();
+async function publishCppProfile(uid, profile) {
+    const comparable = { ...profile };
+    delete comparable.updatedAt; // Heartbeats change lastActive, not the visible profile; avoid noisy writes/events.
+    const fingerprint = JSON.stringify(comparable);
+    if (cppProfileFingerprints.get(uid) === fingerprint) return;
+    const next = { ...profile, updatedAt: Date.now() };
+    await db.ref(`cppProfiles/${uid}`).set(next);
+    cppProfileFingerprints.set(uid, fingerprint);
+}
+function watchCppUserProfile(username, uid) {
+    const watcherKey = `user:${username}`;
+    if (cppProfileWatchers.has(watcherKey)) {
+        cppProfileWatchers.get(watcherKey).lastActiveAt = Date.now();
+        return;
+    }
+    const ref = db.ref(`users/${username}`);
+    const handler = snapshot => {
+        const record = snapshot.val();
+        const profile = getSafeCppProfile(uid, record, "user");
+        publishCppProfile(uid, profile).catch(err => console.error("C++ profile mirror failed:", err.message));
+    };
+    ref.on("value", handler, err => console.error("C++ profile mirror listener failed:", err.message));
+    cppProfileWatchers.set(watcherKey, { ref, handler, uid, lastActiveAt: Date.now() });
+}
+function watchCppKeyProfile(key, uid) {
+    const watcherKey = `key:${key}`;
+    if (cppProfileWatchers.has(watcherKey)) {
+        cppProfileWatchers.get(watcherKey).lastActiveAt = Date.now();
+        return;
+    }
+    const ref = db.ref(`keys/${key}`);
+    const handler = snapshot => {
+        const record = snapshot.val();
+        const profile = getSafeCppProfile(uid, record, "key", { usedKey: key });
+        publishCppProfile(uid, profile).catch(err => console.error("C++ key profile mirror failed:", err.message));
+    };
+    ref.on("value", handler, err => console.error("C++ key profile mirror listener failed:", err.message));
+    cppProfileWatchers.set(watcherKey, { ref, handler, uid, lastActiveAt: Date.now() });
+}
+function stopCppProfileWatcher(watcherKey, uid) {
+    const watcher = cppProfileWatchers.get(watcherKey);
+    if (watcher) {
+        watcher.ref.off("value", watcher.handler);
+        cppProfileWatchers.delete(watcherKey);
+    }
+    if (uid) {
+        cppProfileFingerprints.delete(uid);
+        db.ref(`cppProfiles/${uid}`).remove().catch(err => console.error("C++ profile cleanup failed:", err.message));
+    }
+}
+const cppProfilePruneTimer = setInterval(() => {
+    const staleBefore = Date.now() - 120000;
+    for (const [key, watcher] of cppProfileWatchers) {
+        if (watcher.lastActiveAt < staleBefore) {
+            watcher.ref.off("value", watcher.handler);
+            cppProfileWatchers.delete(key);
+        }
+    }
+}, 60000);
+if (typeof cppProfilePruneTimer.unref === "function") cppProfilePruneTimer.unref();
+
+// Only explicitly trusted Reader device UIDs can make checkout show a payment number.
+// Set PAYMENT_READER_UIDS on the bot server to the UID displayed by the Android Reader app.
+const TRUSTED_READER_UIDS = new Set(
+    String(process.env.PAYMENT_READER_UIDS || "").split(",").map(value => value.trim()).filter(Boolean)
+);
+const READER_ONLINE_WINDOW_MS = Math.max(30_000, Number(process.env.READER_ONLINE_WINDOW_MS || 90_000));
+const READER_RECHECK_COOLDOWN_MS = Math.max(10_000, Number(process.env.READER_RECHECK_COOLDOWN_MS || 15_000));
+const READER_AUTO_WATCH_INTERVAL_MS = Math.max(10_000, Number(process.env.READER_AUTO_WATCH_INTERVAL_MS || 15_000));
+const READER_AUTO_WATCH_TIMEOUT_MS = Math.max(60_000, Number(process.env.READER_AUTO_WATCH_TIMEOUT_MS || 300_000));
+const readerWatchLocks = new Set();
+const readerCheckLocks = new Set();
+const readerCheckLastAt = new Map();
+const paymentTxnLocks = new Set();
+const paymentTxnLastAt = new Map();
+const PAYMENT_TXN_SUBMIT_COOLDOWN_MS = Math.max(10_000, Number(process.env.PAYMENT_TXN_SUBMIT_COOLDOWN_MS || 15_000));
+
+async function getPaymentReaderState() {
+    if (TRUSTED_READER_UIDS.size === 0) {
+        return { online: false, lastSeenAt: null, deviceUid: null, reason: "trusted_reader_not_configured" };
+    }
+    try {
+        const checks = await Promise.all([...TRUSTED_READER_UIDS].map(async uid => {
+            const snap = await db.ref(`reader_devices/${uid}`).once("value");
+            return { uid, record: snap.val() || null };
+        }));
+        const now = Date.now();
+        const onlineRecords = checks.filter(({ record }) => {
+            const lastSeenAt = Number(record && record.lastSeenAt);
+            return !!record && record.enabled === true && Number.isFinite(lastSeenAt) &&
+                lastSeenAt > 0 && (now - lastSeenAt) >= 0 && (now - lastSeenAt) <= READER_ONLINE_WINDOW_MS;
+        }).sort((a, b) => Number(b.record.lastSeenAt) - Number(a.record.lastSeenAt));
+        if (!onlineRecords.length) return { online: false, lastSeenAt: null, deviceUid: null, reason: "heartbeat_missing_or_stale" };
+        return { online: true, lastSeenAt: Number(onlineRecords[0].record.lastSeenAt), deviceUid: onlineRecords[0].uid, reason: null };
+    } catch (err) {
+        console.error("Payment Reader status lookup failed:", err.message);
+        return { online: false, lastSeenAt: null, deviceUid: null, reason: "firebase_error" };
+    }
+}
+
+function normalizeBangladeshPaymentNumber(value) {
+    const raw = String(value || "").trim();
+    if (!raw || /x{3,}|your|paste|placeholder/i.test(raw)) return "";
+    const digits = raw.replace(/\D/g, "");
+    if (/^01[3-9]\d{8}$/.test(digits)) return digits;
+    if (/^8801[3-9]\d{8}$/.test(digits)) return `+${digits}`;
+    return "";
+}
+let PAYMENT_NUMBERS = {
+    bkash: normalizeBangladeshPaymentNumber(process.env.BKASH_PAYMENT_NUMBER),
+    nagad: normalizeBangladeshPaymentNumber(process.env.NAGAD_PAYMENT_NUMBER)
+};
+let LEGACY_PAYMENT_NUMBERS = { ...PAYMENT_NUMBERS };
+let PAYMENT_INSTRUCTIONS = "";
+const DEFAULT_PACKAGE_PRICES = { weekly: 510, monthly: 1510, "2_months": 2410 };
+let PACKAGE_PRICES = { ...DEFAULT_PACKAGE_PRICES };
+let PACKAGE_ENABLED = { weekly: true, monthly: true, "2_months": true };
+let ADMIN_BOT_CONFIG = {
+    features: {
+        paymentBotEnabled: true, checkoutEnabled: true, maintenanceMode: false,
+        autoCouponEnabled: true, giveawayEnabled: true, ticketPanelEnabled: true,
+        verificationEnabled: true, automodEnabled: true, levelingEnabled: true,
+        weeklyReportEnabled: true, voiceStatsEnabled: true,
+        capsProtectionEnabled: true, antiLinkEnabled: true, badWordsFilterEnabled: true,
+        spamProtectionEnabled: true, linkResponseEnabled: true, ghostPingEnabled: true,
+        welcomeSystemEnabled: true, leaveTrackingEnabled: true, oneTimeKeyEnabled: true,
+        profileSyncEnabled: true, orderTrackingEnabled: true, transcriptLogsEnabled: true
+    },
+    checkout: { readerRequired: true, allowPartialPayments: true, sessionExpiryHours: 24 },
+    coupons: { enabled: true, overpaymentMode: "auto", expiryDays: 90 },
+    automod: { maxUppercaseRatio: 0.7, minCapsLetters: 6, spamCount: 5, spamWindowSeconds: 5, warningLimit: 3, timeoutMinutes: 10, blockedWords: ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"] },
+    leveling: { xpMin: 5, xpMax: 9, xpPerLevelBase: 100 },
+    links: { verificationLink: "" },
+    presence: { status: "online", activityType: "Watching", activityText: "Security & Verification" },
+    messages: {
+        welcomeTitle: "🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম",
+        welcomeDescription: "✨ স্বাগতম {user} আমাদের সার্ভারে!\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️",
+        verifyTitle: "🚨 Verification Required",
+        verifyDescription: "👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন",
+        verificationSuccess: "✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!",
+        capsWarning: "⚠️ <@{user}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর (Caps Lock) ব্যবহার করবেন না।",
+        linkWarning: "⚠️ <@{user}>, সার্ভারে বাইরের লিংক পোস্ট করা নিষিদ্ধ!",
+        automodWarning: "⚠️ <@{user}>, সার্ভারে **{reason}** নিষিদ্ধ! আপনি এটি **{warns}/{limit}** বার করেছেন।",
+        timeoutTitle: "🚫 মেম্বার মিউটেড",
+        timeoutDescription: "<@{user}> কে {minutes} মিনিটের জন্য মিউট করা হয়েছে।",
+        levelUp: "🎉 অভিনন্দন <@{user}>! আপনি লেভেল **{level}** এ উন্নীত হয়েছেন।",
+        checkoutUnavailable: "🛠️ Shop checkout বর্তমানে বন্ধ অথবা maintenance mode চালু আছে। পরে আবার চেষ্টা করুন।"
+    },
+    discord: { channels: {}, roles: {} }
+};
+let adminConfigLoaded = false;
+function isFeatureEnabled(name) {
+    const features = ADMIN_BOT_CONFIG.features || {};
+    if (name === "maintenanceMode") return features.maintenanceMode === true;
+    return features[name] !== false;
+}
+function isCheckoutAllowed() {
+    return isFeatureEnabled("paymentBotEnabled") && isFeatureEnabled("checkoutEnabled") && !isFeatureEnabled("maintenanceMode");
+}
+function getCheckoutSettings() {
+    const cfg = ADMIN_BOT_CONFIG.checkout || {};
+    const sessionExpiryHours = Number(cfg.sessionExpiryHours);
+    return {
+        readerRequired: true, // Fail-closed is intentionally enforced until an alternate trusted verification source exists.
+        allowPartialPayments: cfg.allowPartialPayments !== false,
+        sessionExpiryHours: Number.isFinite(sessionExpiryHours) ? Math.max(1, Math.min(720, sessionExpiryHours)) : 24
+    };
+}
+function formatBotMessage(key, fallback, values = {}) {
+    let template = String(ADMIN_BOT_CONFIG.messages?.[key] || fallback || "").slice(0, 4000);
+    for (const [name, value] of Object.entries(values)) {
+        template = template.split(`{${name}}`).join(String(value ?? ""));
+    }
+    return template;
+}
+function isPackageEnabled(category) {
+    const normalized = getNormalizedCategory(category);
+    return PACKAGE_ENABLED[normalized] !== false;
+}
+function getPaymentNumber(provider) {
+    return PAYMENT_NUMBERS[String(provider || "").toLowerCase()] || "";
+}
+function getProviderLabel(provider) {
+    return provider === "bkash" ? "bKash" : provider === "nagad" ? "Nagad" : "Unknown";
+}
+
+async function findTrustedReaderEvent(txnId) {
+    const normalizedTxnId = String(txnId || "").trim().toUpperCase();
+    if (!normalizedTxnId || TRUSTED_READER_UIDS.size === 0) return null;
+    const snapshots = await Promise.all([...TRUSTED_READER_UIDS].map(async uid => {
+        const snap = await db.ref(`reader_events/${uid}`).once("value");
+        return { uid, events: snap.val() || {} };
+    }));
+    for (const { uid, events } of snapshots) {
+        for (const [eventKey, event] of Object.entries(events)) {
+            const id = String((event && event.transactionId) || eventKey).trim().toUpperCase();
+            if (event && id === normalizedTxnId) return { uid, eventKey, event };
+        }
+    }
+    return null;
+}
+
+async function waitForTrustedReaderEvent(txnId, waitMs = 12_000, intervalMs = 1_500) {
+    const stopAt = Date.now() + waitMs;
+    do {
+        const match = await findTrustedReaderEvent(txnId);
+        if (match) return match;
+        if (Date.now() < stopAt) await new Promise(resolve => setTimeout(resolve, intervalMs));
+    } while (Date.now() < stopAt);
+    return null;
+}
+
+async function autoWatchReaderOnline(interaction, category, sessionRef, provider) {
+    const sessionKey = `${interaction.user.id}:${category}`;
+    if (readerWatchLocks.has(sessionKey)) return;
+    readerWatchLocks.add(sessionKey);
+    const initialSnap = await sessionRef.once("value").catch(() => null);
+    const initialSession = initialSnap?.val() || null;
+    const initialCreatedAt = Number(initialSession?.createdAt) || 0;
+    const deadline = Date.now() + READER_AUTO_WATCH_TIMEOUT_MS;
+    try {
+        if (!initialCreatedAt || String(initialSession?.provider || "") !== provider) return;
+        while (Date.now() < deadline) {
+            await new Promise(resolve => setTimeout(resolve, READER_AUTO_WATCH_INTERVAL_MS));
+            const snap = await sessionRef.once("value");
+            const current = snap.val();
+            if (!current || Number(current.createdAt) !== initialCreatedAt || String(current.provider || "") !== provider) return;
+            if (["creating", "completed"].includes(String(current.status || ""))) return;
+            if (current.status === "awaiting_txn" && Number(current.numberShownAt) > 0) return;
+
+            const readerState = await getPaymentReaderState();
+            if (!readerState.online) continue;
+
+            const paymentNumber = getPaymentNumber(provider);
+            const updatedSession = {
+                ...current,
+                lastReaderCheckAt: Date.now(),
+                readerCheckedAt: Date.now()
+            };
+            if (paymentNumber) {
+                updatedSession.status = "awaiting_txn";
+                updatedSession.readerDeviceUid = readerState.deviceUid;
+                updatedSession.numberShownAt = Date.now();
+            } else {
+                updatedSession.status = "number_not_configured";
+            }
+            await sessionRef.update(updatedSession);
+            await interaction.editReply({ content: "", ...buildPaymentPage(category, updatedSession, readerState, paymentNumber) });
+            return;
+        }
+
+        const finalSnap = await sessionRef.once("value").catch(() => null);
+        const finalSession = finalSnap?.val() || null;
+        if (!finalSession || Number(finalSession.createdAt) !== initialCreatedAt || String(finalSession.provider || "") !== provider || ["creating", "completed"].includes(String(finalSession.status || ""))) return;
+        const providerLabel = getProviderLabel(provider);
+        const timeoutEmbed = new EmbedBuilder()
+            .setTitle("🟠 ONLINE CHECK — Reader এখনও offline")
+            .setDescription(
+                `📦 **প্যাকেজ:** \`${String(category).toUpperCase()}\`\n` +
+                `💳 **পেমেন্ট:** ${providerLabel}\n\n` +
+                `${Math.round(READER_AUTO_WATCH_TIMEOUT_MS / 60000)} মিনিটের মধ্যে trusted Reader online পাওয়া যায়নি। নিরাপত্তার জন্য নম্বর দেখানো হয়নি। Reader online হওয়ার পর Shop থেকে package নির্বাচন করে নতুন checkout শুরু করুন। এই page-এ বারবার click করার দরকার নেই।`
+            )
+            .setColor("Orange").setTimestamp();
+        await interaction.editReply({ content: "", embeds: [timeoutEmbed], components: [] });
+    } catch (err) {
+        console.error("Automatic Reader online watch failed:", err.message);
+        // Keep the last fail-closed ONLINE CHECK page visible; never reveal a number on an error.
+    } finally {
+        readerWatchLocks.delete(sessionKey);
+    }
+}
+
+function buildPaymentPage(category, session, readerState, providerNumber) {
+    const provider = String(session.provider || "").toLowerCase();
+    const providerLabel = getProviderLabel(provider);
+    const totalPaid = Number(session.totalPaid) || 0;
+    const targetPrice = Math.max(0, Number(session.targetPrice) || 0);
+    const basePrice = Math.max(0, Number(session.basePrice) || targetPrice);
+    const appliedDiscount = Math.max(0, Number(session.appliedDiscount) || 0);
+    const remainingDue = Math.max(0, targetPrice - totalPaid);
+
+    if (!readerState.online) {
+        const unconfigured = TRUSTED_READER_UIDS.size === 0;
+        const reason = unconfigured
+            ? "Payment Reader-এর trusted device UID server config-এ সেট করা নেই।"
+            : "Payment Reader offline, অথবা heartbeat পুরোনো।";
+        const autoCheckText = unconfigured
+            ? "Server config-এ trusted Reader UID যোগ হলে auto-check কাজ করবে। এই অবস্থায় পেমেন্ট নম্বর লুকানো থাকবে।"
+            : `Bot নিজে প্রতি ${Math.round(READER_AUTO_WATCH_INTERVAL_MS / 1000)} সেকেন্ডে ONLINE CHECK করবে (সর্বোচ্চ ${Math.round(READER_AUTO_WATCH_TIMEOUT_MS / 60000)} মিনিট)। আবার button click বা command করার দরকার নেই।`;
+        const embed = new EmbedBuilder()
+            .setTitle("🟠 ONLINE CHECK")
+            .setDescription(
+                `📦 **প্যাকেজ:** \`${String(category).toUpperCase()}\`\n` +
+                `💳 **পেমেন্ট:** ${providerLabel}\n` +
+                `💰 **বকেয়া:** \`${remainingDue}\` BDT\n\n` +
+                `🔒 **পেমেন্ট নম্বর লুকানো আছে।** ${reason}\n` +
+                autoCheckText
+            )
+            .setColor("Orange").setTimestamp();
+        return { embeds: [embed], components: [] };
+
+    }
+
+    if (!providerNumber) {
+        const embed = new EmbedBuilder()
+            .setTitle("⚠️ ONLINE CHECK — নম্বর সেট করা নেই")
+            .setDescription(`Reader অনলাইন, কিন্তু ${providerLabel}-এর payment number server environment-এ সেট করা নেই। নিরাপত্তার জন্য কোনো নম্বর দেখানো হয়নি।`)
+            .setColor("Orange").setTimestamp();
+        return { embeds: [embed], components: [] };
+    }
+
+    const isPartial = totalPaid > 0;
+    const discountText = session.appliedCoupon
+        ? `\n🎟️ **Coupon:** \`${String(session.appliedCoupon)}\` (ছাড়: ${Number(session.appliedDiscount) || 0} BDT)`
+        : "";
+    const embed = new EmbedBuilder()
+        .setTitle(`💳 ${providerLabel} Payment — ${String(category).toUpperCase()}`)
+        .setDescription(
+            `🟢 **ONLINE CHECK: সফল** — Reader এখন অনলাইন।\n\n` +
+            `📦 **প্যাকেজ:** \`${String(category).toUpperCase()}\`\n` +
+            `💰 **প্যাকেজের মূল্য:** \`${basePrice}\` BDT\n` +
+            (appliedDiscount > 0 ? `🎟️ **কুপন ছাড়:** \`${appliedDiscount}\` BDT\n` : "") +
+            `💳 **ছাড়ের পর পরিশোধযোগ্য:** \`${targetPrice}\` BDT\n` +
+            (isPartial ? `✅ **আগে পাওয়া পেমেন্ট:** \`${totalPaid}\` BDT\n📉 **এখন বকেয়া:** \`${remainingDue}\` BDT\n` : "") +
+            `📱 **${providerLabel} নম্বর:** \`${providerNumber}\`\n` +
+            (PAYMENT_INSTRUCTIONS ? `\n📝 **Payment Instructions:** ${PAYMENT_INSTRUCTIONS}\n` : "") +
+            `\nটাকা পাঠানোর পর payment notification-এ পাওয়া Transaction ID নিচের বাটনে জমা দিন।` +
+            discountText +
+            `\n\n⚠️ TxnID trusted Reader notification-এর সঙ্গে স্বয়ংক্রিয়ভাবে মিলিয়ে দেখা হবে।`
+        )
+        .setColor("Green").setTimestamp();
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`submit_txn_${category}`).setLabel(isPartial ? "➕ Submit Additional TxnID" : "TxnID জমা দিন").setStyle(ButtonStyle.Primary)
+    );
+    return { embeds: [embed], components: [row] };
+}
 
 const app = express();
+app.set("trust proxy", 1);
+app.use(express.json({ limit: "32kb", type: "application/json" }));
 app.get("/", (req, res) => { res.send("Bot is running!"); });
+app.get("/api/cpp/health", (req, res) => res.json({ ok: true, service: "rkbackles-cpp-bridge", version: require("./package.json").version }));
+
+// Small in-memory per-IP limiter for the C++ credential endpoints. Do not log request bodies.
+const cppRateLimits = new Map();
+function checkCppRateLimit(req, res, bucket, maximum = 8, windowMs = 10 * 60 * 1000) {
+    const key = `${bucket}:${String(req.ip || req.socket.remoteAddress || "unknown")}`;
+    const now = Date.now();
+    let state = cppRateLimits.get(key);
+    if (!state || state.resetAt <= now) state = { count: 0, resetAt: now + windowMs };
+    state.count += 1;
+    cppRateLimits.set(key, state);
+    if (cppRateLimits.size > 5000) {
+        for (const [storedKey, storedValue] of cppRateLimits) if (storedValue.resetAt <= now) cppRateLimits.delete(storedKey);
+    }
+    if (state.count > maximum) {
+        res.set("Retry-After", String(Math.max(1, Math.ceil((state.resetAt - now) / 1000))));
+        res.status(429).json({ ok: false, error: "rate_limited", message: "অনেকবার চেষ্টা হয়েছে। কিছুক্ষণ পরে আবার চেষ্টা করুন।" });
+        return false;
+    }
+    return true;
+}
+function cppApiError(res, status, error, message) {
+    return res.status(status).json({ ok: false, error, message });
+}
+async function createCppTokenReply(res, uid, customClaims, profile, sessionId) {
+    const customToken = await admin.auth().createCustomToken(uid, customClaims);
+    return res.json({ ok: true, uid, sessionId, customToken, profile });
+}
+function readBearerToken(req) {
+    const header = String(req.get("authorization") || "");
+    const match = header.match(/^Bearer\s+(.+)$/i);
+    return match ? match[1].trim() : "";
+}
+async function verifyCppRequest(req) {
+    const token = readBearerToken(req);
+    if (!token) throw Object.assign(new Error("Missing bearer token"), { statusCode: 401 });
+    const decoded = await admin.auth().verifyIdToken(token, true);
+    if (!decoded || !["user", "key"].includes(String(decoded.appType || "")) || !decoded.sessionId) {
+        throw Object.assign(new Error("Invalid C++ session"), { statusCode: 403 });
+    }
+    return decoded;
+}
+
+app.post("/api/cpp/login", async (req, res) => {
+    if (!checkCppRateLimit(req, res, "cpp-login", 8, 10 * 60 * 1000)) return;
+    try {
+        const username = String(req.body?.username || "").trim().toLowerCase();
+        const password = String(req.body?.password || "");
+        const hwid = String(req.body?.hwid || "").trim();
+        if (!/^[a-z0-9_]{3,20}$/.test(username) || password.length < 1 || password.length > 128 || !/^[A-Za-z0-9_-]{1,80}$/.test(hwid)) {
+            return cppApiError(res, 400, "invalid_input", "Username, password অথবা device ID সঠিক নয়।");
+        }
+        const userRef = db.ref(`users/${username}`);
+        const snapshot = await userRef.once("value");
+        const initial = snapshot.val();
+        if (!initial) return cppApiError(res, 401, "invalid_credentials", "Username অথবা password ভুল।");
+        if (initial.status && initial.status !== "active") return cppApiError(res, 403, "account_inactive", "অ্যাকাউন্ট inactive বা suspended।");
+        const oldExpiry = Number(initial.expiresAt) || 0;
+        if (oldExpiry > 0 && oldExpiry <= Date.now()) return cppApiError(res, 403, "account_expired", "অ্যাকাউন্টের মেয়াদ শেষ।");
+        const passwordOk = await verifyCppPassword(password, initial);
+        if (!passwordOk) return cppApiError(res, 401, "invalid_credentials", "Username অথবা password ভুল।");
+
+        // Migrate old plaintext-only accounts to scrypt after a successful credential check.
+        let verifiedPasswordHash = String(initial.passwordHash || "");
+        if (!verifiedPasswordHash && typeof initial.password === "string") {
+            const migratedHash = await hashCppPassword(password);
+            await userRef.transaction(current => {
+                if (!current || current.passwordHash || current.password !== password) return;
+                return { ...current, passwordHash: migratedHash, password: null, passwordMigratedAt: Date.now() };
+            }, undefined, false);
+            const migratedSnapshot = await userRef.once("value");
+            const migratedAccount = migratedSnapshot.val();
+            if (!migratedAccount || !(await verifyCppPassword(password, migratedAccount)) || !migratedAccount.passwordHash) {
+                return cppApiError(res, 401, "invalid_credentials", "Login details changed; please sign in again.");
+            }
+            verifiedPasswordHash = String(migratedAccount.passwordHash);
+        }
+
+        const sessionId = crypto.randomUUID();
+        const claim = await userRef.transaction(current => {
+            if (!current || current.passwordHash !== verifiedPasswordHash || (current.status && current.status !== "active")) return;
+            const expiry = Number(current.expiresAt) || 0;
+            if (expiry > 0 && expiry <= Date.now()) return;
+            const lockType = String(current.lockType || "HWID").toUpperCase();
+            const savedHwid = String(current.hwid || "");
+            if (lockType === "HWID" && savedHwid && savedHwid !== hwid) return;
+            if (lockType === "DIGITAL" && current.isLoggedIn === true && current.activeSessionId && current.activeSessionId !== sessionId && Date.now() - (Number(current.lastActive) || 0) < 30000) return;
+            return {
+                ...current,
+                hwid: lockType === "HWID" ? (savedHwid || hwid) : (savedHwid || hwid),
+                activeSessionId: sessionId,
+                lastActive: Date.now(),
+                isLoggedIn: lockType === "DIGITAL" ? true : Boolean(current.isLoggedIn),
+                lastAuthAt: Date.now()
+            };
+        }, undefined, false);
+        if (!claim.committed) return cppApiError(res, 409, "device_or_session_conflict", "অ্যাকাউন্ট অন্য ডিভাইসে active অথবা device lock mismatch।");
+        const account = claim.snapshot.val() || {};
+        const uid = makeCppUid("u", username);
+        watchCppUserProfile(username, uid);
+        const profile = getSafeCppProfile(uid, account, "user");
+        return await createCppTokenReply(res, uid, { appType: "user", appUser: username, sessionId, lockType: String(account.lockType || "HWID").toUpperCase() }, profile, sessionId);
+    } catch (err) {
+        console.error("C++ login bridge error:", err.message);
+        return cppApiError(res, 500, "server_error", "Login service-এ সমস্যা হয়েছে। পরে আবার চেষ্টা করুন।");
+    }
+});
+
+app.post("/api/cpp/key-login", async (req, res) => {
+    if (!checkCppRateLimit(req, res, "cpp-key-login", 6, 10 * 60 * 1000)) return;
+    try {
+        const key = String(req.body?.key || "").trim();
+        const hwid = String(req.body?.hwid || "").trim();
+        if (!/^KEY-[A-Z0-9]{6}-[0-9]{4}$/i.test(key) || !/^[A-Za-z0-9_-]{1,80}$/.test(hwid)) {
+            return cppApiError(res, 400, "invalid_input", "Developer key অথবা device ID সঠিক নয়।");
+        }
+        const keyRef = db.ref(`keys/${key}`);
+        const sessionId = crypto.randomUUID();
+        const claim = await keyRef.transaction(current => {
+            if (!current || current.disabled === true || current.revoked === true) return;
+            const savedHwid = String(current.hwid || "");
+            if (current.used === true && savedHwid && savedHwid !== hwid) return;
+            const expiry = Number(current.expiresAt) || 0;
+            if (expiry > 0 && expiry <= Date.now()) return;
+            return { ...current, used: true, hwid: savedHwid || hwid, activeSessionId: sessionId, lastUsedAt: Date.now() };
+        }, undefined, false);
+        if (!claim.committed) return cppApiError(res, 409, "key_claimed", "এই key অন্য device-এ ব্যবহার হয়েছে অথবা বাতিল/expired।");
+        const uid = makeCppUid("k", key);
+        await db.ref(`cppKeySessions/${uid}`).set({ key, hwid, sessionId, updatedAt: Date.now() });
+        watchCppKeyProfile(key, uid);
+        const profile = getSafeCppProfile(uid, claim.snapshot.val(), "key", { usedKey: key });
+        return await createCppTokenReply(res, uid, { appType: "key", sessionId }, profile, sessionId);
+    } catch (err) {
+        console.error("C++ key login bridge error:", err.message);
+        return cppApiError(res, 500, "server_error", "Developer key service-এ সমস্যা হয়েছে। পরে চেষ্টা করুন।");
+    }
+});
+
+app.post("/api/cpp/heartbeat", async (req, res) => {
+    try {
+        const decoded = await verifyCppRequest(req);
+        const now = Date.now();
+        if (decoded.appType === "user") {
+            const username = String(decoded.appUser || "");
+            if (!/^[a-z0-9_]{3,20}$/.test(username)) return cppApiError(res, 403, "invalid_session", "Session account mapping invalid।");
+            const ref = db.ref(`users/${username}`);
+            const snap = await ref.once("value");
+            const account = snap.val();
+            if (!account || account.activeSessionId !== decoded.sessionId) return cppApiError(res, 409, "session_replaced", "এই session অন্য login দিয়ে প্রতিস্থাপিত হয়েছে।");
+            const expiry = Number(account.expiresAt) || 0;
+            if ((account.status && account.status !== "active") || (expiry > 0 && expiry <= now)) {
+                await db.ref(`cppProfiles/${decoded.uid}`).set(getSafeCppProfile(decoded.uid, account, "user"));
+                watchCppUserProfile(username, decoded.uid);
+                return cppApiError(res, 403, "account_revoked", "অ্যাকাউন্ট inactive অথবা মেয়াদ শেষ।");
+            }
+            const updates = { lastActive: now };
+            if (String(account.lockType || "HWID").toUpperCase() === "DIGITAL") updates.isLoggedIn = true;
+            await ref.update(updates);
+            watchCppUserProfile(username, decoded.uid);
+        } else {
+            const sessionSnap = await db.ref(`cppKeySessions/${decoded.uid}`).once("value");
+            const session = sessionSnap.val();
+            if (!session || session.sessionId !== decoded.sessionId || !session.key) return cppApiError(res, 409, "session_replaced", "Developer key session শেষ হয়েছে।");
+            const keySnap = await db.ref(`keys/${session.key}`).once("value");
+            const keyData = keySnap.val();
+            if (!keyData || keyData.revoked === true || keyData.disabled === true || String(keyData.hwid || "") !== String(session.hwid || "") || String(keyData.activeSessionId || "") !== decoded.sessionId) {
+                await db.ref(`cppProfiles/${decoded.uid}`).set(getSafeCppProfile(decoded.uid, keyData, "key", { usedKey: session.key }));
+                watchCppKeyProfile(session.key, decoded.uid);
+                return cppApiError(res, 403, "key_revoked", "Developer key বাতিল অথবা session invalid।");
+            }
+            await db.ref(`cppKeySessions/${decoded.uid}/updatedAt`).set(now);
+            watchCppKeyProfile(session.key, decoded.uid);
+        }
+        return res.json({ ok: true, serverTime: now });
+    } catch (err) {
+        const status = Number(err.statusCode) || 401;
+        return cppApiError(res, status, status === 401 ? "unauthorized" : "invalid_session", "Session যাচাই করা যায়নি। আবার login করুন।");
+    }
+});
+
+app.post("/api/cpp/logout", async (req, res) => {
+    try {
+        const decoded = await verifyCppRequest(req);
+        if (decoded.appType === "user") {
+            const username = String(decoded.appUser || "");
+            const ref = db.ref(`users/${username}`);
+            const cleared = await ref.transaction(current => {
+                if (!current || current.activeSessionId !== decoded.sessionId) return;
+                const next = { ...current, activeSessionId: null, lastActive: Date.now() };
+                if (String(current.lockType || "HWID").toUpperCase() === "DIGITAL") next.isLoggedIn = false;
+                return next;
+            }, undefined, false);
+            if (cleared.committed) stopCppProfileWatcher(`user:${username}`, decoded.uid);
+        } else {
+            const sessionRef = db.ref(`cppKeySessions/${decoded.uid}`);
+            const sessionSnap = await sessionRef.once("value");
+            const session = sessionSnap.val();
+            if (session?.sessionId === decoded.sessionId) {
+                await sessionRef.remove();
+                if (session.key) {
+                    const cleared = await db.ref(`keys/${session.key}`).transaction(current => current?.activeSessionId === decoded.sessionId ? { ...current, activeSessionId: null } : undefined, undefined, false);
+                    if (cleared.committed) stopCppProfileWatcher(`key:${session.key}`, decoded.uid);
+                }
+            }
+        }
+        return res.json({ ok: true });
+    } catch (_) {
+        return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
+});
+
+app.post("/api/cpp/log", async (req, res) => {
+    try {
+        const decoded = await verifyCppRequest(req);
+        const type = String(req.body?.type || "APP_EVENT").replace(/[^A-Z0-9_]/gi, "").slice(0, 40) || "APP_EVENT";
+        const details = String(req.body?.details || "").slice(0, 240);
+        await db.ref("app_logs").push({ type, username: String(decoded.appUser || (decoded.appType === "key" ? "VIP User" : "unknown")).slice(0, 80), details, timestamp: Date.now(), createdAt: Date.now() });
+        return res.json({ ok: true });
+    } catch (_) { return res.status(401).json({ ok: false, error: "unauthorized" }); }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
-
-// ================================
-// 🛡️ PHASE 1 - CORE SAFE HELPER UTILITIES
-// ================================
-
-/**
- * Clean & Sanitize user inputs for Firebase Path keys
- */
-function sanitizeFirebaseKey(key) {
-    if (!key || typeof key !== "string") return "invalid_key";
-    return key.replace(/[.#$\/[\]]/g, "_").trim();
-}
-
-/**
- * Password Hashing Helper
- */
-function hashPassword(password) {
-    return crypto.createHash("sha256").update(String(password)).digest("hex");
-}
-
-/**
- * Firebase Atomic Transaction Wrapper
- */
-async function runAtomicTransaction(path, updateFunction) {
-    const ref = db.ref(path);
-    try {
-        const result = await ref.transaction(updateFunction);
-        return result;
-    } catch (err) {
-        console.error(`❌ Atomic Transaction Error at path [${path}]:`, err);
-        return { committed: false, snapshot: null, error: err };
-    }
-}
-
-/**
- * Unique Safe Atomic Counter Generator with Retry (e.g., ORD-000001)
- */
-async function getNextAtomicCounter(counterName, prefix = "ORD", maxRetries = 3) {
-    const safeCounterName = sanitizeFirebaseKey(counterName);
-    const counterRef = db.ref(`counters/${safeCounterName}`);
-    
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        const result = await counterRef.transaction((currentValue) => {
-            return (currentValue || 0) + 1;
-        });
-
-        if (result.committed && result.snapshot.exists()) {
-            const num = result.snapshot.val();
-            const padded = String(num).padStart(6, "0");
-            return `${prefix}-${padded}`;
-        }
-    }
-    
-    throw new Error(`Failed to generate atomic counter [${counterName}] after ${maxRetries} attempts.`);
-}
-
-/**
- * Idempotency Check & Set Protection
- */
-async function checkAndSetIdempotency(requestId, ttlSeconds = 10) {
-    const safeReqId = sanitizeFirebaseKey(requestId);
-    const reqRef = db.ref(`idempotency/${safeReqId}`);
-    const now = Date.now();
-    const expiry = now + (ttlSeconds * 1000);
-
-    const result = await reqRef.transaction((currentData) => {
-        if (currentData && currentData.expiresAt > now) {
-            return; // Abort: already processed / processing
-        }
-        return { status: "PROCESSING", createdAt: now, expiresAt: expiry };
-    });
-
-    return result.committed;
-}
-
-/**
- * Audit Logger Helper Engine (Sanitizes Sensitive Fields)
- */
-async function safeLogAudit(action, actorId, targetId, details = {}) {
-    try {
-        const logId = db.ref("audit_logs").push().key;
-        const cleanDetails = { ...details };
-        
-        // Ensure sensitive parameters are never printed into Audit Logs
-        delete cleanDetails.password;
-        delete cleanDetails.customPass;
-        delete cleanDetails.token;
-        delete cleanDetails.secret;
-        if (cleanDetails.key) {
-            cleanDetails.key = cleanDetails.key.substring(0, 4) + "****";
-        }
-
-        await db.ref(`audit_logs/${logId}`).set({
-            action: String(action),
-            actorId: String(actorId),
-            targetId: String(targetId || "N/A"),
-            details: cleanDetails,
-            timestamp: Date.now()
-        });
-    } catch (err) {
-        console.error("❌ safeLogAudit Error:", err);
-    }
-}
 
 // ================================
 // 📱 Dynamic Realtime Settings (Firebase Sync)
 // ================================
 
-let PAYMENT_NUMBER = "01404548951"; 
-let VERIFICATION_LINK = "https://discord.gg/example"; 
+let VERIFICATION_LINK = "https://discord.gg/example"; // existing non-payment setting
 
+// Legacy settings path is still supported for older projects. Once adminConfig/bot exists,
+// its values take precedence so old settings cannot silently overwrite the Admin Panel.
 db.ref("settings").on("value", (snapshot) => {
-    if (snapshot.exists()) {
-        const data = snapshot.val();
-        if (data.payment_number) {
-            PAYMENT_NUMBER = String(data.payment_number);
-            console.log("✅ Realtime Payment Number Updated:", PAYMENT_NUMBER);
+    const data = snapshot.val() || {};
+    const numbers = data.payment_numbers || {};
+    LEGACY_PAYMENT_NUMBERS = {
+        bkash: normalizeBangladeshPaymentNumber(numbers.bkash || data.bkash_payment_number || process.env.BKASH_PAYMENT_NUMBER),
+        nagad: normalizeBangladeshPaymentNumber(numbers.nagad || data.nagad_payment_number || process.env.NAGAD_PAYMENT_NUMBER)
+    };
+    if (!adminConfigLoaded) {
+        PAYMENT_NUMBERS = { ...LEGACY_PAYMENT_NUMBERS };
+    } else {
+        const payment = ADMIN_BOT_CONFIG.payment || {};
+        if (!Object.prototype.hasOwnProperty.call(payment, "bkashNumber")) PAYMENT_NUMBERS.bkash = LEGACY_PAYMENT_NUMBERS.bkash;
+        if (!Object.prototype.hasOwnProperty.call(payment, "nagadNumber")) PAYMENT_NUMBERS.nagad = LEGACY_PAYMENT_NUMBERS.nagad;
+    }
+    if (data.verification_link && !String(ADMIN_BOT_CONFIG.links?.verificationLink || "").trim()) VERIFICATION_LINK = String(data.verification_link).slice(0, 300);
+});
+
+// Live Admin Panel configuration. Missing keys keep the historical defaults for compatibility.
+db.ref("adminConfig/bot").on("value", (snapshot) => {
+    const root = snapshot.val();
+    if (!root || typeof root !== "object") return;
+    adminConfigLoaded = true;
+    ADMIN_BOT_CONFIG = {
+        ...ADMIN_BOT_CONFIG,
+        ...root,
+        features: { ...ADMIN_BOT_CONFIG.features, ...(root.features || {}) },
+        checkout: { ...ADMIN_BOT_CONFIG.checkout, ...(root.checkout || {}) },
+        coupons: { ...ADMIN_BOT_CONFIG.coupons, ...(root.coupons || {}) },
+        automod: { ...ADMIN_BOT_CONFIG.automod, ...(root.automod || {}) },
+        leveling: { ...ADMIN_BOT_CONFIG.leveling, ...(root.leveling || {}) },
+        links: { ...ADMIN_BOT_CONFIG.links, ...(root.links || {}) },
+        presence: { ...ADMIN_BOT_CONFIG.presence, ...(root.presence || {}) },
+        messages: { ...ADMIN_BOT_CONFIG.messages, ...(root.messages || {}) },
+        discord: {
+            ...(ADMIN_BOT_CONFIG.discord || {}), ...(root.discord || {}),
+            channels: { ...(ADMIN_BOT_CONFIG.discord?.channels || {}), ...((root.discord || {}).channels || {}) },
+            roles: { ...(ADMIN_BOT_CONFIG.discord?.roles || {}), ...((root.discord || {}).roles || {}) }
         }
-        if (data.verification_link) {
-            VERIFICATION_LINK = String(data.verification_link);
-            console.log("✅ Realtime Verification Link Updated:", VERIFICATION_LINK);
-        }
+    };
+    if (Object.prototype.hasOwnProperty.call(ADMIN_BOT_CONFIG.links || {}, "verificationLink")) {
+        const configuredLink = String(ADMIN_BOT_CONFIG.links.verificationLink || "").trim();
+        if (configuredLink) VERIFICATION_LINK = configuredLink.slice(0, 300);
+    }
+    const payment = root.payment || {};
+    const hasBkash = Object.prototype.hasOwnProperty.call(payment, "bkashNumber");
+    const hasNagad = Object.prototype.hasOwnProperty.call(payment, "nagadNumber");
+    PAYMENT_NUMBERS = {
+        bkash: normalizeBangladeshPaymentNumber(hasBkash ? payment.bkashNumber : LEGACY_PAYMENT_NUMBERS.bkash || process.env.BKASH_PAYMENT_NUMBER),
+        nagad: normalizeBangladeshPaymentNumber(hasNagad ? payment.nagadNumber : LEGACY_PAYMENT_NUMBERS.nagad || process.env.NAGAD_PAYMENT_NUMBER)
+    };
+    PAYMENT_INSTRUCTIONS = String(payment.instructions || "").slice(0, 1000);
+
+    const packageConfig = root.packages || {};
+    const weekly = packageConfig.weekly || {};
+    const monthly = packageConfig.monthly || {};
+    const twoMonths = packageConfig.twoMonths || packageConfig["2_months"] || {};
+    const priceCandidate = {
+        weekly: Number(weekly.price), monthly: Number(monthly.price), "2_months": Number(twoMonths.price)
+    };
+    PACKAGE_PRICES = {
+        weekly: Number.isFinite(priceCandidate.weekly) && priceCandidate.weekly >= 0 ? priceCandidate.weekly : DEFAULT_PACKAGE_PRICES.weekly,
+        monthly: Number.isFinite(priceCandidate.monthly) && priceCandidate.monthly >= 0 ? priceCandidate.monthly : DEFAULT_PACKAGE_PRICES.monthly,
+        "2_months": Number.isFinite(priceCandidate["2_months"]) && priceCandidate["2_months"] >= 0 ? priceCandidate["2_months"] : DEFAULT_PACKAGE_PRICES["2_months"]
+    };
+    PACKAGE_ENABLED = {
+        weekly: weekly.enabled !== false,
+        monthly: monthly.enabled !== false,
+        "2_months": twoMonths.enabled !== false
+    };
+    // Refresh the shop panel after prices, package availability or controls change.
+    if (client.isReady()) {
+        setBotPresence();
+        syncAllManagedPanels().catch(err => console.error("Real-time Discord panel sync failed:", err.message));
     }
 });
 
@@ -189,16 +770,19 @@ const VERIFIED_ROLE_ID = "1488333841402691664";
 const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 
+// অর্ডার ট্র্যাকিং চ্যানেল আইডি
 const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
+// নতুন অর্ডার গাইড চ্যানেল আইডি
 const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 
+// ১-টাইম কী জেনারেটর চ্যানেল আইডি
 const ONETIME_KEY_CHANNEL_IDS = ["1488340757160005683"];
 
 const ROLES = {
     ADMIN: "1488332568372973568", 
     SUPPORT_TICKET_REPORT: "1488333580705861765", 
     SUPPORT_CUSTOMER: "1488335064873046086",
-    DEVELOPER: "1523955414612578354"
+    DEVELOPER: "1523955414612578354" // Developer রোলের ID
 };
 
 const CHANNELS = {
@@ -217,39 +801,22 @@ const COVER_IMAGES = {
     PAYMENT: "https://cdn.discordapp.com/attachments/1488338142607184055/1488761437550678056/5cfd1fe4-d12c-4439-b374-f386f7595184.png"
 };
 
-const BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
+const DEFAULT_BAD_WORDS = ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"]; 
 
-const PACKAGE_PRICES = {
-    weekly: 510,
-    weekly_plan: 510,
-    monthly: 1510,
-    monthly_plan: 1510,
-    "2_months": 2410,
-    two_months_plan: 2410,
-    two: 2410,
-    "2months": 2410,
-    "2month": 2410,
-    two_months: 2410
-};
-
-function getNormalizedCategory(cat) {
-    if (!cat) return "weekly";
-    const c = String(cat).toLowerCase().trim();
-    const map = {
-        "weekly": "weekly",
-        "weekly_plan": "weekly",
-        "monthly": "monthly",
-        "monthly_plan": "monthly",
-        "2_months": "2_months",
-        "two_months_plan": "2_months",
-        "two": "2_months",
-        "2months": "2_months",
-        "2month": "2_months",
-        "two_months": "2_months"
-    };
-    return map[c] || "weekly";
+// 💰 Package price keys normalise to the live Admin Panel price map above.
+function getPackagePrice(category) {
+    return Number(PACKAGE_PRICES[getNormalizedCategory(category)] ?? DEFAULT_PACKAGE_PRICES.weekly);
 }
 
+function getNormalizedCategory(cat) {
+    const c = String(cat || "weekly").toLowerCase().trim();
+    if (["2_months", "two_months", "two_months_plan", "two", "2months", "2month"].includes(c) || c.includes("two") || c.includes("2")) return "2_months";
+    if (["monthly", "monthly_plan", "month"].includes(c) || c.includes("month")) return "monthly";
+    if (["weekly", "weekly_plan", "week"].includes(c) || c.includes("week")) return "weekly";
+    return "weekly";
+}
+
+// New Configs
 const STATS_VC_CHANNEL_ID = "1524321192079786005";
 const LEVEL_ROLE_ID = "1524322087295127552";
 const GIVEAWAY_CHANNEL_ID = "1488341249739198585";
@@ -259,10 +826,66 @@ const STAFF_ADMIN_LOG_ID = "1524324771502882877";
 const WEEKLY_REPORT_CHANNEL_ID = "1524326280923709550";
 const TRANSCRIPT_LOG_CHANNEL_ID = "1524326928268660807";
 
+// Databases
 const DATA_FILE = "./database.json";
 const WELCOME_LOG_FILE = "./welcome_messages.json";
 const PUNISH_FILE = "./punishments.json"; 
-const ORDER_LOG_FILE = "./order_tracking.json"; 
+const ORDER_LOG_FILE = "./order_tracking.json";
+
+// Config helpers: dashboard values override existing IDs; blank/missing values keep current IDs.
+function getConfiguredChannelId(key) {
+    const configured = String(ADMIN_BOT_CONFIG.discord?.channels?.[key] || "").trim();
+    if (/^\d{15,25}$/.test(configured)) return configured;
+    const fallback = {
+        welcome: WELCOME_CHANNEL_ID, log: LOG_CHANNEL_ID, orderTracking: ORDER_TRACKING_CHANNEL_ID,
+        orderGuide: ORDER_GUIDE_CHANNEL_ID, ticketPanel: CHANNELS.TICKET_PANEL,
+        reportPanel: CHANNELS.REPORT_PANEL, customerPanel: CHANNELS.CUSTOMER_PANEL,
+        paymentPanel: CHANNELS.PAYMENT_PANEL, giveaway: GIVEAWAY_CHANNEL_ID,
+        weeklyReport: WEEKLY_REPORT_CHANNEL_ID, voiceStats: STATS_VC_CHANNEL_ID,
+        transcriptLog: TRANSCRIPT_LOG_CHANNEL_ID, staffAdminLog: STAFF_ADMIN_LOG_ID,
+        embedNotice: EMBED_NOTICE_CHANNEL_ID, socialFeed: SOCIAL_FEED_CHANNEL_ID
+    };
+    return fallback[key] || "";
+}
+function getConfiguredChannelIds(key) {
+    const configured = ADMIN_BOT_CONFIG.discord?.channels?.[key];
+    const source = Array.isArray(configured) ? configured : (typeof configured === "string" ? configured.split(/[\s,;]+/) : []);
+    const ids = source.map(value => String(value || "").trim()).filter(value => /^\d{15,25}$/.test(value));
+    if (ids.length) return [...new Set(ids)].slice(0, 10);
+    if (key === "oneTimeKey") return ONETIME_KEY_CHANNEL_IDS;
+    return [];
+}
+function getConfiguredRoleId(key) {
+    const configured = String(ADMIN_BOT_CONFIG.discord?.roles?.[key] || "").trim();
+    if (/^\d{15,25}$/.test(configured)) return configured;
+    const fallback = {
+        admin: ROLES.ADMIN, supportTicketReport: ROLES.SUPPORT_TICKET_REPORT,
+        supportCustomer: ROLES.SUPPORT_CUSTOMER, developer: ROLES.DEVELOPER,
+        verified: VERIFIED_ROLE_ID, level: LEVEL_ROLE_ID
+    };
+    return fallback[key] || "";
+}
+function getAutomodSettings() {
+    const cfg = ADMIN_BOT_CONFIG.automod || {};
+    const num = (value, fallback, min, max) => Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : fallback));
+    const words = Array.isArray(cfg.blockedWords) ? cfg.blockedWords : DEFAULT_BAD_WORDS;
+    return {
+        maxUppercaseRatio: num(cfg.maxUppercaseRatio, 0.7, 0.5, 1),
+        minCapsLetters: Math.round(num(cfg.minCapsLetters, 6, 1, 100)),
+        spamCount: Math.round(num(cfg.spamCount, 5, 2, 100)),
+        spamWindowSeconds: Math.round(num(cfg.spamWindowSeconds, 5, 1, 120)),
+        warningLimit: Math.round(num(cfg.warningLimit, 3, 1, 20)),
+        timeoutMinutes: Math.round(num(cfg.timeoutMinutes, 10, 1, 1440)),
+        blockedWords: words.map(word => String(word || "").trim().toLowerCase()).filter(Boolean).slice(0, 100)
+    };
+}
+function getLevelingSettings() {
+    const cfg = ADMIN_BOT_CONFIG.leveling || {};
+    const number = (value, fallback, min, max) => Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : fallback));
+    const xpMin = Math.round(number(cfg.xpMin, 5, 1, 100));
+    const xpMax = Math.round(number(cfg.xpMax, 9, xpMin, 100));
+    return { xpMin, xpMax: Math.max(xpMin, xpMax), xpPerLevelBase: Math.round(number(cfg.xpPerLevelBase, 100, 10, 10000)) };
+}
 
 const cooldowns = new Map();
 const userMsgCounter = new Map(); 
@@ -275,199 +898,155 @@ const client = new Client({
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessageReactions,
-        GatewayIntentBits.GuildPresences
+        GatewayIntentBits.GuildMessageReactions
     ],
     partials: [Partials.Channel, Partials.GuildMember, Partials.Message, Partials.Reaction]
 });
 
-process.on("unhandledRejection", (err) => { console.error("[Unhandled Rejection]", err); });
-process.on("uncaughtException", (err) => { console.error("[Uncaught Exception]", err); });
-
-function generateUniqueCouponCode() {
-    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    let code = "AK-";
-    const bytes = crypto.randomBytes(6);
-    for (let i = 0; i < 6; i++) {
-        code += chars.charAt(bytes[i] % chars.length);
-    }
-    return code;
-}
-
-function setBotPresence() {
-    if (client.user) {
-        client.user.setActivity("Security & Orders", { type: ActivityType.Watching });
-    }
-}
-
-// Startup Recovery Mechanism
-async function runStartupStateRecovery() {
-    console.log("🔄 Starting System Recovery Check...");
-    try {
-        const now = Date.now();
-        const RESERVATION_TTL_MS = 15 * 60 * 1000;
-
-        // 1. Recover Stale Reserved Coupons (Safely Preserve USED Coupons)
-        const couponsSnap = await db.ref("coupons").once("value");
-        if (couponsSnap.exists()) {
-            const coupons = couponsSnap.val();
-            for (const key in coupons) {
-                const c = coupons[key];
-                if (c.status === "RESERVED" && c.reservedAt && (now - c.reservedAt > RESERVATION_TTL_MS)) {
-                    await db.ref(`coupons/${key}`).transaction((curr) => {
-                        if (!curr || curr.status === "used" || curr.status === "USED") return curr;
-                        return {
-                            ...curr,
-                            status: "active",
-                            reservedBy: null,
-                            reservedAt: null,
-                            reservationExpiresAt: null,
-                            reservedOrderId: null,
-                            reservedSessionId: null
-                        };
-                    });
-                    console.log(`✅ Recovered Stale Coupon Lease: ${key}`);
-                }
-            }
-        }
-
-        // 2. Recover Abandoned Stale Transaction Locks
-        const txnsSnap = await db.ref("transactions").once("value");
-        if (txnsSnap.exists()) {
-            const txns = txnsSnap.val();
-            for (const key in txns) {
-                const t = txns[key];
-                if (t.status === "CLAIMING" && t.claimedAt && (now - t.claimedAt > 30000)) {
-                    await db.ref(`transactions/${key}`).transaction((curr) => {
-                        if (!curr || curr.status === "COMMITTED" || curr.used === true) return curr;
-                        return {
-                            ...curr,
-                            status: "AVAILABLE",
-                            claimedBy: null,
-                            claimedAt: null
-                        };
-                    });
-                    console.log(`✅ Released Stale Transaction Lock: ${key}`);
-                }
-            }
-        }
-
-        // 3. Recover Unfinished Operations Idempotently
-        const opsSnap = await db.ref("payment_operations").once("value");
-        if (opsSnap.exists()) {
-            const ops = opsSnap.val();
-            for (const opId in ops) {
-                const op = ops[opId];
-                
-                // State: SESSION_COMMITTED & !txnCommitted
-                if (op.state === "SESSION_COMMITTED" && !op.txnCommitted) {
-                    if (op.txnId && op.paymentMethod !== "COUPON") {
-                        await db.ref(`transactions/${op.txnId}`).update({
-                            used: true,
-                            status: "COMMITTED",
-                            usedBy: op.userId,
-                            usedAt: Date.now()
-                        });
-                        await db.ref(`payment_operations/${opId}`).update({
-                            state: "TXN_COMMITTED",
-                            txnCommitted: true,
-                            updatedAt: Date.now()
-                        });
-                    } else if (op.paymentMethod === "COUPON") {
-                        await db.ref(`payment_operations/${opId}`).update({
-                            state: "COUPON_COMMITTED",
-                            couponCommitted: true,
-                            updatedAt: Date.now()
-                        });
-                    }
-                    console.log(`✅ Recovered Payment Operation (SESSION_COMMITTED): ${opId}`);
-                }
-                
-                // State: TXN_COMMITTED or COUPON_COMMITTED & !finalized
-                if ((op.state === "TXN_COMMITTED" || op.state === "COUPON_COMMITTED") && !op.finalized) {
-                    await db.ref(`payment_operations/${opId}`).update({
-                        state: "FINALIZED",
-                        finalized: true,
-                        updatedAt: Date.now()
-                    });
-                    console.log(`✅ Finalized Payment Operation (${op.state}): ${opId}`);
-                }
-
-                // Stale STARTED state
-                if (op.state === "STARTED" && op.createdAt && (now - op.createdAt > 60000)) {
-                    await db.ref(`payment_operations/${opId}`).update({
-                        state: "FAILED",
-                        reason: "OPERATION_TIMEOUT",
-                        updatedAt: Date.now()
-                    });
-                    console.log(`✅ Cleaned Stale Started Operation: ${opId}`);
-                }
-            }
-        }
-
-        // 4. Clean Stale Username Reservations
-        const usersSnap = await db.ref("users").once("value");
-        if (usersSnap.exists()) {
-            const users = usersSnap.val();
-            for (const uKey in users) {
-                const u = users[uKey];
-                if (u.reserved === true && u.reservedAt && (now - u.reservedAt > 300000) && !u.createdAt) {
-                    await db.ref(`users/${uKey}`).remove();
-                    console.log(`✅ Released Expired Username Reservation: ${uKey}`);
-                }
-            }
-        }
-
-        // 5. Recover Abandoned Ticket Reservations
-        const activeTicketsSnap = await db.ref("tickets_active").once("value");
-        if (activeTicketsSnap.exists()) {
-            const activeTickets = activeTicketsSnap.val();
-            for (const tKey in activeTickets) {
-                const act = activeTickets[tKey];
-                if (act.status === "RESERVED" && act.createdAt && (now - act.createdAt > 60000)) {
-                    await db.ref(`tickets_active/${tKey}`).remove();
-                    console.log(`✅ Cleaned Stale Ticket Reservation: ${tKey}`);
-                }
-            }
-        }
-
-    } catch (err) {
-        console.error("❌ Startup Recovery Error:", err);
-    }
-}
-
-client.once("ready", () => {
-    console.log(`🤖 Logged in as ${client.user.tag}`);
-    setBotPresence();
-    runStartupStateRecovery();
+process.on("unhandledRejection", (err) => {
+    console.error("[Unhandled Rejection]", err);
+});
+process.on("uncaughtException", (err) => {
+    console.error("[Uncaught Exception] Fatal error; shutting down so the process manager can restart the bot.", err);
+    process.exit(1);
 });
 
+// 🎲 ইউনিক কুপন কোড জেনারেটর (e.g., AK-A1B2C3)
+function generateSecureBase36(length) {
+    const range = 36n ** BigInt(length);
+    return (crypto.randomBytes(8).readBigUInt64BE(0) % range)
+        .toString(36)
+        .toUpperCase()
+        .padStart(length, "0");
+}
+
+function generateUniqueCouponCode() {
+    // Keep the existing AK-XXXXXX format so existing panels/users remain compatible.
+    return `AK-${generateSecureBase36(6)}`;
+}
+
+
+// Auto coupon defaults ON for users who have not saved a preference yet.
+async function isAutoCouponEnabled(userId) {
+    if (ADMIN_BOT_CONFIG.coupons?.enabled === false || ADMIN_BOT_CONFIG.features?.autoCouponEnabled === false) return false;
+    const snap = await db.ref(`user_settings/${userId}/autoCouponEnabled`).once("value");
+    return snap.exists() ? snap.val() === true : true;
+}
+
+function getCouponBalance(coupon) {
+    const balance = Number(coupon?.remainingValue ?? coupon?.couponValue ?? coupon?.discountValue ?? 0);
+    return Number.isFinite(balance) && balance > 0 ? balance : 0;
+}
+
+async function reserveBestAutoCoupon(userId, category, basePrice) {
+    const snap = await db.ref("coupons").once("value");
+    const allCoupons = snap.val() || {};
+    const now = Date.now();
+    const candidates = Object.entries(allCoupons)
+        .map(([code, data]) => ({ code, data: data || {} }))
+        .filter(({ data }) => data.userId === userId && data.status === "active" &&
+            (!data.expiresAt || Number(data.expiresAt) > now) && getCouponBalance(data) > 0)
+        .sort((a, b) => {
+            const aExpiry = Number(a.data.expiresAt) || Number.MAX_SAFE_INTEGER;
+            const bExpiry = Number(b.data.expiresAt) || Number.MAX_SAFE_INTEGER;
+            return aExpiry - bExpiry || getCouponBalance(b.data) - getCouponBalance(a.data);
+        });
+
+    for (const candidate of candidates) {
+        const couponRef = db.ref(`coupons/${candidate.code}`);
+        const reservation = await couponRef.transaction((current) => {
+            const time = Date.now();
+            if (!current || current.status !== "active" || current.userId !== userId ||
+                (current.expiresAt && Number(current.expiresAt) <= time) || getCouponBalance(current) <= 0) return;
+            const heldByOtherCheckout = current.reservedBy &&
+                !(current.reservedBy === userId && current.reservedCategory === category) &&
+                (time - (Number(current.reservedAt) || 0) < 30 * 60 * 1000);
+            if (heldByOtherCheckout) return;
+            return { ...current, reservedBy: userId, reservedCategory: category, reservedAt: time };
+        }, undefined, false);
+        if (!reservation.committed) continue;
+        const coupon = reservation.snapshot.val() || {};
+        const balance = getCouponBalance(coupon);
+        const discount = Math.min(Math.max(0, Number(basePrice) || 0), balance);
+        if (discount <= 0) continue;
+        return { code: candidate.code, balance, discount, coupon };
+    }
+    return null;
+}
+
+async function consumeCouponBalance(code, userId, category, requestedAmount) {
+    if (!code) return { committed: false, remainingValue: 0 };
+    const amountToConsume = Math.max(0, Number(requestedAmount) || 0);
+    const couponRef = db.ref(`coupons/${code}`);
+    return couponRef.transaction((current) => {
+        if (!current || current.status !== "active" || current.userId !== userId) return;
+        if (current.reservedBy && (current.reservedBy !== userId || current.reservedCategory !== category)) return;
+        const balance = getCouponBalance(current);
+        if (balance <= 0 || amountToConsume <= 0) return;
+        const consumed = Math.min(balance, amountToConsume);
+        const remainingValue = Math.max(0, Math.round((balance - consumed) * 100) / 100);
+        return {
+            ...current,
+            remainingValue,
+            status: remainingValue > 0 ? "active" : "used",
+            lastUsedBy: userId,
+            lastUsedAt: Date.now(),
+            lastConsumedValue: consumed,
+            ...(remainingValue > 0 ? { reservedBy: null, reservedCategory: null, reservedAt: null } : {
+                usedBy: userId, usedAt: Date.now(), reservedBy: null, reservedCategory: null, reservedAt: null
+            })
+        };
+    }, undefined, false);
+}
+
+async function releaseCouponReservation(code, userId, category) {
+    if (!code) return;
+    await db.ref(`coupons/${code}`).transaction((current) => {
+        if (!current || current.status !== "active" || current.reservedBy !== userId || current.reservedCategory !== category) return;
+        return { ...current, reservedBy: null, reservedCategory: null, reservedAt: null };
+    }, undefined, false).catch(() => {});
+}
+
+// 📌 Firebase থেকে ডেটা নিয়ে আসার ফাংশন
 async function fetchFirebasePanelData(panelType) {
     try {
-        const safePanelType = sanitizeFirebaseKey(panelType);
-        const snapshot = await db.ref(`panels/${safePanelType}`).once("value");
+        const snapshot = await db.ref(`panels/${panelType}`).once("value");
         const data = snapshot.val() || {};
         
         const customDescription = data.description || null;
         const customImage = data.image || null;
 
-        let options = [];
-
+        let rawOptions = [];
         if (data.options && typeof data.options === "object") {
-            options = Object.keys(data.options).map(key => ({
-                label: String(data.options[key].label || data.options[key]),
-                value: String(data.options[key].value || key)
-            }));
+            rawOptions = Object.keys(data.options).map(key => {
+                const item = data.options[key];
+                const isObject = item !== null && typeof item === "object";
+                return {
+                    label: String(isObject ? (item.label ?? key) : (item ?? key)).trim().slice(0, 100),
+                    value: String(isObject ? (item.value ?? key) : key).trim().slice(0, 80),
+                    ...(isObject && item.description ? { description: String(item.description).trim().slice(0, 100) } : {})
+                };
+            });
         } else {
-            options = Object.keys(data)
+            rawOptions = Object.keys(data)
                 .filter(key => !["description", "image", "title", "options"].includes(key))
-                .map(key => ({
-                    label: String(data[key]),
-                    value: String(key)
-                }));
+                .map(key => ({ label: String(data[key] ?? key).trim().slice(0, 100), value: String(key).trim().slice(0, 80) }));
         }
 
-        if (options.length === 0) {
+        const usedValues = new Set();
+        const options = rawOptions
+            .filter(option => option.label && option.value && !usedValues.has(option.value) && usedValues.add(option.value))
+            .slice(0, 25);
+
+        const paymentPackageAliases = new Set(["weekly", "weekly_plan", "monthly", "monthly_plan", "2_months", "two_months", "two_months_plan", "two", "2months", "2month"]);
+        if (panelType === "payment" && (options.length === 0 || options.every(option => paymentPackageAliases.has(String(option.value).trim().toLowerCase())))) {
+            // Package values/availability are authoritative from adminConfig, not stale labels in panels/payment.
+            options.length = 0;
+            if (isPackageEnabled("weekly")) options.push({ label: `Weekly — ${getPackagePrice("weekly")} BDT`, value: "weekly" });
+            if (isPackageEnabled("monthly")) options.push({ label: `Monthly — ${getPackagePrice("monthly")} BDT`, value: "monthly" });
+            if (isPackageEnabled("2_months")) options.push({ label: `2 Months — ${getPackagePrice("2_months")} BDT`, value: "2_months" });
+            if (options.length === 0) options.push({ label: "Temporarily Unavailable", value: "none" });
+        } else if (options.length === 0) {
             options.push({ label: "No Options Found", value: "none" });
         }
 
@@ -487,8 +1066,12 @@ async function fetchFirebasePanelData(panelType) {
 // 🔑 Key Generation Core Function
 // ================================
 async function handleOneTimeKeyGeneration(interaction) {
-    const hasDevRole = interaction.member.roles.cache.has(ROLES.DEVELOPER);
-    const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator);
+    if (!isFeatureEnabled("oneTimeKeyEnabled")) {
+        return interaction.reply({ content: "🔑 One-Time Key Generator বর্তমানে Admin Panel থেকে বন্ধ আছে।", flags: [MessageFlags.Ephemeral] });
+    }
+    const member = interaction.member;
+    const hasDevRole = Boolean(member?.roles?.cache?.has(getConfiguredRoleId("developer")));
+    const isAdmin = Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator));
 
     if (!hasDevRole && !isAdmin) {
         return interaction.reply({
@@ -497,37 +1080,44 @@ async function handleOneTimeKeyGeneration(interaction) {
         });
     }
 
-    const randomBytesStr = crypto.randomBytes(3).toString("hex").toUpperCase();
-    const randomKey = `KEY-${randomBytesStr}-${Date.now().toString().slice(-4)}`;
-    const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
-    const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
-    
-    const safeKey = sanitizeFirebaseKey(randomKey);
-    const keyRef = db.ref(`keys/${safeKey}`);
-    
-    await keyRef.set({
-        used: false,
-        generatedBy: interaction.user.tag,
-        username: interaction.user.username,
-        userId: interaction.user.id,
-        avatarUrl: userAvatarUrl,
-        serverName: serverName,
-        createdAt: Date.now()
-    });
+    try {
+        const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", size: 512 });
+        const serverName = interaction.guild?.name || "Discord Server";
+        let randomKey = null;
 
-    await safeLogAudit("ONE_TIME_KEY_GENERATE", interaction.user.id, null, { key: randomKey });
+        // Collision হলে পুরোনো key overwrite না করে নতুন key তৈরি করে।
+        for (let attempt = 0; attempt < 5 && !randomKey; attempt++) {
+            // Keep the original KEY-XXXXXX-1234 format for C++ client compatibility.
+            const candidate = `KEY-${generateSecureBase36(6)}-${Date.now().toString().slice(-4)}`;
+            const keyRef = db.ref(`keys/${candidate}`);
+            const result = await keyRef.transaction((current) => current === null ? {
+                used: false,
+                generatedBy: interaction.user.tag,
+                username: interaction.user.username,
+                userId: interaction.user.id,
+                avatarUrl: userAvatarUrl,
+                serverName,
+                createdAt: Date.now()
+            } : undefined, undefined, false);
+            if (result.committed) randomKey = candidate;
+        }
 
-    const keyEmbed = new EmbedBuilder()
-        .setTitle("🔑 1TIME KEY Generated Successfully!")
-        .setDescription(`আপনার ১-টাইম কী সফলভাবে তৈরি হয়েছে। C++ অ্যাপে লগইন করতে নিচের কী-টি ব্যবহার করুন:\n\n**KEY:** \`${randomKey}\``)
-        .setThumbnail(userAvatarUrl)
-        .setColor("#57F287")
-        .setFooter({ text: "নোট: এই কী-টি C++ অ্যাপে কেবল একবারই ব্যবহার করা যাবে।" });
+        if (!randomKey) throw new Error("Could not allocate a unique one-time key after several attempts.");
 
-    return interaction.reply({ 
-        embeds: [keyEmbed], 
-        flags: [MessageFlags.Ephemeral] 
-    });
+        const keyEmbed = new EmbedBuilder()
+            .setTitle("🔑 1TIME KEY Generated Successfully!")
+            .setDescription(`আপনার ১-টাইম কী সফলভাবে তৈরি হয়েছে। C++ অ্যাপে লগইন করতে নিচের কী-টি ব্যবহার করুন:\n\n**KEY:** \`${randomKey}\``)
+            .setThumbnail(userAvatarUrl)
+            .setColor("#57F287")
+            .setFooter({ text: "নোট: এই কী-টি C++ অ্যাপে কেবল একবারই ব্যবহার করা যাবে।" });
+
+        return interaction.reply({ embeds: [keyEmbed], flags: [MessageFlags.Ephemeral] });
+    } catch (err) {
+        console.error("❌ One-time key generation failed:", err);
+        const payload = { content: "❌ কী তৈরি করা যায়নি। Firebase configuration/permission পরীক্ষা করে আবার চেষ্টা করুন।", flags: [MessageFlags.Ephemeral] };
+        if (interaction.replied || interaction.deferred) return interaction.followUp(payload).catch(() => {});
+        return interaction.reply(payload).catch(() => {});
+    }
 }
 
 // ================================
@@ -557,7 +1147,10 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
     if (status === "verified") { statusText = "✅ Verified"; color = "#00FF00"; }
     else if (status === "left") { statusText = "🚫 Left Server"; color = "#FF0000"; }
 
-    const embed = new EmbedBuilder().setColor(color).setTitle("🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম").setDescription(`✨ স্বাগতম <@${id}> আমাদের সার্ভারে!\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️`).addFields({ name: "👤 Username", value: `${tag}`, inline: true }, { name: "🆔 User ID", value: `${id}`, inline: true }, { name: "⏰ Joined Server", value: joinedTime, inline: true }, { name: "🛡️ Verification Status", value: `**${statusText}**`, inline: true }).setTimestamp();
+    const defaultWelcomeDescription = "✨ স্বাগতম {user} আমাদের সার্ভারে!\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️";
+    const welcomeTitle = formatBotMessage("welcomeTitle", "🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম", { user: `<@${id}>`, server: member.guild?.name || "our server" }).slice(0, 256);
+    const welcomeDescription = formatBotMessage("welcomeDescription", defaultWelcomeDescription, { user: `<@${id}>`, server: member.guild?.name || "our server" }).slice(0, 4000);
+    const embed = new EmbedBuilder().setColor(color).setTitle(welcomeTitle).setDescription(welcomeDescription).addFields({ name: "👤 Username", value: `${tag}`.slice(0, 256), inline: true }, { name: "🆔 User ID", value: `${id}`, inline: true }, { name: "⏰ Joined Server", value: joinedTime, inline: true }, { name: "🛡️ Verification Status", value: `**${statusText}**`, inline: true }).setTimestamp();
     if (thumbnail) embed.setThumbnail(thumbnail);
     if (member.guild) embed.addFields({ name: "👥 Total Members", value: `${member.guild.memberCount}`, inline: true });
     if (verifyTime) embed.addFields({ name: "⚡ Verified At", value: `<t:${Math.floor(verifyTime / 1000)}:R>`, inline: true });
@@ -565,6 +1158,40 @@ function buildDynamicWelcomeEmbed(member, status, isOfflineHook = false, verifyT
     else embed.setFooter({ text: "Professional Security Management System" });
     return embed;
 }
+
+// New member welcome tracking (required for the verification handler to update its welcome embed).
+client.on("guildMemberAdd", async (member) => {
+    if (!isFeatureEnabled("welcomeSystemEnabled")) return;
+    if (member.guild.id !== ALLOWED_GUILD_ID) return;
+    try {
+        const welcomeChannel = member.guild.channels.cache.get(getConfiguredChannelId("welcome"));
+        if (!welcomeChannel) {
+            console.error("❌ Welcome channel not found:", getConfiguredChannelId("welcome"));
+            return;
+        }
+        const welcomeMessage = await welcomeChannel.send({ embeds: [buildDynamicWelcomeEmbed(member, "unverified")] });
+        saveWelcomeLog(member.id, welcomeMessage.id, { isOffline: false, status: "unverified", joinedAt: Date.now() });
+    } catch (error) {
+        console.error("❌ Failed to post welcome message:", error.message);
+    }
+});
+
+client.on("guildMemberRemove", async (member) => {
+    if (!isFeatureEnabled("leaveTrackingEnabled")) return;
+    if (member.guild.id !== ALLOWED_GUILD_ID) return;
+    try {
+        const logs = getWelcomeLogs();
+        const userLog = logs[member.id];
+        if (!userLog?.messageId) return;
+        const welcomeChannel = member.guild.channels.cache.get(getConfiguredChannelId("welcome"));
+        if (!welcomeChannel) return;
+        const welcomeMessage = await welcomeChannel.messages.fetch(userLog.messageId);
+        await welcomeMessage.edit({ embeds: [buildDynamicWelcomeEmbed(member, "left", Boolean(userLog.isOffline))] });
+        saveWelcomeLog(member.id, userLog.messageId, { ...userLog, status: "left", leftAt: Date.now() });
+    } catch (error) {
+        console.error("❌ Failed to update leave tracking:", error.message);
+    }
+});
 
 // ================================
 // 🛒 Order Status Embed Builder
@@ -602,8 +1229,39 @@ function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = nu
     return embed;
 }
 
-// Ghost Ping Tracking
+// XP transaction callback must remain side-effect free: Firebase may retry it.
+async function awardMessageXp(message) {
+    const xpRef = db.ref(`leveling/${message.author.id}`);
+    const levelSettings = getLevelingSettings();
+    let previousLevel = 1;
+    const result = await xpRef.transaction((current) => {
+        const old = current && typeof current === "object" ? current : { xp: 0, level: 1 };
+        const level = Math.max(1, Number.parseInt(old.level, 10) || 1);
+        const gainedXp = crypto.randomInt(levelSettings.xpMin, levelSettings.xpMax + 1);
+        let xp = Math.max(0, Number(old.xp) || 0) + gainedXp;
+        let nextLevel = level;
+        previousLevel = level;
+        while (xp >= nextLevel * levelSettings.xpPerLevelBase) {
+            xp -= nextLevel * levelSettings.xpPerLevelBase;
+            nextLevel += 1;
+        }
+        return { xp, level: nextLevel };
+    }, undefined, false);
+
+    if (!result.committed) return;
+    const finalData = result.snapshot.val() || {};
+    const finalLevel = Number(finalData.level) || 1;
+    if (finalLevel > previousLevel) {
+        await message.channel.send(formatBotMessage("levelUp", "🎉 অভিনন্দন <@{user}>! আপনি লেভেল **{level}** এ উন্নীত হয়েছেন।", { user: message.author.id, level: finalLevel }).slice(0, 1900))
+            .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
+            .catch(() => {});
+        await message.member.roles.add(getConfiguredRoleId("level")).catch(() => {});
+    }
+}
+
+// Ghost Ping ট্র্যাকিং
 client.on("messageDelete", async (message) => {
+    if (!isFeatureEnabled("ghostPingEnabled")) return;
     if (!message.guild || message.author?.bot) return;
     if (message.mentions.users.size > 0 || message.mentions.roles.size > 0) {
         const targets = [...message.mentions.users.values()].map(u => u.toString()).join(" ") || [...message.mentions.roles.values()].map(r => r.toString()).join(" ");
@@ -619,88 +1277,81 @@ client.on("messageDelete", async (message) => {
 // Automod + Activity XP System
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
-    if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(ROLES.ADMIN)) return;
+    if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(getConfiguredRoleId("admin"))) return;
+    if (!isFeatureEnabled("automodEnabled")) {
+        if (isFeatureEnabled("levelingEnabled")) await awardMessageXp(message).catch(err => console.error("Leveling XP failed:", err.message));
+        return;
+    }
     
     const userId = message.author.id; 
     let triggerAutomod = false; 
     let reason = "";
     const contentLower = message.content.toLowerCase();
 
-    // 🛑 Caps-Lock Protection
+    const automodSettings = getAutomodSettings();
+
+    // Caps-lock protection can be independently enabled/disabled.
     const upperCount = message.content.replace(/[^A-Z]/g, "").length;
     const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
-    if (totalLetters > 5 && (upperCount / totalLetters) > 0.7) {
+    if (isFeatureEnabled("capsProtectionEnabled") && totalLetters >= automodSettings.minCapsLetters && (upperCount / Math.max(1, totalLetters)) > automodSettings.maxUppercaseRatio) {
         try { await message.delete().catch(() => {}); } catch(e){}
-        const capsWarn = await message.channel.send(`⚠️ <@${userId}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর (Caps Lock) ব্যবহার করবেন না।`);
+        const capsWarn = await message.channel.send(formatBotMessage("capsWarning", "⚠️ <@{user}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর (Caps Lock) ব্যবহার করবেন না।", { user: userId }).slice(0, 1900));
         setTimeout(() => capsWarn.delete().catch(() => {}), 5000);
         return;
     }
 
-    // 🎮 Activity Leveling (Firebase XP System)
-    const safeUserId = sanitizeFirebaseKey(userId);
-    const xpRef = db.ref(`leveling/${safeUserId}`);
-    xpRef.transaction((current) => {
-        if (!current) {
-            return { xp: 10, level: 1 };
-        } else {
-            let nextXp = (current.xp || 0) + Math.floor(Math.random() * 5) + 5;
-            let nextLevel = current.level || 1;
-            let neededXp = nextLevel * 100;
-            if (nextXp >= neededXp) {
-                nextXp -= neededXp;
-                nextLevel += 1;
-                
-                message.channel.send(`🎉 অভিনন্দন <@${userId}>! আপনি লেভেল **${nextLevel}** এ উন্নীত হয়েছেন।`).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
-                message.member.roles.add(LEVEL_ROLE_ID).catch(() => {});
-            }
-            return { xp: nextXp, level: nextLevel };
-        }
-    });
-
-    // Anti-Link Spam
+    // Anti-link protection is an independently controlled feature.
     const linkRegex = /(https?:\/\/[^\s]+)/g;
-    if (linkRegex.test(message.content)) {
+    if (isFeatureEnabled("antiLinkEnabled") && linkRegex.test(message.content)) {
         try { await message.delete().catch(() => {}); } catch(e){}
-        const linkWarn = await message.channel.send(`⚠️ <@${userId}>, সার্ভারে কোনো প্রকার বাইরের লিংক ছড়ানো সম্পূর্ণ নিষিদ্ধ!`);
+        const linkWarn = await message.channel.send(formatBotMessage("linkWarning", "⚠️ <@{user}>, সার্ভারে বাইরের লিংক পোস্ট করা নিষিদ্ধ!", { user: userId }).slice(0, 1900));
         setTimeout(() => linkWarn.delete().catch(() => {}), 5000);
         return;
     }
 
-    // Live link response
-    if (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক")) {
+    // Dynamic invite/verification-link response.
+    if (isFeatureEnabled("linkResponseEnabled") && VERIFICATION_LINK && (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক"))) {
         return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
     }
 
-    if (BAD_WORDS.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
-    if (!triggerAutomod) {
+    const blockedWords = automodSettings.blockedWords;
+    if (isFeatureEnabled("badWordsFilterEnabled") && blockedWords.some(word => contentLower.includes(word))) { triggerAutomod = true; reason = "গালিগালাজ / নিষিদ্ধ শব্দ ব্যবহার"; }
+    if (!triggerAutomod && isFeatureEnabled("spamProtectionEnabled")) {
         const now = Date.now(); if (!userMsgCounter.has(userId)) userMsgCounter.set(userId, []);
         const timestamps = userMsgCounter.get(userId); timestamps.push(now);
-        const expirationTime = now - 5000; const activeTimestamps = timestamps.filter(time => time > expirationTime);
+        const expirationTime = now - automodSettings.spamWindowSeconds * 1000; const activeTimestamps = timestamps.filter(time => time > expirationTime);
         userMsgCounter.set(userId, activeTimestamps);
-        if (activeTimestamps.length >= 5) { triggerAutomod = true; reason = "অতিরিক্ত স্প্যামিং করা"; }
+        if (activeTimestamps.length >= automodSettings.spamCount) { triggerAutomod = true; reason = "অতিরিক্ত স্প্যামিং করা"; }
     }
     if (triggerAutomod) {
         try { await message.delete().catch(() => {}); } catch(e){}
-        
-        // Persistent Automod Warns via Firebase
-        const warnRef = db.ref(`automod/warnings/${safeUserId}`);
-        let currentWarns = 0;
-        await warnRef.transaction((val) => {
-            currentWarns = (val || 0) + 1;
-            return currentWarns;
-        });
-
-        if (currentWarns < 3) {
-            const warnEmbed = new EmbedBuilder().setColor("Yellow").setDescription(`⚠️ <@${userId}>, সার্ভারে **${reason}** নিষিদ্ধ! আপনি এটি **${currentWarns}/৩** বার করেছেন।`);
+        const currentAutomodSettings = getAutomodSettings();
+        let warns = (userWarns.get(userId) || 0) + 1; userWarns.set(userId, warns);
+        if (warns < currentAutomodSettings.warningLimit) {
+            const warnEmbed = new EmbedBuilder().setColor("Yellow").setDescription(formatBotMessage("automodWarning", "⚠️ <@{user}>, সার্ভারে **{reason}** নিষিদ্ধ! আপনি এটি **{warns}/{limit}** বার করেছেন।", { user: userId, reason, warns, limit: currentAutomodSettings.warningLimit }).slice(0, 4000));
             const warnMsg = await message.channel.send({ embeds: [warnEmbed] }); setTimeout(() => warnMsg.delete().catch(() => {}), 5000);
         } else {
-            await warnRef.set(0); 
-            savePunishment(userId, "Muted", 10 * 60 * 1000); 
-            try { 
-                await message.member.timeout(10 * 60 * 1000, "Automod: Limit Exceeded"); 
-                const muteEmbed = new EmbedBuilder().setColor("Red").setTitle("🚫 মেম্বার মিউটেড").setDescription(`<@${userId}> কে ১০ মিনিটের জন্য মিউট করা হয়েছে।`); 
-                await message.channel.send({ embeds: [muteEmbed] }); 
-            } catch (err) {}
+            userWarns.set(userId, 0);
+            const timeoutMs = currentAutomodSettings.timeoutMinutes * 60 * 1000;
+            savePunishment(userId, "Muted", timeoutMs);
+            try {
+                await message.member.timeout(timeoutMs, "Automod: Limit Exceeded");
+                const muteEmbed = new EmbedBuilder().setColor("Red")
+                    .setTitle(formatBotMessage("timeoutTitle", "🚫 মেম্বার মিউটেড", { user: userId }).slice(0, 256))
+                    .setDescription(formatBotMessage("timeoutDescription", "<@{user}> কে {minutes} মিনিটের জন্য মিউট করা হয়েছে।", { user: userId, minutes: currentAutomodSettings.timeoutMinutes }).slice(0, 4000));
+                await message.channel.send({ embeds: [muteEmbed] });
+            } catch (err) {
+                console.error("❌ Automod timeout failed:", err.message);
+            }
+        }
+        return; // Deleted/flagged messages must not earn XP.
+    }
+
+    if (isFeatureEnabled("levelingEnabled")) {
+        try {
+            await awardMessageXp(message);
+        } catch (err) {
+            console.error("❌ XP transaction failed:", err.message);
         }
     }
 });
@@ -712,241 +1363,97 @@ client.on("messageCreate", async (message) => {
 const verificationRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder().setCustomId("universal_verify_button").setLabel("Verify Me").setStyle(ButtonStyle.Success)
 );
-function createVerificationEmbed() { return new EmbedBuilder().setTitle("🚨 Verification Required").setDescription("👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন").setColor("Blue").setImage(COVER_IMAGES.VERIFY).setTimestamp(); }
-
-// Specialized Claim Handler Routine
-async function handleClaimAction(interaction) {
-    await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-    const safeChannelId = sanitizeFirebaseKey(interaction.channel.id);
-    const ticketRef = db.ref(`tickets/${safeChannelId}`);
-
-    const ticketSnap = await ticketRef.once("value");
-    if (!ticketSnap.exists()) {
-        return interaction.editReply("❌ **টিকিট রেজিস্ট্রি ডাটা পাওয়া যায়নি!**");
-    }
-
-    const ticket = ticketSnap.val();
-    const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator) || interaction.member.roles.cache.has(ROLES.ADMIN);
-    let isAuthorized = isAdmin;
-
-    if (!isAuthorized) {
-        if ((ticket.type === "ticket" || ticket.type === "report") && interaction.member.roles.cache.has(ROLES.SUPPORT_TICKET_REPORT)) {
-            isAuthorized = true;
-        } else if ((ticket.type === "customer" || ticket.type === "order") && interaction.member.roles.cache.has(ROLES.SUPPORT_CUSTOMER)) {
-            isAuthorized = true;
-        }
-    }
-
-    if (!isAuthorized) {
-        return interaction.editReply("❌ **আপনার এই টিকিট Claim করার অনুমতি নেই।**");
-    }
-
-    // Atomic Status Transition: OPEN -> CLAIMED
-    const claimResult = await ticketRef.transaction((currentTicket) => {
-        if (!currentTicket) return currentTicket;
-        if (currentTicket.status !== "OPEN") {
-            return; // Abort if already claimed or closed
-        }
-        return {
-            ...currentTicket,
-            status: "CLAIMED",
-            claimedBy: interaction.user.id,
-            claimedAt: Date.now()
-        };
-    });
-
-    if (!claimResult.committed) {
-        return interaction.editReply("⚠️ **এই টিকিটটি ইতোমধ্যে অন্য একজন স্টাফ Claim করে ফেলেছেন!**");
-    }
-
-    let channelPermSuccess = false;
-    try {
-        await interaction.channel.permissionOverwrites.edit(interaction.user.id, {
-            ViewChannel: true,
-            SendMessages: true,
-            ReadMessageHistory: true,
-            ManageChannels: true
-        });
-        channelPermSuccess = true;
-    } catch (permErr) {
-        console.error("❌ Permission Update Error during Claim:", permErr);
-        await ticketRef.update({
-            recoveryRequired: true,
-            recoveryReason: "CLAIM_PERMISSION_FAILED"
-        });
-    }
-
-    await safeLogAudit("TICKET_CLAIMED", interaction.user.id, ticket.ticketId, {
-        channelId: interaction.channel.id,
-        type: ticket.type
-    });
-
-    // Update Staff Duty Analytics Count
-    const safeStaffId = sanitizeFirebaseKey(interaction.user.id);
-    await db.ref(`staff_duty/${safeStaffId}/claimedCount`).transaction((cnt) => (cnt || 0) + 1);
-
-    const claimEmbed = new EmbedBuilder()
-        .setTitle("🛟 Ticket Claimed")
-        .setDescription(`এই টিকিটটি সফলভাবে <@${interaction.user.id}> দ্বারা **Claimed** করা হয়েছে।`)
-        .setColor("Green")
-        .setTimestamp();
-
-    await interaction.channel.send({ embeds: [claimEmbed] });
-    return interaction.editReply("✅ টিকিট সফলভাবে Claim করা হয়েছে!");
+function createVerificationEmbed() {
+    return new EmbedBuilder()
+        .setTitle(formatBotMessage("verifyTitle", "🚨 Verification Required").slice(0, 256))
+        .setDescription(formatBotMessage("verifyDescription", "👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন").slice(0, 4000))
+        .setColor("Blue").setImage(COVER_IMAGES.VERIFY).setTimestamp();
 }
-
-// Specialized Close Handler Routine
-async function handleCloseAction(interaction) {
-    await interaction.deferReply();
-    const safeChannelId = sanitizeFirebaseKey(interaction.channel.id);
-    const ticketRef = db.ref(`tickets/${safeChannelId}`);
-
-    const ticketSnap = await ticketRef.once("value");
-    if (!ticketSnap.exists()) {
-        return interaction.followUp("❌ **টিকিট রেজিস্ট্রি ডাটা পাওয়া যায়নি!**");
+function getDisabledFeatureMessage(interaction) {
+    const id = String(interaction.customId || "");
+    if (["select_buy_category"].includes(id) || /^(pay_gateway_|pay_provider_|check_reader_|submit_txn_|modal_txn_|open_cred_modal_|modal_create_account_|apply_coupon_|modal_coupon_)/.test(id)) {
+        if (!isCheckoutAllowed()) return formatBotMessage("checkoutUnavailable", "🛠️ Shop checkout বর্তমানে বন্ধ অথবা maintenance mode চালু আছে। পরে আবার চেষ্টা করুন।").slice(0, 1800);
+        if (/^(apply_coupon_|modal_coupon_)/.test(id) && ADMIN_BOT_CONFIG.coupons?.enabled === false) return "🎟️ Coupon system বর্তমানে বন্ধ আছে।";
+        if (/^(create_ticket_|create_report_|create_customer_|select_product_ticket)/.test(id) && !isFeatureEnabled("ticketPanelEnabled")) return "🎫 Ticket/Support panel বর্তমানে বন্ধ আছে।";
     }
-
-    const ticket = ticketSnap.val();
-    const isAdmin = interaction.member.permissions.has(PermissionFlagsBits.Administrator) || interaction.member.roles.cache.has(ROLES.ADMIN);
-    let isAuthorized = isAdmin;
-
-    if (!isAuthorized) {
-        if ((ticket.type === "ticket" || ticket.type === "report") && interaction.member.roles.cache.has(ROLES.SUPPORT_TICKET_REPORT)) {
-            isAuthorized = true;
-        } else if ((ticket.type === "customer" || ticket.type === "order") && interaction.member.roles.cache.has(ROLES.SUPPORT_CUSTOMER)) {
-            isAuthorized = true;
-        }
-    }
-
-    if (!isAuthorized) {
-        return interaction.followUp("❌ **আপনার এই টিকিট Close করার অনুমতি নেই।**");
-    }
-
-    // Atomic State Transition Guard
-    const closeLock = await ticketRef.transaction((curr) => {
-        if (!curr) return curr;
-        if (["CLOSING", "TRANSCRIPT_CREATING", "TRANSCRIPT_SAVED", "CLOSED"].includes(curr.status)) {
-            return; // Reject Duplicate Request
-        }
-        return {
-            ...curr,
-            status: "CLOSING",
-            closingStartedAt: Date.now()
-        };
-    });
-
-    if (!closeLock.committed) {
-        return interaction.followUp("⚠️ **এই টিকিটটি ইতোমধ্যে বন্ধ করার প্রক্রিয়ায় রয়েছে।**");
-    }
-
-    await interaction.followUp("⏳ **টিকিট ট্রান্সক্রিপ্ট তৈরি এবং চ্যানেল বন্ধ করার কাজ চলছে...**");
-
-    // Lifecycle Step 1: TRANSCRIPT_CREATING
-    await ticketRef.update({ status: "TRANSCRIPT_CREATING" });
-
-    let transcriptChannel = interaction.guild.channels.cache.get(TRANSCRIPT_LOG_CHANNEL_ID);
-    let transcriptSaved = false;
-
-    try {
-        const attachment = await discordTranscripts.createTemplate(interaction.channel, {
-            limit: -1,
-            returnNode: false,
-            fileName: `transcript-${ticket.ticketId}.html`
-        });
-
-        if (transcriptChannel) {
-            const transcriptEmbed = new EmbedBuilder()
-                .setTitle(`📜 TICKET TRANSCRIPT [${ticket.ticketId}]`)
-                .addFields(
-                    { name: "👤 টিকিট ইউজার", value: `<@${ticket.userId}>`, inline: true },
-                    { name: "🛟 ಕ್ಲೇম করেছেন", value: ticket.claimedBy ? `<@${ticket.claimedBy}>` : "কেউ না", inline: true },
-                    { name: "🔒 বন্ধ করেছেন", value: `${interaction.user}`, inline: true },
-                    { name: "🏷️ ক্যাটাগরি", value: `\`${ticket.category || ticket.type}\``, inline: true }
-                )
-                .setColor("Blue")
-                .setTimestamp();
-
-            await transcriptChannel.send({ embeds: [transcriptEmbed], files: [attachment] });
-            transcriptSaved = true;
-        }
-    } catch (tErr) {
-        console.error("❌ Transcript Generation/Upload Error:", tErr);
-    }
-
-    if (!transcriptSaved) {
-        await ticketRef.update({
-            status: "TRANSCRIPT_FAILED",
-            recoveryRequired: true,
-            recoveryReason: "TRANSCRIPT_CREATION_FAILED"
-        });
-        return interaction.followUp("⚠️ **Transcript তৈরি ব্যর্থ হয়েছে। ডাটা সুরক্ষার জন্য টিকিট চ্যানেল রাখা হয়েছে।**");
-    }
-
-    // Lifecycle Step 2: TRANSCRIPT_SAVED -> CLOSED -> ACTIVE CLEARANCE -> DELETE
-    await ticketRef.update({ status: "TRANSCRIPT_SAVED" });
-    await ticketRef.update({ status: "CLOSED", closedAt: Date.now() });
-
-    const safeUserId = sanitizeFirebaseKey(ticket.userId);
-    await db.ref(`tickets_active/${safeUserId}_${ticket.type}`).remove();
-
-    await safeLogAudit("TICKET_CLOSED", interaction.user.id, ticket.ticketId, {
-        channelId: interaction.channel.id
-    });
-
-    setTimeout(async () => {
-        try {
-            await interaction.channel.delete();
-        } catch (e) {
-            console.error("❌ Channel Deletion Error:", e);
-        }
-    }, 3000);
+    if (/^(create_ticket_|create_report_|create_customer_|select_product_ticket)/.test(id) && !isFeatureEnabled("ticketPanelEnabled")) return "🎫 Ticket/Support panel বর্তমানে বন্ধ আছে।";
+    if (id === "universal_verify_button" && !isFeatureEnabled("verificationEnabled")) return "🛡️ Verification system সাময়িকভাবে বন্ধ আছে।";
+    if (id.startsWith("giveaway_join_") && !isFeatureEnabled("giveawayEnabled")) return "🎉 Giveaway বর্তমানে বন্ধ আছে।";
+    return null;
 }
 
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
+    try {
+    const disabledFeatureMessage = getDisabledFeatureMessage(interaction);
+    if (disabledFeatureMessage) {
+        const payload = { content: disabledFeatureMessage, flags: [MessageFlags.Ephemeral] };
+        if (interaction.deferred) await interaction.editReply({ content: disabledFeatureMessage });
+        else await interaction.reply(payload);
+        return;
+    }
+    if (interaction.isStringSelectMenu() && interaction.customId === "select_buy_category" && !isCheckoutAllowed()) {
+        return interaction.reply({ content: "🛠️ Shop checkout বন্ধ আছে।", flags: [MessageFlags.Ephemeral] });
+    }
     if (interaction.isButton() || interaction.isStringSelectMenu()) {
         const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
-        if (cooldowns.has(cooldownKey) && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("pay_") && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_")) return interaction.reply({ content: "⚠️ আপনি খুব দ্রুত ক্লিক করছেন!", flags: [MessageFlags.Ephemeral] });
-        cooldowns.set(cooldownKey, true); setTimeout(() => cooldowns.delete(cooldownKey), 3000);
+        const paymentOnlineControl = interaction.customId.startsWith("pay_provider_") || interaction.customId.startsWith("check_reader_");
+        if (cooldowns.has(cooldownKey) && !paymentOnlineControl && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_")) {
+            return interaction.reply({ content: "⚠️ অনুরোধটি ইতোমধ্যে নেওয়া হয়েছে। কয়েক সেকেন্ড অপেক্ষা করুন।", flags: [MessageFlags.Ephemeral] });
+        }
+        if (!paymentOnlineControl) {
+            cooldowns.set(cooldownKey, true);
+            setTimeout(() => cooldowns.delete(cooldownKey), 3000);
+        }
+    }
+
+    if (interaction.isButton() && interaction.customId === "toggle_auto_coupon") {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        try {
+            const prefRef = db.ref(`user_settings/${interaction.user.id}/autoCouponEnabled`);
+            const result = await prefRef.transaction(current => current === false ? true : false, undefined, false);
+            const enabled = result.committed ? result.snapshot.val() === true : await isAutoCouponEnabled(interaction.user.id);
+            const settingText = enabled
+                ? "🟢 **Auto Coupon: ON** — পরের নতুন checkout-এ আপনার active coupon-এর উপযুক্ত অংশ নিজে থেকে ব্যবহার হবে।"
+                : "⚪ **Auto Coupon: OFF** — পরের নতুন checkout-এ স্বয়ংক্রিয়ভাবে coupon ব্যবহার হবে না; চাইলে coupon code হাতে দিতে পারবেন।";
+            return interaction.editReply(`${settingText}\nএই পরিবর্তন পরের নতুন checkout থেকে কার্যকর হবে।`);
+        } catch (err) {
+            console.error("Auto coupon preference toggle failed:", err.message);
+            return interaction.editReply("❌ Auto Coupon সেটিং পরিবর্তন করা যায়নি। পরে আবার চেষ্টা করুন.");
+        }
     }
 
     if (interaction.isButton() && interaction.customId === "universal_verify_button") {
         try {
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const role = interaction.guild.roles.cache.get(VERIFIED_ROLE_ID);
+            const role = interaction.guild.roles.cache.get(getConfiguredRoleId("verified"));
             if (!role) return interaction.editReply("❌ Role not found!");
-            if (interaction.member.roles.cache.has(VERIFIED_ROLE_ID)) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
-            await interaction.member.roles.add(role); await interaction.editReply("✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!");
+            if (interaction.member.roles.cache.has(getConfiguredRoleId("verified"))) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
+            await interaction.member.roles.add(role); await interaction.editReply(formatBotMessage("verificationSuccess", "✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!", { user: interaction.user.id }).slice(0, 1800));
             
             db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
-            await safeLogAudit("USER_VERIFIED", interaction.user.id, interaction.user.id);
 
-            const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(WELCOME_CHANNEL_ID);
+            const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(getConfiguredChannelId("welcome"));
             if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(interaction.member, "verified", userLog.isOffline, Date.now()); await msg.edit({ embeds: [updatedEmbed] }); } } catch (e) {} }
         } catch (err) { console.error(err); }
         return;
     }
 
-    // 🔑 OneTime Key Handler
+    // 🔑 Button ভিত্তিক OneTime Key Handler
     if (interaction.isButton() && (interaction.customId === "btn_generate_1time_key" || interaction.customId === "generate_1time_key")) {
         return handleOneTimeKeyGeneration(interaction);
     }
 
-    // Giveaway Handler
+    // Giveaway বাটনে ক্লিক ট্র্যাকিং
     if (interaction.isButton() && interaction.customId.startsWith("giveaway_join_")) {
-        const gwId = sanitizeFirebaseKey(interaction.customId.split("_")[2]);
-        const safeUserId = sanitizeFirebaseKey(interaction.user.id);
-        const participantRef = db.ref(`giveaways/${gwId}/participants/${safeUserId}`);
-        
-        const result = await participantRef.transaction((currentData) => {
-            if (currentData) return; // Already entered
-            return interaction.user.tag;
-        });
-
-        if (!result.committed) {
+        const gwId = interaction.customId.split("_")[2];
+        const participantRef = db.ref(`giveaways/${gwId}/participants/${interaction.user.id}`);
+        const snap = await participantRef.once("value");
+        if (snap.exists()) {
             return interaction.reply({ content: "❌ আপনি অলরেডি এই গিভঅ্যাওয়েতে জয়েন করেছেন!", flags: [MessageFlags.Ephemeral] });
         }
+        await participantRef.set(interaction.user.tag);
         
         const fullSnap = await db.ref(`giveaways/${gwId}`).once("value");
         const gwData = fullSnap.val();
@@ -959,7 +1466,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.reply({ content: "✅ আপনি সফলভাবে গিভঅ্যাওয়েতে নাম এন্ট্রি করেছেন!", flags: [MessageFlags.Ephemeral] });
     }
 
-    // Ticket Rating System
+    // এডভান্সড টিকেট রেটিং ফিডব্যাক সিস্টেম
     if (interaction.isButton() && interaction.customId.startsWith("star_rating_")) {
         const [, , stars, staffId] = interaction.customId.split("_");
         
@@ -974,7 +1481,7 @@ client.on("interactionCreate", async (interaction) => {
         const [, , stars, staffId] = interaction.customId.split("_");
         const comment = interaction.fields.getTextInputValue("feedback_comment") || "কোনো কমেন্ট নেই।";
         
-        const reviewChannel = interaction.guild.channels.cache.get(LOG_CHANNEL_ID);
+        const reviewChannel = interaction.guild.channels.cache.get(getConfiguredChannelId("log"));
         if (reviewChannel) {
             const reviewEmbed = new EmbedBuilder()
                 .setTitle("⭐ NEW SUPPORT FEEDBACK")
@@ -991,7 +1498,7 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
     }
 
-    // Dropdown Handlers
+    // 🌟 ড্রপডাউন সিলেকশন হ্যান্ডলার (1TIME KEY + TICKET HANDLING + BUY/PAYMENT PANEL)
     if (interaction.isStringSelectMenu() && (interaction.customId.startsWith("select_product_") || interaction.customId.startsWith("select_report_") || interaction.customId.startsWith("select_customer_") || interaction.customId.startsWith("select_buy_") || interaction.customId.startsWith("select_key_"))) {
         const value = interaction.values[0];
         if (value === "none" || value === "error") return interaction.reply({ content: "❌ অবৈধ অপশন!", flags: [MessageFlags.Ephemeral] });
@@ -1009,15 +1516,95 @@ client.on("interactionCreate", async (interaction) => {
         else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${lowerVal}`; } 
 
         if (type === "order") {
-            const modal = new ModalBuilder().setCustomId(`modal_coupon_${lowerVal}`).setTitle("🎟️ Coupon / Discount Code");
-            const couponInput = new TextInputBuilder()
-                .setCustomId("coupon_code_input")
-                .setLabel("কুপন কোড দিন (না থাকলে SKIP লিখুন)")
-                .setStyle(TextInputStyle.Short)
-                .setValue("SKIP")
-                .setRequired(true);
-            modal.addComponents(new ActionRowBuilder().addComponents(couponInput));
-            return interaction.showModal(modal);
+            const category = getNormalizedCategory(lowerVal);
+            const userId = interaction.user.id;
+            if (!isPackageEnabled(category)) return interaction.reply({ content: "এই প্যাকেজটি Admin Panel থেকে সাময়িকভাবে বন্ধ করা হয়েছে।", flags: [MessageFlags.Ephemeral] });
+            const basePrice = getPackagePrice(category);
+            const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
+            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const newSession = {
+                targetPrice: basePrice,
+                basePrice,
+                appliedCoupon: null,
+                appliedDiscount: 0,
+                totalPaid: 0,
+                usedTxns: [],
+                provider: null,
+                status: "select_provider",
+                createdAt: Date.now(),
+                createdByDiscordId: userId
+            };
+            const sessionResult = await sessionRef.transaction(current => {
+                if (current && current.status === "creating") return;
+                if (current && current.status !== "completed" && ((Number(current.totalPaid) || 0) > 0 || (Array.isArray(current.usedTxns) && current.usedTxns.length > 0))) return;
+                return newSession;
+            }, undefined, false);
+            if (!sessionResult.committed) {
+                return interaction.editReply("⚠️ এই প্যাকেজের একটি পেমেন্ট ইতোমধ্যে প্রক্রিয়াধীন। পুরোনো TxnID/অ্যাকাউন্ট প্রক্রিয়া শেষ না হওয়া পর্যন্ত নতুন checkout শুরু করা যাবে না।");
+            }
+
+            let checkoutSession = sessionResult.snapshot.val() || newSession;
+            const autoCouponEnabled = await isAutoCouponEnabled(userId).catch(() => true);
+            if (autoCouponEnabled) {
+                const autoCoupon = await reserveBestAutoCoupon(userId, category, basePrice).catch(err => {
+                    console.error("Automatic coupon lookup failed:", err.message);
+                    return null;
+                });
+                if (autoCoupon) {
+                    checkoutSession = {
+                        ...checkoutSession,
+                        targetPrice: Math.max(0, basePrice - autoCoupon.discount),
+                        appliedCoupon: autoCoupon.code,
+                        appliedDiscount: autoCoupon.discount,
+                        autoCouponApplied: true,
+                        autoCouponBalanceBefore: autoCoupon.balance,
+                        couponAppliedAt: Date.now()
+                    };
+                    await sessionRef.update(checkoutSession);
+
+                    if (checkoutSession.targetPrice <= 0) {
+                        await consumeCouponBalance(autoCoupon.code, userId, category, autoCoupon.discount);
+                        checkoutSession = { ...checkoutSession, status: "pending", totalPaid: 0, usedTxns: ["AUTO_COUPON_100_PERCENT_OFF"] };
+                        await sessionRef.update(checkoutSession);
+                        const freeEmbed = new EmbedBuilder()
+                            .setTitle(`🎉 Auto Coupon Applied — ${category.toUpperCase()}`)
+                            .setDescription(
+                                `🎟️ **কুপন:** \`${autoCoupon.code}\`\n` +
+                                `💸 **ব্যবহৃত কুপন ব্যালেন্স:** \`${autoCoupon.discount}\` BDT\n` +
+                                `💰 **এখন পরিশোধযোগ্য:** \`0 BDT\`\n\n` +
+                                `আপনার কুপন দিয়ে প্যাকেজের পুরো মূল্য কভার হয়েছে। অ্যাকাউন্ট তৈরি করতে নিচের বাটনে চাপ দিন।`
+                            ).setColor("Green");
+                        const credentialRow = new ActionRowBuilder().addComponents(
+                            new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success)
+                        );
+                        return interaction.editReply({ embeds: [freeEmbed], components: [credentialRow] });
+                    }
+                }
+            }
+
+            const appliedCouponText = checkoutSession.appliedCoupon
+                ? `\n🎟️ **Auto Coupon:** \`${checkoutSession.appliedCoupon}\` — \`${checkoutSession.appliedDiscount} BDT\` ছাড়\n💰 **কুপনের পর পরিশোধযোগ্য:** \`${checkoutSession.targetPrice} BDT\``
+                : `\n🎟️ **Auto Coupon:** ${autoCouponEnabled ? "ON (যোগ্য কুপন থাকলে নিজে থেকে ব্যবহার হবে)" : "OFF (ম্যানুয়াল কুপন ব্যবহার করা যাবে)"}`;
+            const pickerEmbed = new EmbedBuilder()
+                .setTitle(`🛍️ ${category.toUpperCase()} — পেমেন্ট মাধ্যম নির্বাচন করুন`)
+                .setDescription(
+                    `📦 **প্যাকেজ:** \`${category.toUpperCase()}\`\n` +
+                    `💰 **প্যাকেজের মূল্য:** \`${basePrice} BDT\`\n` +
+                    (checkoutSession.appliedCoupon ? appliedCouponText : `${appliedCouponText}`) + `\n\n` +
+                    `bKash অথবা Nagad নির্বাচন করুন। নম্বর দেখানোর আগে bot স্বয়ংক্রিয়ভাবে **ONLINE CHECK** করবে। Reader offline থাকলে কোনো নম্বর দেখানো হবে না।`
+                )
+                .setColor("Blue");
+            const providerRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder().setCustomId(`pay_provider_bkash_${category}`).setLabel("bKash নির্বাচন করুন").setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId(`pay_provider_nagad_${category}`).setLabel("Nagad নির্বাচন করুন").setStyle(ButtonStyle.Success)
+            );
+            const components = [providerRow];
+            if (!autoCouponEnabled && ADMIN_BOT_CONFIG.coupons?.enabled !== false) {
+                components.push(new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`apply_coupon_${category}`).setLabel("🎟️ Coupon Code ব্যবহার করুন").setStyle(ButtonStyle.Secondary)
+                ));
+            }
+            return interaction.editReply({ embeds: [pickerEmbed], components });
         } else if (type) {
             const ephemeralEmbed = new EmbedBuilder().setTitle(`📌 Selected Category: ${value.toUpperCase().replace("_", " ")}`).setDescription(`চ্যানেল তৈরি করতে নিচের বাটনে চাপ দিন।`).setColor(embedColor);
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(buttonId).setLabel(`Create ${type.toUpperCase()}`).setStyle(ButtonStyle.Success));
@@ -1025,47 +1612,18 @@ client.on("interactionCreate", async (interaction) => {
         }
     }
 
-    // Modal Submit & Coupon Handling
+    // Modal Submit & Payment Handlers
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_coupon_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         
-        const idempotencyKey = `coupon_${interaction.user.id}_${interaction.customId}`;
-        const isFirst = await checkAndSetIdempotency(idempotencyKey, 10);
-        if (!isFirst) {
-            return interaction.editReply("⚠️ **Duplicate Submission!** আপনার অনুরোধটি ইতোমধ্যে প্রসেস করা হচ্ছে।");
-        }
-
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-        const rawCoupon = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
-        const couponEntered = sanitizeFirebaseKey(rawCoupon);
+        const couponEntered = interaction.fields.getTextInputValue("coupon_code_input").trim().toUpperCase();
         const userId = interaction.user.id;
-        const safeUserId = sanitizeFirebaseKey(userId);
         
-        // 🔒 ACTIVE PAYMENT SESSION OVERWRITE PROTECTION (ATOMIC MUTEX)
-        const sessionRef = db.ref(`pending_payments/${safeUserId}_${category}`);
-        const sessionLock = await sessionRef.transaction((currentSess) => {
-            if (currentSess) {
-                const activeStates = ["STARTED", "COUPON_RESERVED", "PAYMENT_PENDING", "PARTIALLY_PAID", "PAID", "ACCOUNT_PENDING", "ACCOUNT_CREATING"];
-                if (activeStates.includes(currentSess.status)) {
-                    const isStale = currentSess.createdAt && (Date.now() - currentSess.createdAt > 15 * 60 * 1000);
-                    if (!isStale) return; // Abort overwrite if active session exists and is not stale
-                }
-            }
-            return {
-                sessionId: `sess_${safeUserId}_${category}_${Date.now()}`,
-                userId: userId,
-                category: category,
-                status: "STARTED",
-                createdAt: Date.now()
-            };
-        });
-
-        if (!sessionLock.committed) {
-            return interaction.editReply("⚠️ **অ্যাক্টিভ পেমেন্ট সেশন রয়েছে!** আপনার ইতোমধ্যে একটি পেন্ডিং বা কমপ্লিট পেমেন্ট প্রসেস চালু রয়েছে।");
-        }
-
-        let basePrice = PACKAGE_PRICES[category] || 510;
+        if (!isPackageEnabled(category)) return interaction.editReply("এই প্যাকেজটি বর্তমানে বন্ধ আছে। Shop থেকে অন্য প্যাকেজ নির্বাচন করুন।");
+        if (ADMIN_BOT_CONFIG.coupons?.enabled === false) return interaction.editReply("Coupon system বর্তমানে Admin Panel থেকে বন্ধ আছে।");
+        let basePrice = getPackagePrice(category);
         let finalPrice = basePrice;
         let discountText = "কোনো ডিসকাউন্ট কুপন ব্যবহার করা হয়নি।";
         let appliedCouponCode = null;
@@ -1073,84 +1631,72 @@ client.on("interactionCreate", async (interaction) => {
 
         if (couponEntered !== "SKIP") {
             const couponRef = db.ref(`coupons/${couponEntered}`);
-            const RESERVATION_TTL_MS = 15 * 60 * 1000;
-            
-            // Atomic check & reserve coupon with auto-lease expiry check
-            const claimCouponResult = await couponRef.transaction((currentCoupon) => {
-                if (!currentCoupon) return currentCoupon;
+            const couponSnap = await couponRef.once("value");
+
+            if (couponSnap.exists()) {
+                const couponData = couponSnap.val();
                 const now = Date.now();
-                
-                if (currentCoupon.status === "used" || currentCoupon.status === "USED") return; 
 
-                const isExpired = currentCoupon.reservedAt && (now - currentCoupon.reservedAt > RESERVATION_TTL_MS);
-                if (currentCoupon.status !== "active" && !isExpired) return; 
-                if (currentCoupon.expiresAt && currentCoupon.expiresAt < now) return; 
+                if (couponData.userId !== userId) {
+                    discountText = "❌ **এই কুপনটি আপনার অ্যাকাউন্টের নয়।** নিজের কুপন কোড ব্যবহার করুন।";
+                } else if (couponData.status === "used") {
+                    discountText = "❌ **কুপন কোডটি ইতোমধ্যে ব্যবহার করা হয়েছে!** মূল মূল্য প্রযোজ্য হবে।";
+                } else if (couponData.expiresAt && couponData.expiresAt < now) {
+                    await couponRef.update({ status: "expired" });
+                    discountText = "❌ **কুপন কোডটির মেয়াদ শেষ হয়ে গেছে!** মূল মূল্য প্রযোজ্য হবে।";
+                } else if (couponData.status === "active") {
+                    const reservation = await couponRef.transaction((current) => {
+                        const reserveNow = Date.now();
+                        if (!current || current.status !== "active" || (current.expiresAt && current.expiresAt < reserveNow)) return;
+                        const sameCheckout = current.reservedBy === userId && current.reservedCategory === category;
+                        const staleReservation = current.reservedBy && (reserveNow - (Number(current.reservedAt) || 0) >= 30 * 60 * 1000);
+                        if (current.reservedBy && !sameCheckout && !staleReservation) return;
+                        return {
+                            ...current,
+                            reservedBy: userId,
+                            reservedCategory: category,
+                            reservedAt: reserveNow
+                        };
+                    }, undefined, false);
 
-                return {
-                    ...currentCoupon,
-                    status: "RESERVED",
-                    reservedBy: userId,
-                    reservedAt: now,
-                    reservationExpiresAt: now + RESERVATION_TTL_MS,
-                    reservedSessionId: `${safeUserId}_${category}`
-                };
-            });
-
-            if (claimCouponResult.committed && claimCouponResult.snapshot.exists()) {
-                const couponData = claimCouponResult.snapshot.val();
-                appliedDiscountValue = Number(couponData.couponValue || couponData.discountValue || 0);
-                finalPrice = Math.max(0, basePrice - appliedDiscountValue);
-                appliedCouponCode = couponEntered;
-
-                discountText = `🎉 **কুপন কোড \`${couponEntered}\` সফলভাবে অ্যাপ্লাই হয়েছে!**\n` +
-                               `💸 **ছাড়ের পরিমাণ:** \`${appliedDiscountValue}\` ৳\n` +
-                               `🏷️ **নতুন পরিশোধযোগ্য মূল্য:** \`${finalPrice}\` ৳`;
+                    if (!reservation.committed) {
+                        discountText = "⚠️ **কুপনটি অন্য একটি চেকআউটে সংরক্ষিত আছে বা আর ব্যবহারযোগ্য নয়।** মূল মূল্য প্রযোজ্য হবে।";
+                    } else {
+                        const reservedCoupon = reservation.snapshot.val();
+                        const couponBalance = getCouponBalance(reservedCoupon);
+                        const discount = Math.min(basePrice, couponBalance);
+                        if (!Number.isFinite(discount) || discount <= 0) {
+                            await couponRef.update({ reservedBy: null, reservedCategory: null, reservedAt: null }).catch(() => {});
+                            discountText = "⚠️ **কুপনটির ডিসকাউন্ট ভ্যালু ভুল।** মূল মূল্য প্রযোজ্য হবে।";
+                        } else {
+                            appliedDiscountValue = discount;
+                            finalPrice = Math.max(0, basePrice - appliedDiscountValue);
+                            appliedCouponCode = couponEntered;
+                            discountText = `🎉 **কুপন কোড \`${couponEntered}\` সফলভাবে অ্যাপ্লাই হয়েছে!**\n` +
+                                           `💸 **ছাড়ের পরিমাণ:** \`${appliedDiscountValue}\` ৳\n` +
+                                           `🏷️ **নতুন পরিশোধযোগ্য মূল্য:** \`${finalPrice}\` ৳`;
+                        }
+                    }
+                }
             } else {
-                discountText = "⚠️ **অবৈধ, ব্যবহৃত বা মেয়াদোত্তীর্ণ কুপন কোড!** মূল মূল্য প্রযোজ্য হবে।";
+                discountText = "⚠️ **অবৈধ কুপন কোড!** সিস্টেমের ডেটাবেজে এই কুপন পাওয়া যায়নি। মূল মূল্য প্রযোজ্য হবে।";
             }
         }
 
         if (finalPrice <= 0) {
-            const opId = `op_coupon100_${userId}_${Date.now()}`;
-            await db.ref(`payment_operations/${opId}`).set({
-                operationId: opId,
-                userId: userId,
-                category: category,
-                paymentMethod: "COUPON",
-                state: "COUPON_RESERVED",
-                sessionCommitted: true,
-                couponCommitted: true,
-                txnCommitted: false,
-                createdAt: Date.now(),
-                updatedAt: Date.now()
-            });
-
-            await db.ref(`pending_payments/${safeUserId}_${category}`).update({
+            await db.ref(`pending_payments/${userId}_${category}`).set({
                 targetPrice: 0,
                 basePrice: basePrice,
                 appliedCoupon: appliedCouponCode,
                 appliedDiscount: appliedDiscountValue,
                 totalPaid: 0,
-                status: "PAID",
-                paymentMethod: "COUPON",
-                usedTxns: [],
-                updatedAt: Date.now()
+                usedTxns: ["COUPON_100_PERCENT_OFF"],
+                status: "pending"
             });
 
             if (appliedCouponCode) {
-                const safeAppCoupon = sanitizeFirebaseKey(appliedCouponCode);
-                await db.ref(`coupons/${safeAppCoupon}`).transaction((coupon) => {
-                    if (!coupon || coupon.status === "used" || coupon.status === "USED") return coupon;
-                    return {
-                        ...coupon,
-                        status: "used",
-                        usedBy: userId,
-                        usedAt: Date.now()
-                    };
-                });
+                await consumeCouponBalance(appliedCouponCode, userId, category, appliedDiscountValue);
             }
-
-            await db.ref(`payment_operations/${opId}`).update({ state: "FINALIZED", finalized: true, updatedAt: Date.now() });
 
             const zeroPriceEmbed = new EmbedBuilder()
                 .setTitle(`🎉 100% Discount Applied! (${category.toUpperCase()})`)
@@ -1173,42 +1719,153 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply({ embeds: [zeroPriceEmbed], components: [row] });
         }
 
-        await db.ref(`pending_payments/${safeUserId}_${category}`).update({
+        await db.ref(`pending_payments/${userId}_${category}`).set({
             targetPrice: finalPrice,
-            basePrice: basePrice,
+            basePrice,
             appliedCoupon: appliedCouponCode,
             appliedDiscount: appliedDiscountValue,
             totalPaid: 0,
-            status: "PAYMENT_PENDING",
             usedTxns: [],
-            updatedAt: Date.now()
+            provider: null,
+            status: "select_provider",
+            createdAt: Date.now(),
+            createdByDiscordId: userId
         });
 
-        const payEmbed = new EmbedBuilder()
-            .setTitle(`💳 Payment Gateway: ${category.toUpperCase().replace("_", " ")}`)
+        const pickerEmbed = new EmbedBuilder()
+            .setTitle(`🛍️ ${category.toUpperCase()} — পেমেন্ট মাধ্যম নির্বাচন করুন`)
             .setDescription(
                 `📦 **প্যাকেজের রেগুলার মূল্য:** \`${basePrice}\` BDT\n` +
-                `💰 **আপনাকে পেমেন্ট করতে হবে:** \`${finalPrice}\` BDT\n\n` +
-                `📱 **বিকাশ / নগদ (Personal):** \`${PAYMENT_NUMBER}\`\n\n` +
-                `টাকা পাঠানোর পর প্রাপ্ত Transaction ID (TxnID) দিয়ে নিচের **"Submit TxnID"** বাটনে ক্লিক করুন।\n\n` +
-                `🎁 **কুপন ও ডিসকাউন্ট স্ট্যাটাস:**\n${discountText}`
+                `💰 **ছাড়ের পর পরিশোধযোগ্য:** \`${finalPrice}\` BDT\n\n` +
+                `📱 bKash অথবা Nagad নির্বাচন করুন। নম্বর দেখানোর আগে bot স্বয়ংক্রিয়ভাবে **ONLINE CHECK** করবে। Reader offline থাকলে নম্বর দেখানো হবে না।\n\n` +
+                `🎁 **কুপন স্ট্যাটাস:**\n${discountText}`
             )
-            .setColor("#9B59B6");
-
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`submit_txn_${category}`)
-                .setLabel("Submit TxnID")
-                .setStyle(ButtonStyle.Primary)
+            .setColor("Blue");
+        const providerRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`pay_provider_bkash_${category}`).setLabel("bKash নির্বাচন করুন").setStyle(ButtonStyle.Primary),
+            new ButtonBuilder().setCustomId(`pay_provider_nagad_${category}`).setLabel("Nagad নির্বাচন করুন").setStyle(ButtonStyle.Success)
         );
+        return interaction.editReply({ embeds: [pickerEmbed], components: [providerRow] });
+    }
 
-        return interaction.editReply({ embeds: [payEmbed], components: [row] });
+    if (interaction.isButton() && interaction.customId.startsWith("apply_coupon_")) {
+        const category = getNormalizedCategory(interaction.customId.slice("apply_coupon_".length));
+        const modal = new ModalBuilder().setCustomId(`modal_coupon_${category}`).setTitle("🎟️ Coupon / Discount Code");
+        const couponInput = new TextInputBuilder()
+            .setCustomId("coupon_code_input")
+            .setLabel("কুপন কোড দিন (না থাকলে SKIP লিখুন)")
+            .setStyle(TextInputStyle.Short)
+            .setValue("SKIP")
+            .setRequired(true);
+        modal.addComponents(new ActionRowBuilder().addComponents(couponInput));
+        return interaction.showModal(modal);
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith("pay_provider_")) {
+        const match = /^pay_provider_(bkash|nagad)_(.+)$/.exec(interaction.customId);
+        if (!match) return interaction.reply({ content: "❌ Payment option invalid.", flags: [MessageFlags.Ephemeral] });
+        const provider = match[1];
+        const category = getNormalizedCategory(match[2]);
+        const lockKey = `${interaction.user.id}:${category}`;
+        if (readerCheckLocks.has(lockKey)) {
+            await interaction.deferUpdate().catch(() => {});
+            return;
+        }
+        readerCheckLocks.add(lockKey);
+        readerCheckLastAt.set(interaction.user.id, Date.now());
+        try {
+            await interaction.update({ content: "🟠 **ONLINE CHECK চলছে...** Reader online না হওয়া পর্যন্ত পেমেন্ট নম্বর দেখানো হবে না।", embeds: [], components: [] });
+            const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
+            const sessionSnap = await sessionRef.once("value");
+            const session = sessionSnap.val();
+            if (!session || session.status !== "select_provider") {
+                return interaction.editReply({ content: "⚠️ এই checkout আর নির্বাচনযোগ্য নয়। আবার package নির্বাচন করুন।", embeds: [], components: [] });
+            }
+            const selected = await sessionRef.transaction(current => {
+                if (!current || current.status !== "select_provider") return;
+                return { ...current, provider, status: "checking_reader", providerSelectedAt: Date.now(), lastReaderCheckAt: Date.now() };
+            }, undefined, false);
+            if (!selected.committed) {
+                return interaction.editReply({ content: "⚠️ এই checkout-এ আরেকটি payment check চলছে। একই বাটন বারবার চাপার প্রয়োজন নেই।", embeds: [], components: [] });
+            }
+            const readerState = await getPaymentReaderState();
+            const paymentNumber = getPaymentNumber(provider);
+            const updatedSession = { ...(selected.snapshot.val() || {}), provider };
+            if (readerState.online && paymentNumber) {
+                updatedSession.status = "awaiting_txn";
+                updatedSession.readerCheckedAt = Date.now();
+                updatedSession.readerDeviceUid = readerState.deviceUid;
+                updatedSession.numberShownAt = Date.now();
+            } else {
+                updatedSession.status = readerState.online ? "number_not_configured" : "reader_offline";
+                updatedSession.lastReaderCheckAt = Date.now();
+            }
+            await sessionRef.update(updatedSession);
+            const reply = await interaction.editReply({ content: "", ...buildPaymentPage(category, updatedSession, readerState, paymentNumber) });
+            if (!readerState.online && TRUSTED_READER_UIDS.size > 0) {
+                void autoWatchReaderOnline(interaction, category, sessionRef, provider);
+            }
+            return reply;
+        } catch (err) {
+            console.error("Payment provider selection/online check failed:", err);
+            return interaction.editReply({ content: "❌ ONLINE CHECK করা যায়নি। নম্বর নিরাপত্তার জন্য লুকানো রাখা হয়েছে। পরে আবার check করুন।", embeds: [], components: [] }).catch(() => {});
+        } finally {
+            readerCheckLocks.delete(lockKey);
+        }
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith("check_reader_")) {
+        const category = getNormalizedCategory(interaction.customId.slice("check_reader_".length));
+        const lockKey = `${interaction.user.id}:${category}`;
+        const now = Date.now();
+        const lastCheck = readerCheckLastAt.get(interaction.user.id) || 0;
+        if (readerCheckLocks.has(lockKey) || (now - lastCheck) < READER_RECHECK_COOLDOWN_MS) {
+            // Acknowledge quietly; repeated clicks do not create extra chat messages or backend checks.
+            await interaction.deferUpdate().catch(() => {});
+            return;
+        }
+        readerCheckLocks.add(lockKey);
+        try {
+            await interaction.deferUpdate();
+            const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
+            const snap = await sessionRef.once("value");
+            const session = snap.val();
+            if (!session || !["reader_offline", "number_not_configured", "awaiting_txn", "pending"].includes(session.status) || !["bkash", "nagad"].includes(String(session.provider || ""))) {
+                return interaction.editReply({ content: "❌ সক্রিয় payment session পাওয়া যায়নি। Shop থেকে package নির্বাচন করুন।", embeds: [], components: [] });
+            }
+            const storedCheckAt = Number(session.lastReaderCheckAt) || 0;
+            if (storedCheckAt > 0 && (now - storedCheckAt) < READER_RECHECK_COOLDOWN_MS) {
+                // Persisted cooldown also survives a bot restart; do not message-spam the user.
+                readerCheckLastAt.set(interaction.user.id, storedCheckAt);
+                return;
+            }
+            readerCheckLastAt.set(interaction.user.id, now);
+            await interaction.editReply({ content: "🟠 **ONLINE CHECK চলছে...** একই সময়ে আরেকটি check request প্রয়োজন নেই।", embeds: [], components: [] });
+            const readerState = await getPaymentReaderState();
+            const paymentNumber = getPaymentNumber(session.provider);
+            const updatedSession = { ...session, lastReaderCheckAt: Date.now() };
+            if (readerState.online && paymentNumber) {
+                updatedSession.status = "awaiting_txn";
+                updatedSession.readerCheckedAt = Date.now();
+                updatedSession.readerDeviceUid = readerState.deviceUid;
+                updatedSession.numberShownAt = updatedSession.numberShownAt || Date.now();
+            } else {
+                updatedSession.status = readerState.online ? "number_not_configured" : "reader_offline";
+            }
+            await sessionRef.update(updatedSession);
+            return interaction.editReply({ content: "", ...buildPaymentPage(category, updatedSession, readerState, paymentNumber) });
+        } catch (err) {
+            console.error("Reader recheck failed:", err);
+            return interaction.editReply({ content: "❌ ONLINE CHECK আপাতত ব্যর্থ হয়েছে। নম্বর দেখানো হয়নি।", embeds: [], components: [] }).catch(() => {});
+        } finally {
+            readerCheckLocks.delete(lockKey);
+        }
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("submit_txn_")) {
-        const rawCategory = interaction.customId.split("_")[2].toLowerCase();
+        const rawCategory = interaction.customId.slice("submit_txn_".length).toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-        
+        // Session/provider/numberShownAt is checked after modal submit, avoiding a slow pre-modal DB call.
         const modal = new ModalBuilder()
             .setCustomId(`modal_txn_${category}`)
             .setTitle("🔒 Submit Transaction ID");
@@ -1226,244 +1883,303 @@ client.on("interactionCreate", async (interaction) => {
 
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_txn_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-        
+
         const rawCategory = interaction.customId.split("_")[2].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
-        
-        const rawTxnInput = interaction.fields.getTextInputValue("txn_id_input").trim();
-        const txnId = sanitizeFirebaseKey(rawTxnInput);
+        const txnId = interaction.fields.getTextInputValue("txn_id_input").trim().toUpperCase();
         const userId = interaction.user.id;
-        const safeUserId = sanitizeFirebaseKey(userId);
-
-        const idempotencyKey = `txn_${userId}_${txnId}`;
-        const isFirstRequest = await checkAndSetIdempotency(idempotencyKey, 10);
-        if (!isFirstRequest) {
-            return interaction.editReply("⚠️ **Duplicate Submission!** আপনার পেমেন্ট ভেরিফিকেশন অনুরোধটি ইতোমধ্যে প্রক্রিয়াধীন আছে।");
+        if (!/^[A-Z0-9_-]{3,64}$/.test(txnId)) {
+            return interaction.editReply("❌ Transaction ID-তে অবৈধ অক্ষর আছে। শুধু ইংরেজি অক্ষর, সংখ্যা, _ বা - ব্যবহার করুন (৩–৬৪ অক্ষর)।");
         }
+        const txnLockKey = `${userId}:${category}`;
+        if (paymentTxnLocks.has(txnLockKey)) {
+            return interaction.editReply("⏳ আপনার TxnID ইতোমধ্যে যাচাই হচ্ছে। একই সময়ে আবার submit করার প্রয়োজন নেই।");
+        }
+        const previousTxnSubmitAt = paymentTxnLastAt.get(txnLockKey) || 0;
+        const cooldownRemaining = PAYMENT_TXN_SUBMIT_COOLDOWN_MS - (Date.now() - previousTxnSubmitAt);
+        if (cooldownRemaining > 0) {
+            return interaction.editReply(`🛡️ Spam protection: আবার TxnID submit করার আগে ${Math.ceil(cooldownRemaining / 1000)} সেকেন্ড অপেক্ষা করুন।`);
+        }
+        paymentTxnLocks.add(txnLockKey);
+        paymentTxnLastAt.set(txnLockKey, Date.now());
 
-        const sessionRef = db.ref(`pending_payments/${safeUserId}_${category}`);
-        const txnRef = db.ref(`transactions/${txnId}`);
-        const opId = `op_${userId}_${txnId}_${Date.now()}`;
-        const opRef = db.ref(`payment_operations/${opId}`);
+        const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
+        let txnRef = null;
+        let claimedTxnAt = null;
+        let paymentRecorded = false;
 
         try {
-            // 🔒 ATOMIC TRANSACTION LIFECYCLE MUTEX (AVAILABLE -> CLAIMING -> COMMITTED)
-            const claimResult = await txnRef.transaction((currentData) => {
-                const now = Date.now();
-                if (currentData === null) return currentData; 
-                if (currentData.used === true || currentData.status === "CLAIMED" || currentData.status === "COMMITTED") {
-                    return; 
-                }
-                if (currentData.status === "CLAIMING" && currentData.claimedAt && (now - currentData.claimedAt < 30000)) {
-                    return; 
-                }
-                return {
-                    ...currentData,
-                    status: "CLAIMING",
-                    claimedBy: userId,
-                    claimedAt: now
-                };
-            });
-
-            if (!claimResult.committed || !claimResult.snapshot.exists()) {
-                return interaction.editReply("❌ **অকার্যকর বা ব্যবহৃত Transaction ID!** এই Transaction ID-টি সিস্টেমে নেই বা ইতোমধ্যে ব্যবহার করা হয়েছে।");
+            const sessionSnap = await sessionRef.once("value");
+            if (!sessionSnap.exists()) return interaction.editReply("❌ কোনো payment session পাওয়া যায়নি। Shop থেকে package নির্বাচন করুন।");
+            const initialSession = sessionSnap.val() || {};
+            if (["creating", "completed"].includes(initialSession.status)) {
+                return interaction.editReply("⚠️ এই payment session ইতোমধ্যে ব্যবহার হচ্ছে বা সম্পন্ন হয়েছে।");
+            }
+            const checkoutSettings = getCheckoutSettings();
+            const createdAt = Number(initialSession.createdAt) || 0;
+            if (createdAt > 0 && (Number(initialSession.totalPaid) || 0) <= 0 && Date.now() - createdAt > checkoutSettings.sessionExpiryHours * 60 * 60 * 1000) {
+                await sessionRef.update({ status: "expired", expiredAt: Date.now(), lastUpdated: Date.now() }).catch(() => {});
+                return interaction.editReply(`⌛ এই checkout session-এর মেয়াদ শেষ (${checkoutSettings.sessionExpiryHours} ঘণ্টা)। Shop থেকে নতুন checkout শুরু করুন।`);
+            }
+            if (!initialSession.provider || !initialSession.numberShownAt || !["bkash", "nagad"].includes(String(initialSession.provider))) {
+                return interaction.editReply("🟠 ONLINE CHECK সম্পন্ন নয়। নম্বর দেখানোর আগে Reader status যাচাই করতে হবে।");
+            }
+            if (TRUSTED_READER_UIDS.size === 0) {
+                return interaction.editReply("🔴 Payment Reader trusted device configure করা হয়নি। তাই TxnID স্বয়ংক্রিয়ভাবে verify করা যাচ্ছে না।");
             }
 
-            const txnData = claimResult.snapshot.val();
-            const newTxnAmount = Number(txnData.amount) || 0;
-
-            if (isNaN(newTxnAmount) || newTxnAmount <= 0) {
-                await txnRef.update({ status: "AVAILABLE", claimedBy: null, claimedAt: null });
-                return interaction.editReply("❌ **অবৈধ Transaction Amount!** সেশনে পেমেন্টের সঠিক তথ্য পাওয়া যায়নি।");
+            const readerMatch = await waitForTrustedReaderEvent(txnId);
+            if (!readerMatch) {
+                return interaction.editReply("⏳ এই TxnID trusted Payment Reader-এ এখনো পাওয়া যায়নি। bKash/Nagad notification আসা ও upload হওয়া পর্যন্ত অপেক্ষা করে একই TxnID আবার submit করুন।");
+            }
+            const event = readerMatch.event || {};
+            const selectedProvider = String(initialSession.provider).toLowerCase();
+            const eventProvider = String(event.provider || "").toLowerCase();
+            if (eventProvider !== selectedProvider) {
+                return interaction.editReply(`❌ Provider mismatch: আপনি ${getProviderLabel(selectedProvider)} নির্বাচন করেছেন, কিন্তু Reader event ${getProviderLabel(eventProvider)} থেকে এসেছে। সঠিক payment মাধ্যম নির্বাচন করুন।`);
+            }
+            const eventAmount = Number(event.amount);
+            if (!Number.isFinite(eventAmount) || eventAmount <= 0) {
+                return interaction.editReply("⏳ Reader TxnID পেয়েছে, কিন্তু notification থেকে amount পড়তে পারেনি। স্বয়ংক্রিয়ভাবে credit করা যাবে না।");
+            }
+            const capturedAt = Number(event.capturedAt);
+            const notificationPostedAt = Number(event.notificationPostedAt) || capturedAt;
+            if (!Number.isFinite(capturedAt) || !Number.isFinite(notificationPostedAt) ||
+                notificationPostedAt < (Number(initialSession.createdAt) || 0)) {
+                return interaction.editReply("❌ এই TxnID checkout শুরু হওয়ার আগের notification। পুরোনো transaction দিয়ে নতুন package কেনা যাবে না।");
             }
 
-            await opRef.set({
-                operationId: opId,
-                userId: userId,
-                txnId: txnId,
-                amount: newTxnAmount,
-                category: category,
-                paymentMethod: "TRANSACTION",
-                state: "STARTED",
-                sessionCommitted: false,
-                txnCommitted: false,
-                createdAt: Date.now(),
-                updatedAt: Date.now()
-            });
-
-            let processFailed = false;
-
-            try {
-                // ATOMIC UPDATE FOR PAYMENT SESSION
-                const sessionTxnResult = await sessionRef.transaction((currentSession) => {
-                    const sess = currentSession || {
-                        category: category,
-                        targetPrice: PACKAGE_PRICES[category] || 510,
-                        totalPaid: 0,
-                        status: "PAYMENT_PENDING",
-                        usedTxns: []
-                    };
-
-                    const used = sess.usedTxns || [];
-                    if (used.includes(txnId)) {
-                        return; // Already added
-                    }
-
-                    used.push(txnId);
-                    const updatedTotalPaid = (Number(sess.totalPaid) || 0) + newTxnAmount;
-                    const target = sess.targetPrice || PACKAGE_PRICES[category] || 510;
-
+            txnRef = db.ref(`transactions/${txnId}`);
+            let txnSnap = await txnRef.once("value");
+            if (!txnSnap.exists()) {
+                await txnRef.transaction(current => {
+                    if (current !== null) return;
                     return {
-                        ...sess,
-                        totalPaid: updatedTotalPaid,
-                        usedTxns: used,
-                        status: updatedTotalPaid >= target ? "PAID" : "PARTIALLY_PAID",
-                        lastUpdated: Date.now()
+                        transactionId: txnId,
+                        provider: selectedProvider,
+                        amount: eventAmount,
+                        currency: "BDT",
+                        used: false,
+                        verificationStatus: "evidence_matched",
+                        verificationSource: "reader_notification_evidence",
+                        verifiedByReaderUid: readerMatch.uid,
+                        readerEventKey: readerMatch.eventKey,
+                        eventCapturedAt: capturedAt,
+                        notificationPostedAt,
+                        evidenceMatchedAt: Date.now()
                     };
+                }, undefined, false);
+                txnSnap = await txnRef.once("value");
+            }
+            const txnData = txnSnap.val() || {};
+            const txnStatus = String(txnData.verificationStatus || "").toLowerCase();
+            const verificationSource = String(txnData.verificationSource || "").toLowerCase();
+            if (txnStatus === "rejected") {
+                return interaction.editReply("❌ Admin এই TxnID evidence reject করেছেন। এই TxnID দিয়ে payment credit হবে না। সঠিক TxnID দিন অথবা payment history নিয়ে Support-এর সঙ্গে যোগাযোগ করুন।");
+            }
+            if (txnStatus !== "verified" ||
+                !["official_api", "manual_admin_review"].includes(verificationSource)) {
+                const retryRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`submit_txn_${category}`).setLabel("Admin review-এর পর TxnID আবার দিন").setStyle(ButtonStyle.Primary)
+                );
+                return interaction.editReply({
+                    content: "⏳ Reader notification-এর TxnID evidence পাওয়া গেছে, কিন্তু এটি payment proof নয়। Admin-কে provider transaction history দেখে Admin Panel থেকে manually approve করতে হবে; ততক্ষণ payment credit/account creation হবে না। অনুমোদনের পরে একই TxnID আবার submit করুন।",
+                    components: [retryRow]
                 });
-
-                if (!sessionTxnResult.committed) {
-                    await txnRef.update({ status: "AVAILABLE", claimedBy: null, claimedAt: null });
-                    await opRef.update({ state: "FAILED", updatedAt: Date.now() });
-                    return interaction.editReply("⚠️ এই Transaction ID-টি ইতোমধ্যে আপনার পেমেন্ট সেশনে ব্যবহার করা হয়েছে।");
+            }
+            if (String(txnData.provider || "").toLowerCase() !== selectedProvider) {
+                return interaction.editReply("❌ এই TxnID-র provider checkout-এর সঙ্গে মেলেনি। Payment credit করা হয়নি।");
+            }
+            if (txnData.used === true) return interaction.editReply("🚫 **Duplicate Transaction!** এই Transaction ID আগেই ব্যবহার করা হয়েছে।");
+            const listedAmount = Number(txnData.amount);
+            if (!Number.isFinite(listedAmount) || listedAmount <= 0 || Math.abs(listedAmount - eventAmount) > 0.009) {
+                return interaction.editReply("❌ Transaction amount validation ব্যর্থ হয়েছে। Payment credit করা হয়নি।");
+            }
+            if (!checkoutSettings.allowPartialPayments) {
+                const target = Number(initialSession.targetPrice) || 0;
+                const alreadyPaid = Number(initialSession.totalPaid) || 0;
+                if (target > 0 && alreadyPaid + eventAmount < target) {
+                    return interaction.editReply(`⚠️ Admin partial payment বন্ধ রেখেছেন। এই payment যোগ করলে মোট ${alreadyPaid + eventAmount} BDT হবে, কিন্তু প্রয়োজন ${target} BDT। এই TxnID claim করা হয়নি; সম্পূর্ণ প্রয়োজনীয় পরিমাণের payment করুন বা Admin-এর সঙ্গে যোগাযোগ করুন।`);
                 }
+            }
 
-                await opRef.update({ state: "SESSION_COMMITTED", sessionCommitted: true, updatedAt: Date.now() });
+            const now = Date.now();
+            claimedTxnAt = now;
+            // A transaction prevents two users from claiming the same TxnID at once.
+            const claimResult = await txnRef.transaction((current) => {
+                if (!current || current.used === true) return;
+                const amount = Number(current.amount);
+                if (!Number.isFinite(amount) || amount <= 0) return;
+                return { ...current, used: true, usedBy: userId, usedAt: claimedTxnAt };
+            }, undefined, false);
+            if (!claimResult.committed) {
+                return interaction.editReply("🚫 **Duplicate Transaction!** এই Transaction ID ইতোমধ্যে অন্য একটি রিকোয়েস্ট ব্যবহার করেছে।");
+            }
 
-                const updatedSession = sessionTxnResult.snapshot.val();
-                const targetPrice = updatedSession.targetPrice;
-                const currentTotalPaid = updatedSession.totalPaid;
+            const newTxnAmount = Number(claimResult.snapshot.val()?.amount);
+            if (!Number.isFinite(newTxnAmount) || newTxnAmount <= 0) {
+                await txnRef.transaction(current => current?.usedBy === userId && current?.usedAt === claimedTxnAt ? { ...current, used: false, usedBy: null, usedAt: null } : undefined, undefined, false);
+                return interaction.editReply("❌ Transaction amount invalid. অ্যাডমিনের সাহায্য নিন।");
+            }
 
-                await txnRef.update({
-                    used: true,
-                    status: "COMMITTED",
-                    usedBy: userId,
-                    usedAt: Date.now()
+            let sessionResult;
+            sessionResult = await sessionRef.transaction((current) => {
+                if (!current || ["creating", "completed"].includes(current.status)) return;
+                const target = Number(current.targetPrice);
+                const alreadyPaid = Number(current.totalPaid) || 0;
+                if (!Number.isFinite(target) || target < 0 || alreadyPaid >= target) return;
+                const used = Array.isArray(current.usedTxns) ? current.usedTxns : [];
+                if (used.includes(txnId)) return;
+                return {
+                    ...current,
+                    category,
+                    targetPrice: target,
+                    totalPaid: alreadyPaid + newTxnAmount,
+                    usedTxns: [...used, txnId],
+                    status: "pending",
+                    lastUpdated: Date.now()
+                };
+            }, undefined, false);
+
+            if (!sessionResult.committed) {
+                // The session changed before the TxnID could be applied; release this claim safely.
+                await txnRef.transaction(current => current?.usedBy === userId && current?.usedAt === claimedTxnAt ? { ...current, used: false, usedBy: null, usedAt: null } : undefined, undefined, false);
+                return interaction.editReply("⚠️ পেমেন্ট সেশনটি ইতোমধ্যে আপডেট হয়েছে। সেশনটি রিফ্রেশ করে আবার চেষ্টা করুন।");
+            }
+
+            const sessionData = sessionResult.snapshot.val() || {};
+            const targetPrice = Number(sessionData.targetPrice);
+            const currentTotalPaid = Number(sessionData.totalPaid) || 0;
+            const usedTxns = Array.isArray(sessionData.usedTxns) ? sessionData.usedTxns : [];
+            paymentRecorded = currentTotalPaid >= targetPrice;
+            if (currentTotalPaid < targetPrice) {
+                const remainingDue = targetPrice - currentTotalPaid;
+                const readerState = await getPaymentReaderState();
+                const paymentNumber = getPaymentNumber(sessionData.provider);
+                const nextPage = buildPaymentPage(category, sessionData, readerState, paymentNumber);
+                return interaction.editReply({
+                    content: `⏳ আংশিক পেমেন্ট পাওয়া গেছে। প্রয়োজনীয় মূল্য: ${targetPrice} BDT; মোট পাওয়া: ${currentTotalPaid} BDT; বকেয়া: ${remainingDue} BDT.`,
+                    ...nextPage
                 });
+            }
 
-                await opRef.update({ state: "TXN_COMMITTED", txnCommitted: true, updatedAt: Date.now() });
+            let extraPayment = currentTotalPaid - targetPrice;
+            let createdCouponCode = null;
+            let couponRequestId = null;
 
-                await safeLogAudit("PAYMENT_TXN_CLAIMED", userId, txnId, { amount: newTxnAmount, category });
-
-                if (currentTotalPaid < targetPrice) {
-                    const remainingDue = targetPrice - currentTotalPaid;
-                    await opRef.update({ state: "FINALIZED", updatedAt: Date.now() });
-
-                    const pendingEmbed = new EmbedBuilder()
-                        .setTitle("❌ Payment Verification Pending (আংশিক পেমেন্ট)")
-                        .setDescription(
-                            `আপনি **${category.toUpperCase()}** প্যাকেজ নির্বাচন করেছেন।\n\n` +
-                            `📌 **প্রয়োজনীয় মূল্য:** \`${targetPrice}\` BDT\n` +
-                            `💳 **প্রাপ্ত মোট টাকা:** \`${currentTotalPaid}\` BDT\n` +
-                            `📉 **বকেয়া টাকা:** \`${remainingDue}\` BDT\n\n` +
-                            `⚠️ অবশিষ্ট **${remainingDue} BDT** নিচের নম্বরে বানিয়ে নতুন Transaction ID সাবমিট করুন:\n` +
-                            `📱 **বিকাশ / নগদ (Personal):** \`${PAYMENT_NUMBER}\``
-                        )
-                        .setColor("Orange")
-                        .setTimestamp();
-
-                    const row = new ActionRowBuilder().addComponents(
-                        new ButtonBuilder()
-                            .setCustomId(`submit_txn_${category}`)
-                            .setLabel("➕ Submit Additional TxnID")
-                            .setStyle(ButtonStyle.Secondary)
-                    );
-
-                    return interaction.editReply({ embeds: [pendingEmbed], components: [row] });
-                }
-
-                let extraPayment = currentTotalPaid - targetPrice;
-                let createdCouponCode = null;
-
-                if (extraPayment > 0) {
-                    let isUnique = false;
-                    while (!isUnique) {
-                        createdCouponCode = generateUniqueCouponCode();
-                        const safeCouponCode = sanitizeFirebaseKey(createdCouponCode);
-                        const couponRef = db.ref(`coupons/${safeCouponCode}`);
-                        
-                        const couponResult = await couponRef.transaction((current) => {
-                            if (current !== null) return; 
-                            return {
-                                couponCode: createdCouponCode,
-                                userId: userId,
-                                username: interaction.user.username,
-                                couponValue: extraPayment,
-                                extraPaymentAmount: extraPayment,
-                                createdAt: Date.now(),
-                                expiresAt: Date.now() + (90 * 24 * 60 * 60 * 1000),
-                                status: "active"
-                            };
-                        });
-                        if (couponResult.committed) {
-                            isUnique = true;
-                        }
+            if (extraPayment > 0 && ADMIN_BOT_CONFIG.coupons?.enabled !== false) {
+                const expiryDays = Math.max(1, Math.min(3650, Number(ADMIN_BOT_CONFIG.coupons?.expiryDays) || 90));
+                const overpaymentMode = String(ADMIN_BOT_CONFIG.coupons?.overpaymentMode || "auto").toLowerCase();
+                if (overpaymentMode === "manual") {
+                    // The payment has been credited only after an explicit verification step; coupon approval is separate.
+                    couponRequestId = crypto.createHash("sha256").update([...usedTxns].sort().join("|")).digest("hex").slice(0, 24);
+                    const requestRef = db.ref(`couponRequests/${couponRequestId}`);
+                    const requestResult = await requestRef.transaction(current => current || {
+                        requestId: couponRequestId,
+                        userId,
+                        username: interaction.user.username,
+                        couponValue: extraPayment,
+                        remainingValue: extraPayment,
+                        extraPaymentAmount: extraPayment,
+                        transactionIds: usedTxns.filter(txn => txn !== "AUTO_COUPON_100_PERCENT_OFF" && txn !== "COUPON_100_PERCENT_OFF"),
+                        category,
+                        createdAt: Date.now(),
+                        expiresAt: Date.now() + expiryDays * 24 * 60 * 60 * 1000,
+                        status: "pending",
+                        requestedBy: "overpayment_reward"
+                    }, undefined, false);
+                    if (!requestResult.committed) console.warn("Overpayment coupon request was not newly created; preserving existing request.");
+                } else if (overpaymentMode === "auto") {
+                    const newCouponObj = {
+                        userId,
+                        username: interaction.user.username,
+                        couponValue: extraPayment,
+                        remainingValue: extraPayment,
+                        extraPaymentAmount: extraPayment,
+                        createdAt: Date.now(),
+                        expiresAt: Date.now() + expiryDays * 24 * 60 * 60 * 1000,
+                        status: "active",
+                        source: "verified_overpayment",
+                        sourceRequestId: null
+                    };
+                    // Bounded, atomic allocation prevents an infinite collision loop or accidental overwrite.
+                    for (let attempt = 0; attempt < 10 && !createdCouponCode; attempt++) {
+                        const candidate = generateUniqueCouponCode();
+                        const couponCreate = await db.ref(`coupons/${candidate}`).transaction(
+                            current => current === null ? { ...newCouponObj, couponCode: candidate } : undefined,
+                            undefined,
+                            false
+                        );
+                        if (couponCreate.committed) createdCouponCode = candidate;
                     }
+                    if (!createdCouponCode) console.error("❌ Could not allocate a unique extra-payment coupon.");
                 }
+            }
 
-                if (updatedSession.appliedCoupon) {
-                    const safeAppCoupon = sanitizeFirebaseKey(updatedSession.appliedCoupon);
-                    await db.ref(`coupons/${safeAppCoupon}`).transaction((coupon) => {
-                        if (!coupon || coupon.status === "used" || coupon.status === "USED") return coupon;
-                        return {
-                            ...coupon,
-                            status: "used",
-                            usedBy: userId,
-                            usedAt: Date.now()
-                        };
-                    });
+            if (sessionData.appliedCoupon) {
+                const couponConsumption = await consumeCouponBalance(
+                    sessionData.appliedCoupon,
+                    userId,
+                    category,
+                    Number(sessionData.appliedDiscount) || 0
+                );
+                if (!couponConsumption.committed) {
+                    console.warn("Coupon balance could not be consumed after successful payment:", sessionData.appliedCoupon);
                 }
+            }
 
-                await opRef.update({ state: "FINALIZED", updatedAt: Date.now() });
+            let extraInfoText = "";
+            if (extraPayment > 0 && createdCouponCode) {
+                extraInfoText = `\n\n🎁 **Extra Payment Reward Coupon Generated!**\n` +
+                                `আপনি প্যাকেজের মূল্যের চেয়ে **${extraPayment} ৳** বেশি পরিশোধ করেছেন।\n` +
+                                `আপনার জন্য একটি ডিসকাউন্ট কুপন তৈরি করা হয়েছে:\n` +
+                                `🎟️ **Coupon Code:** \`${createdCouponCode}\`\n` +
+                                `💸 **Discount Balance:** \`${extraPayment}\` ৳\n` +
+                                `📌 **Status:** Active`;
+            } else if (extraPayment > 0 && couponRequestId) {
+                extraInfoText = `\n\n🎁 **Overpayment Coupon Request Submitted**\n` +
+                                `অতিরিক্ত **${extraPayment} ৳** কুপন হিসেবে পাওয়ার অনুরোধ Admin-এর অনুমোদনের অপেক্ষায় আছে।\n` +
+                                `📌 **Request ID:** \`${couponRequestId}\`\nStatus: Pending Approval`;
+            } else if (extraPayment > 0 && ADMIN_BOT_CONFIG.coupons?.enabled === false) {
+                extraInfoText = `\n\nAdmin settings অনুযায়ী coupon reward বর্তমানে বন্ধ আছে; অতিরিক্ত ${extraPayment} ৳-এর বিষয়টি support/admin-এর সঙ্গে নিশ্চিত করুন।`;
+            }
 
-                let extraInfoText = "";
-                if (extraPayment > 0 && createdCouponCode) {
-                    extraInfoText = `\n\n🎁 **Extra Payment Reward Coupon Generated!**\n` +
-                                    `আপনি প্যাকেজের মূল্যের চেয়ে **${extraPayment} ৳** বেশি পরিশোধ করেছেন।\n` +
-                                    `আপনার জন্য একটি ডিসকাউন্ট কুপন তৈরি করা হয়েছে:\n` +
-                                    `🎟️ **Coupon Code:** \`${createdCouponCode}\`\n` +
-                                    `💸 **Discount Balance:** \`${extraPayment}\` ৳\n` +
-                                    `📌 **Status:** Active`;
-                }
+            const successPayEmbed = new EmbedBuilder()
+                .setTitle("✅ Payment Successfully Verified!")
+                .setDescription(
+                    `আপনার পেমেন্ট সফলভাবে ভেরিফাই করা হয়েছে।\n\n` +
+                    `💰 **মোট পরিশোধিত:** \`${currentTotalPaid}\` BDT\n` +
+                    `📦 **প্যাকেজ:** \`${category.toUpperCase()}\`${extraInfoText}\n\n` +
+                    `👉 অ্যাকাউন্ট তৈরির জন্য নিচের **"Create Account Credentials"** বাটনে ক্লিক করুন।`
+                )
+                .setColor("Green");
 
-                const successPayEmbed = new EmbedBuilder()
-                    .setTitle("✅ Payment Successfully Verified!")
-                    .setDescription(
-                        `আপনার পেমেন্ট সফলভাবে ভেরিফাই করা হয়েছে।\n\n` +
-                        `💰 **মোট পরিশোধিত:** \`${currentTotalPaid}\` BDT\n` +
-                        `📦 **প্যাকেজ:** \`${category.toUpperCase()}\`${extraInfoText}\n\n` +
-                        `👉 অ্যাকাউন্ট তৈরির জন্য নিচের **"Create Account Credentials"** বাটনে ক্লিক করুন।`
-                    )
-                    .setColor("Green");
+            const createAccRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`open_cred_modal_${category}`)
+                    .setLabel("🔑 Create Account Credentials")
+                    .setStyle(ButtonStyle.Success)
+            );
 
+            return interaction.editReply({ embeds: [successPayEmbed], components: [createAccRow] });
+
+        } catch (err) {
+            console.error("❌ Txn Verification Error:", err);
+            if (paymentRecorded) {
                 const createAccRow = new ActionRowBuilder().addComponents(
                     new ButtonBuilder()
                         .setCustomId(`open_cred_modal_${category}`)
                         .setLabel("🔑 Create Account Credentials")
                         .setStyle(ButtonStyle.Success)
                 );
-
-                return interaction.editReply({ embeds: [successPayEmbed], components: [createAccRow] });
-
-            } catch (innerErr) {
-                processFailed = true;
-                console.error("❌ Inner Txn Process Error:", innerErr);
-                
-                const snap = await txnRef.once("value");
-                const currentTxn = snap.val();
-                if (currentTxn && (currentTxn.status === "COMMITTED" || currentTxn.status === "CLAIMED")) {
-                    await sessionRef.update({ paymentState: "RECOVERY_REQUIRED", recoveryReason: "TXN_COMMITTED_SESSION_ERROR" });
-                    await opRef.update({ state: "RECOVERY_REQUIRED", recoveryRequired: true, updatedAt: Date.now() });
-                } else {
-                    await txnRef.update({ status: "AVAILABLE", claimedBy: null, claimedAt: null });
-                    await opRef.update({ state: "FAILED", updatedAt: Date.now() });
-                }
-                throw innerErr;
+                return interaction.editReply({
+                    content: "✅ পেমেন্ট রেকর্ড হয়েছে। অতিরিক্ত কুপন/নোটিফিকেশন তৈরি করতে সমস্যা হয়েছে, তবে অ্যাকাউন্ট তৈরি করতে নিচের বাটন ব্যবহার করুন।",
+                    components: [createAccRow]
+                });
             }
-
-        } catch (err) {
-            console.error("❌ Txn Verification Error:", err);
-            return interaction.editReply("❌ **পেমেন্ট প্রক্রিয়াকরণে সমস্যা হয়েছে!** অনুগ্রহ করে অ্যাডমিনের সাথে যোগাযোগ করুন।");
+            return interaction.editReply("❌ **পেমেন্ট প্রক্রিয়াকরণে সমস্যা হয়েছে!** অনুগ্রহ করে পরে আবার চেষ্টা করুন।");
+        } finally {
+            paymentTxnLocks.delete(txnLockKey);
         }
     }
 
@@ -1477,14 +2193,18 @@ client.on("interactionCreate", async (interaction) => {
 
         const userInput = new TextInputBuilder()
             .setCustomId("custom_username")
-            .setLabel("পছন্দমতো Username (ইংরেজিতে)")
+            .setLabel("Username (৩–২০ অক্ষর, ইংরেজি/সংখ্যা/_)")
             .setStyle(TextInputStyle.Short)
+            .setMinLength(3)
+            .setMaxLength(20)
             .setRequired(true);
 
         const passInput = new TextInputBuilder()
             .setCustomId("custom_password")
-            .setLabel("পছন্দমতো Password")
+            .setLabel("Password (৮–১২৮ অক্ষর)")
             .setStyle(TextInputStyle.Short)
+            .setMinLength(8)
+            .setMaxLength(128)
             .setRequired(true);
 
         modal.addComponents(
@@ -1495,72 +2215,53 @@ client.on("interactionCreate", async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    // 🌟 AUTOMATED ACCOUNT CREATION & SYNC FOR C++ APP
+    // 🌟 FULL AUTOMATED ACCOUNT CREATION & SYNC FOR C++ APP
     if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_create_account_")) {
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-
-        const idempotencyKey = `create_acc_${interaction.user.id}_${interaction.customId}`;
-        const isFirst = await checkAndSetIdempotency(idempotencyKey, 15);
-        if (!isFirst) {
-            return interaction.editReply("⚠️ **Duplicate Submission!** আপনার অ্যাকাউন্ট তৈরি করার অনুরোধটি ইতোমধ্যে প্রসেস হচ্ছে।");
-        }
 
         const rawCategory = interaction.customId.split("_")[3].toLowerCase();
         const category = getNormalizedCategory(rawCategory);
 
-        const rawUserInput = interaction.fields.getTextInputValue("custom_username").trim();
-        const usernameRegex = /^[a-zA-Z0-9_-]{3,20}$/;
-        if (!usernameRegex.test(rawUserInput)) {
-            return interaction.editReply("❌ **Invalid Username!** শুধুমাত্র বর্ণ (a-z, A-Z), সংখ্যা (0-9), হাইফেন (-) এবং আন্ডারস্কোর (_) ব্যবহার করা যাবে (৩-২০ অক্ষর)।");
-        }
-
-        const customUser = sanitizeFirebaseKey(rawUserInput.toLowerCase());
-        const customPass = interaction.fields.getTextInputValue("custom_password").trim();
-        const hashedPassword = hashPassword(customPass);
-
+        const customUser = interaction.fields.getTextInputValue("custom_username").trim().toLowerCase();
+        const customPass = interaction.fields.getTextInputValue("custom_password");
         const userId = interaction.user.id;
-        const safeUserId = sanitizeFirebaseKey(userId);
-        
-        const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
-        const serverName = interaction.guild ? interaction.guild.name : "Discord Server";
+        const userAvatarUrl = interaction.user.displayAvatarURL({ extension: "png", size: 512 });
+        const serverName = interaction.guild?.name || "Discord Server";
+        const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
+        let sessionClaimed = false;
+        let accountSaved = false;
 
-        const sessionRef = db.ref(`pending_payments/${safeUserId}_${category}`);
-        
-        // Lock Account Creation State
-        const lockResult = await sessionRef.transaction((session) => {
-            if (!session) return session;
-            if (session.accountState === "ACCOUNT_CREATING" || session.accountState === "ACCOUNT_CREATED") {
-                return; 
-            }
-            return {
-                ...session,
-                accountState: "ACCOUNT_CREATING"
-            };
-        });
-
-        if (!lockResult.committed) {
-            return interaction.editReply("⚠️ **অ্যাকাউন্ট তৈরি হচ্ছে বা ইতোমধ্যে তৈরি করা হয়েছে!**");
+        if (!/^[a-z0-9_]{3,20}$/.test(customUser)) {
+            return interaction.editReply("❌ Username ৩–২০ অক্ষরের হতে হবে এবং শুধু a-z, 0-9 ও underscore (_) ব্যবহার করা যাবে।");
         }
-
-        const sessionData = lockResult.snapshot.val();
-
-        if (!sessionData || sessionData.totalPaid < sessionData.targetPrice) {
-            await sessionRef.update({ accountState: null });
-            return interaction.editReply("❌ **পেমেন্ট অসম্পূর্ণ!** সম্পূর্ণ টাকা পরিশোধ করুন।");
+        if (customPass.length < 8 || customPass.length > 128 || !customPass.trim()) {
+            return interaction.editReply("❌ Password ৮–১২৮ অক্ষরের হতে হবে।");
         }
 
         try {
-            const usernameRes = await db.ref(`users/${customUser}`).transaction((current) => {
-                if (current !== null && (!current.reserved || (current.reservedAt && Date.now() - current.reservedAt < 300000))) {
-                    return; 
-                }
-                return { reserved: true, reservedBy: userId, reservedAt: Date.now() };
-            });
-
-            if (!usernameRes.committed) {
-                await sessionRef.update({ accountState: null });
-                return interaction.editReply(`❌ **Username Already Exists!** \`${customUser}\` নামটি অন্য কারো ব্যবহৃত।`);
+            const sessionSnap = await sessionRef.once("value");
+            const initialSession = sessionSnap.val();
+            if (!initialSession || Number(initialSession.totalPaid) < Number(initialSession.targetPrice)) {
+                return interaction.editReply("❌ **পেমেন্ট অসম্পূর্ণ!** সম্পূর্ণ টাকা পরিশোধ করুন।");
             }
+            if (["creating", "completed"].includes(initialSession.status)) {
+                return interaction.editReply("⚠️ এই পেমেন্ট সেশন ইতোমধ্যে ব্যবহার করা হচ্ছে বা অ্যাকাউন্ট তৈরি হয়ে গেছে। একই পেমেন্ট দিয়ে দ্বিতীয় অ্যাকাউন্ট তৈরি করা যাবে না।");
+            }
+
+            // Atomically reserve this paid checkout so repeated button/modal submissions cannot create multiple accounts.
+            const claimResult = await sessionRef.transaction((current) => {
+                if (!current || ["creating", "completed"].includes(current.status)) return;
+                const paid = Number(current.totalPaid) || 0;
+                const target = Number(current.targetPrice);
+                if (!Number.isFinite(target) || target < 0 || paid < target) return;
+                return { ...current, status: "creating", creationOwner: userId, creationStartedAt: Date.now() };
+            }, undefined, false);
+
+            if (!claimResult.committed) {
+                return interaction.editReply("⚠️ এই পেমেন্ট সেশনটি ইতোমধ্যে ব্যবহার করা হয়েছে বা আপডেট হয়েছে।");
+            }
+            sessionClaimed = true;
+            const sessionData = claimResult.snapshot.val() || {};
 
             let days = 7;
             let packageName = "Weekly";
@@ -1572,103 +2273,77 @@ client.on("interactionCreate", async (interaction) => {
                 packageName = "2 Months";
             }
 
-            const expiryTimestamp = Date.now() + (days * 24 * 60 * 60 * 1000);
-
-            await db.ref(`users/${customUser}`).set({
-                username: customUser,         
-                passwordHash: hashedPassword,
+            const now = Date.now();
+            const expiryTimestamp = now + (days * 24 * 60 * 60 * 1000);
+            const userRef = db.ref(`users/${customUser}`);
+            const passwordHash = await hashCppPassword(customPass);
+            const newAccountData = {
+                username: customUser,
+                passwordHash,
                 discordId: userId,
-                avatarUrl: userAvatarUrl,    
-                serverName: serverName,      
-                category: category,          
-                package: packageName,        
-                paidAmount: sessionData.totalPaid,
-                usedTxns: sessionData.usedTxns || [],
-                createdAt: Date.now(),
-                expiresAt: expiryTimestamp,  
-                status: "active"             
-            });
+                avatarUrl: userAvatarUrl,
+                serverName,
+                category,
+                package: packageName,
+                paidAmount: Number(sessionData.totalPaid) || 0,
+                usedTxns: Array.isArray(sessionData.usedTxns) ? sessionData.usedTxns : [],
+                createdAt: now,
+                expiresAt: expiryTimestamp,
+                status: "active"
+            };
 
-            await sessionRef.update({ accountState: "ACCOUNT_CREATED", accountCreatedUsername: customUser });
+            // Username creation is atomic; an active username cannot be overwritten by a simultaneous request.
+            const userClaim = await userRef.transaction((current) => {
+                if (!current) return newAccountData;
+                const currentExpiry = Number(current.expiresAt);
+                if (Number.isFinite(currentExpiry) && currentExpiry <= Date.now()) return newAccountData;
+                return;
+            }, undefined, false);
 
-            let orderId;
-            try {
-                orderId = await getNextAtomicCounter("orders", "ORD", 3);
-            } catch (cntErr) {
-                console.error("❌ Atomic Counter Error on Order Creation:", cntErr);
-                await sessionRef.update({ accountState: "ACCOUNT_CREATED", recoveryRequired: true, recoveryReason: "ORDER_COUNTER_FAILED" });
-                return interaction.editReply("⚠️ **অ্যাকাউন্ট তৈরি হয়েছে কিন্তু অর্ডার ট্র্যাকিং আইডি জেনারেট করা যায়নি!** অ্যাডমিনকে জানান।");
+            if (!userClaim.committed) {
+                await sessionRef.transaction((current) => current?.status === "creating" && current?.creationOwner === userId
+                    ? { ...current, status: "pending", creationOwner: null, creationStartedAt: null }
+                    : undefined, undefined, false);
+                sessionClaimed = false;
+                return interaction.editReply(`❌ **Username Already Exists!** \`${customUser}\` নামটি অন্য কারো ব্যবহৃত।`);
             }
 
-            await db.ref(`orders/${orderId}`).set({
-                orderId: orderId,
-                userId: userId,
-                category: category,
-                package: packageName,
-                basePrice: sessionData.basePrice || sessionData.targetPrice,
-                discount: sessionData.appliedDiscount || 0,
-                finalPrice: sessionData.targetPrice,
-                payment: {
-                    requiredAmount: sessionData.targetPrice,
-                    totalPaid: sessionData.totalPaid,
-                    status: "PAID",
-                    transactions: sessionData.usedTxns || []
-                },
-                status: "ACCOUNT_CREATED",
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
-                paidAt: Date.now()
+            accountSaved = true;
+            await sessionRef.update({
+                status: "completed",
+                accountUsername: customUser,
+                completedAt: Date.now(),
+                creationOwner: null,
+                creationStartedAt: null
             });
 
-            await safeLogAudit("ACCOUNT_CREATED", userId, customUser, { orderId: orderId, package: packageName });
-
-            let supportRoleId = ROLES.SUPPORT_CUSTOMER;
-            let channelPrefix = `order-${orderId.toLowerCase()}`;
+            const randomCode = Math.floor(1000 + Math.random() * 9000);
+            let supportRoleId = getConfiguredRoleId("supportCustomer");
+            let channelPrefix = `order-${randomCode}`;
 
             const permissionOverwrites = [
                 { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-                { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
+                { id: getConfiguredRoleId("verified"), deny: [PermissionFlagsBits.ViewChannel] },
                 { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
             ];
 
             if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-            if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+            if (interaction.guild.roles.cache.has(getConfiguredRoleId("admin"))) permissionOverwrites.push({ id: getConfiguredRoleId("admin"), allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
-            let privateChannel;
-            try {
-                privateChannel = await interaction.guild.channels.create({
-                    name: channelPrefix,
-                    type: 0,
-                    permissionOverwrites
-                });
-            } catch (chanErr) {
-                console.error("❌ Order Channel Creation Failure:", chanErr);
-                await db.ref(`orders/${orderId}`).update({ status: "CHANNEL_FAILED", recoveryRequired: true });
-                return interaction.editReply("⚠️ **অ্যাকাউন্ট তৈরি সফল হয়েছে, কিন্তু ডিসকর্ড চ্যানেল তৈরি করা যায়নি!** আপনার অ্যাকাউন্ট ক্রেডেনশিয়ালস ডিএমে পাঠানোর চেষ্টা করা হচ্ছে।");
-            }
-
-            // Register Order Channel Registry Link
-            const safeOrderChanId = sanitizeFirebaseKey(privateChannel.id);
-            await db.ref(`tickets/${safeOrderChanId}`).set({
-                ticketId: orderId,
-                type: "order",
-                category: category,
-                userId: userId,
-                channelId: privateChannel.id,
-                status: "OPEN",
-                claimedBy: null,
-                createdAt: Date.now()
+            const privateChannel = await interaction.guild.channels.create({
+                name: channelPrefix,
+                type: 0,
+                permissionOverwrites
             });
 
             const orderEmbed = new EmbedBuilder()
-                .setTitle(`🛍️ NEW MEMBERSHIP ORDER CONFIRMED [${orderId}]`)
+                .setTitle(`🛍️ NEW MEMBERSHIP ORDER CONFIRMED`)
                 .setColor("#00FF00")
                 .setThumbnail(userAvatarUrl)
                 .addFields(
                     { name: "👤 কাস্টমার", value: `${interaction.user}`, inline: true },
                     { name: "📦 প্যাকেজ", value: `\`${packageName.toUpperCase()}\``, inline: true },
                     { name: "👤 Username", value: `\`${customUser}\``, inline: true },
-                    { name: "🔑 Password", value: `\`[PROTECTED - DELIVERED VIA PRIVATE DM]\``, inline: true },
                     { name: "💳 Total Paid", value: `\`${sessionData.totalPaid}\` BDT`, inline: true },
                     { name: "📅 এক্সপায়ার ডেট", value: `<t:${Math.floor(expiryTimestamp / 1000)}:R>`, inline: true }
                 )
@@ -1695,12 +2370,9 @@ client.on("interactionCreate", async (interaction) => {
                     .setTimestamp();
 
                 await interaction.user.send({ embeds: [dmEmbed] });
-            } catch (dmErr) {
-                console.warn("⚠️ Could not send DM to user:", dmErr);
-                await db.ref(`orders/${orderId}`).update({ credentialDeliveryStatus: "CREDENTIAL_DELIVERY_FAILED" });
-            }
+            } catch (dmErr) {}
 
-            const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
+            const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
             if (trackingChannel) {
                 const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "approved", null, null, sessionData.usedTxns ? sessionData.usedTxns.join(", ") : null);
                 trackingEmbed.addFields(
@@ -1727,19 +2399,23 @@ client.on("interactionCreate", async (interaction) => {
 
         } catch (err) {
             console.error("❌ Account Creation Error:", err);
-            
-            // Username Cleanup on complete failure
-            const checkUserSnap = await db.ref(`users/${customUser}`).once("value");
-            if (checkUserSnap.exists() && checkUserSnap.val().reserved && !checkUserSnap.val().createdAt) {
-                await db.ref(`users/${customUser}`).remove();
+            if (sessionClaimed) {
+                try {
+                    if (accountSaved) {
+                        await sessionRef.update({ status: "completed", accountUsername: customUser, completedAt: Date.now(), creationOwner: null, creationStartedAt: null });
+                    } else {
+                        await sessionRef.transaction((current) => current?.status === "creating" && current?.creationOwner === userId
+                            ? { ...current, status: "pending", creationOwner: null, creationStartedAt: null }
+                            : undefined, undefined, false);
+                    }
+                } catch (reservationErr) {
+                    console.error("❌ Could not finalize/release account-creation reservation:", reservationErr.message);
+                }
             }
-
-            if (checkUserSnap.exists() && checkUserSnap.val().createdAt) {
-                await sessionRef.update({ accountState: "ACCOUNT_CREATED", recoveryRequired: true, recoveryReason: "DISCORD_DISPATCH_FAILED" });
-            } else {
-                await sessionRef.update({ accountState: "ACCOUNT_FAILED" });
-            }
-            return interaction.editReply("❌ **অ্যাকাউন্ট তৈরিতে ত্রুটি ঘটেছে!**");
+            const message = accountSaved
+                ? "⚠️ অ্যাকাউন্টটি Firebase-এ তৈরি হয়েছে, কিন্তু Discord order channel তৈরি/আপডেট করতে সমস্যা হয়েছে। নতুন করে পেমেন্ট বা অ্যাকাউন্ট তৈরি করবেন না; অ্যাডমিনকে জানান।"
+                : "❌ **অ্যাকাউন্ট তৈরিতে ত্রুটি ঘটেছে!** সেশন রিলিজ করা হয়েছে; কিছুক্ষণ পর আবার চেষ্টা করুন।";
+            return interaction.editReply(message);
         }
     }
 
@@ -1748,88 +2424,36 @@ client.on("interactionCreate", async (interaction) => {
         const parts = interaction.customId.split("_");
         const type = parts[1]; const category = parts.slice(2).join("_");
 
-        const safeUserId = sanitizeFirebaseKey(interaction.user.id);
-        const activeTicketRef = db.ref(`tickets_active/${safeUserId}_${type}`);
+        const randomCode = Math.floor(1000 + Math.random() * 9000);
+        let supportRoleId = getConfiguredRoleId("supportTicketReport");
+        let channelPrefix = `${type}-${randomCode}`;
 
-        // ATOMIC TICKET RESERVATION LOCK
-        const activeLockResult = await activeTicketRef.transaction((current) => {
-            if (current && (current.status === "OPEN" || current.status === "RESERVED")) {
-                return; // Abort: active ticket exists
-            }
-            return {
-                status: "RESERVED",
-                createdAt: Date.now()
-            };
-        });
-
-        if (!activeLockResult.committed) {
-            return interaction.editReply("⚠️ **Duplicate Ticket!** আপনার ইতোমধ্যে এই ক্যাটাগরিতে একটি ওপেন টিকিট রয়েছে।");
-        }
-
-        const prefixCode = type.toUpperCase().slice(0, 3);
-        let sequenceId;
-        try {
-            sequenceId = await getNextAtomicCounter(`counter_${type}`, prefixCode, 3);
-        } catch (cntErr) {
-            console.error("❌ Ticket Counter Error:", cntErr);
-            await activeTicketRef.remove();
-            return interaction.editReply("❌ **টিকিট কাউন্টার জেনারেট করা সম্ভব হয়নি!** পুনরায় চেষ্টা করুন।");
-        }
-
-        let supportRoleId = ROLES.SUPPORT_TICKET_REPORT;
-        let channelPrefix = `${type}-${sequenceId.toLowerCase()}`;
-
-        if (type === "customer") supportRoleId = ROLES.SUPPORT_CUSTOMER;
+        if (type === "customer") supportRoleId = getConfiguredRoleId("supportCustomer");
 
         const permissionOverwrites = [
             { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: VERIFIED_ROLE_ID, deny: [PermissionFlagsBits.ViewChannel] },
+            { id: getConfiguredRoleId("verified"), deny: [PermissionFlagsBits.ViewChannel] },
             { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
         ];
 
         if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-        if (interaction.guild.roles.cache.has(ROLES.ADMIN)) permissionOverwrites.push({ id: ROLES.ADMIN, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+        if (interaction.guild.roles.cache.has(getConfiguredRoleId("admin"))) permissionOverwrites.push({ id: getConfiguredRoleId("admin"), allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
-        let privateChannel;
-        try {
-            privateChannel = await interaction.guild.channels.create({
-                name: channelPrefix,
-                type: 0,
-                permissionOverwrites
-            });
-        } catch (cErr) {
-            console.error("❌ Ticket Channel Creation Error:", cErr);
-            await activeTicketRef.remove();
-            return interaction.editReply("❌ **টিকিট চ্যানেল তৈরি করা সম্ভব হয়নি!** পারমিশন পরীক্ষা করুন।");
-        }
-
-        const safeChannelId = sanitizeFirebaseKey(privateChannel.id);
-        await db.ref(`tickets/${safeChannelId}`).set({
-            ticketId: sequenceId,
-            type: type,
-            category: category,
-            userId: interaction.user.id,
-            channelId: privateChannel.id,
-            status: "OPEN",
-            claimedBy: null,
-            createdAt: Date.now()
+        const privateChannel = await interaction.guild.channels.create({
+            name: channelPrefix,
+            type: 0,
+            permissionOverwrites
         });
 
-        await activeTicketRef.update({
-            channelId: privateChannel.id,
-            status: "OPEN"
-        });
-
-        const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")} [${sequenceId}]`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
+        const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")}`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
         const actionRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim").setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId(`ban_panel_${type}`).setLabel("🚫 Support Ban").setStyle(ButtonStyle.Danger)
+            new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Secondary)
         );
 
         await privateChannel.send({ content: `${interaction.user} <@&${supportRoleId}>`, embeds: [panelEmbed], components: [actionRow] });
 
-        const trackingChannel = interaction.guild.channels.cache.get(ORDER_TRACKING_CHANNEL_ID);
+        const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
         if (trackingChannel) {
             const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending");
             const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
@@ -1842,19 +2466,703 @@ client.on("interactionCreate", async (interaction) => {
             }
         }
 
-        return interaction.editReply({ content: `✅ আপনার **${type.toUpperCase()}** টিকিট তৈরি হয়েছে: ${privateChannel}` });
+        return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে: ${privateChannel}`);
     }
 
-    // 🛟 CLAIM ACTION HANDLER
-    if (interaction.isButton() && (interaction.customId.startsWith("claim_"))) {
-        return handleClaimAction(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
+        const type = interaction.customId.split("_")[1];
+        let reqRole = (type === "customer" || type === "order") ? getConfiguredRoleId("supportCustomer") : getConfiguredRoleId("supportTicketReport");
+        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(getConfiguredRoleId("admin"))) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
+        
+        await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
+        await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
+
+        db.ref(`staff_duty/${interaction.user.id}/claims`).transaction(c => (c || 0) + 1);
+        return;
     }
 
-    // 🔒 CLOSE ACTION HANDLER
-    if (interaction.isButton() && (interaction.customId.startsWith("close_"))) {
-        return handleCloseAction(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith("close_")) {
+        const orderLogs = getOrderLogs();
+        const currentOrder = orderLogs[interaction.channel.id];
+        const member = interaction.member;
+        const isAdmin = Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator) || member?.roles?.cache?.has(getConfiguredRoleId("admin")));
+        const isSupport = Boolean(member?.roles?.cache?.has(getConfiguredRoleId("supportTicketReport")) || member?.roles?.cache?.has(getConfiguredRoleId("supportCustomer")));
+        const isTicketOwner = Boolean(
+            (currentOrder?.userId && currentOrder.userId === interaction.user.id) ||
+            interaction.channel.permissionOverwrites?.cache?.has(interaction.user.id)
+        );
+
+        if (!isAdmin && !isSupport && !isTicketOwner) {
+            return interaction.reply({ content: "❌ এই টিকিট বন্ধ করার অনুমতি আপনার নেই।", flags: [MessageFlags.Ephemeral] });
+        }
+
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        let transcriptSaved = false;
+        try {
+            const transcript = await discordTranscripts.createTranscript(interaction.channel, {
+                limit: -1,
+                returnType: "attachment",
+                filename: `${interaction.channel.name}-transcript.html`,
+                saveImages: true,
+                poweredBy: false
+            });
+            const transcriptLogChan = isFeatureEnabled("transcriptLogsEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("transcriptLog")) : null;
+            if (transcriptLogChan) {
+                await transcriptLogChan.send({
+                    content: `📜 **Transcript Log:** #${interaction.channel.name} | Closed by ${interaction.user}`,
+                    files: [transcript]
+                });
+                transcriptSaved = true;
+            }
+        } catch (tErr) {
+            console.error("❌ Transcript creation/upload failed:", tErr.message);
+        }
+
+        if (currentOrder?.trackingMessageId) {
+            try {
+                const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
+                const trackingMessage = trackingChannel ? await trackingChannel.messages.fetch(currentOrder.trackingMessageId) : null;
+                if (trackingMessage) {
+                    const statusEmbed = buildOrderStatusEmbed(
+                        `<@${currentOrder.userId || interaction.user.id}>`,
+                        currentOrder.category || "unknown",
+                        interaction.channel,
+                        "closed",
+                        interaction.user,
+                        null,
+                        currentOrder.txnId || null
+                    );
+                    await trackingMessage.edit({ embeds: [statusEmbed] });
+                }
+                saveOrderLog(interaction.channel.id, currentOrder.trackingMessageId, {
+                    ...currentOrder,
+                    status: "closed",
+                    closedBy: interaction.user.id,
+                    closedAt: Date.now(),
+                    transcriptSaved
+                });
+            } catch (trackingErr) {
+                console.error("❌ Order tracking close update failed:", trackingErr.message);
+            }
+        }
+
+        await interaction.editReply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
+        setTimeout(async () => {
+            await interaction.channel.delete().catch(() => {});
+        }, 5000);
+    }
+    } catch (error) {
+        console.error("❌ Interaction handler failed:", error);
+        const payload = { content: "❌ অনুরোধটি সম্পন্ন করা যায়নি। আবার চেষ্টা করুন বা অ্যাডমিনকে জানান।", flags: [MessageFlags.Ephemeral] };
+        try {
+            if (interaction.deferred) await interaction.editReply({ content: payload.content });
+            else if (interaction.replied) await interaction.followUp(payload);
+            else await interaction.reply(payload);
+        } catch (replyError) {
+            console.error("❌ Could not send interaction error response:", replyError.message);
+        }
     }
 });
 
-// Bot Login
-client.login(TOKEN);
+// ================================
+// ⚡ PART 4 - Live UI Panels Templates
+// ================================
+
+function getPanelColor(fullData, fallback) {
+    const candidate = String(fullData?.color || "").trim();
+    return /^#[0-9a-f]{6}$/i.test(candidate) ? candidate : fallback;
+}
+function getPanelFooter(fullData, fallback) {
+    return String(fullData?.footer || fallback || "").trim().slice(0, 2048);
+}
+function getPanelPlaceholder(fullData, fallback) {
+    return String(fullData?.placeholder || fallback || "Select an option...").trim().slice(0, 150) || fallback || "Select an option...";
+}
+
+async function getDynamicOrderGuidePanel() {
+    const { customDescription, customImage, fullData } = await fetchFirebasePanelData("order_guide");
+    const defaultTitle = "📦 HOW TO ORDER & SYSTEM GUIDE";
+    const defaultDesc = `🛒 **আমাদের সার্ভার থেকে অর্ডার করার নিয়মাবলী** 🛒`;
+
+    const embed = new EmbedBuilder()
+         .setTitle(fullData.title || defaultTitle)
+        .setDescription(customDescription || defaultDesc)
+        .setColor(getPanelColor(fullData, "#FFAA00"))
+        .setTimestamp()
+        .setFooter({ text: getPanelFooter(fullData, "Order Guide System"), iconURL: client.user.displayAvatarURL() });
+
+    if (customImage) embed.setImage(customImage);
+    return { embeds: [embed] };
+}
+
+// 🌟 সাধারণ টিকিট সাপোর্ট প্যানেল
+async function getDynamicTicketPanel() {
+    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("ticket");
+    const defaultDesc = `🎟️ **আমাদের অফিসিয়াল সাপোর্ট প্যানেল** 🎟️\n\nযে কোনো সমস্যা বা অনুসন্ধানের জন্য নিচের ড্রপডাউন সিলেক্ট করুন।`;
+
+    const embed = new EmbedBuilder()
+         .setTitle(fullData.title || "🎫 OFFICIAL SUPPORT PANEL")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.TICKET)
+        .setColor(getPanelColor(fullData, "#5865F2"))
+        .setFooter({ text: getPanelFooter(fullData, "Official Support Panel"), iconURL: client.user.displayAvatarURL() });
+
+    let finalOptions = options;
+    if (options.length === 0 || (options.length === 1 && options[0].value === "none")) {
+        finalOptions = [
+            {
+                label: "💬 General Support Ticket",
+                description: "সাধারণ সহায়তার জন্য টিকেট খুলুন",
+                value: "general_support"
+            }
+        ];
+    }
+
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId("select_product_ticket")
+        .setPlaceholder(getPanelPlaceholder(fullData, "👇 ড্রপডাউন মেনু থেকে সহায়তার ক্যাটাগরি সিলেক্ট করুন..."))
+        .addOptions(finalOptions);
+
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
+}
+
+// 🔑 ১-টাইম কী জেনারেটর প্যানেল
+async function getDynamicOneTimeKeyPanel() {
+    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("onetime_key");
+    const defaultDesc = `🔐 **DEVELOPER ONE-TIME KEY GENERATOR** 🔐\n\nC++ অ্যাপে ব্যবহারের জন্য ১-টাইম কী জেনারেট করতে ড্রপডাউন বা বাটনে চাপ দিন।\n*(শুধুমাত্র ডেভেলপারদের জন্য নির্দিষ্ট)*`;
+
+    const embed = new EmbedBuilder()
+         .setTitle(fullData.title || "🔑 1TIME KEY GENERATOR PANEL")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.TICKET)
+        .setColor(getPanelColor(fullData, "#F1C40F"))
+        .setFooter({ text: getPanelFooter(fullData, "Developer Portal System"), iconURL: client.user.displayAvatarURL() });
+
+    let finalOptions = options;
+    if (options.length === 0 || (options.length === 1 && options[0].value === "none")) {
+        finalOptions = [
+            {
+                label: "🔑 Generate 1TIME KEY (Dev Only)",
+                description: "C++ অ্যাপের জন্য ১-টাইম কী জেনারেট করুন",
+                value: "generate_1time_key"
+            }
+        ];
+    }
+
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId("select_key_category")
+        .setPlaceholder(getPanelPlaceholder(fullData, "👇 কী জেনারেট করতে নিচের ড্রপডাউন সিলেক্ট করুন..."))
+        .addOptions(finalOptions);
+
+    const buttonRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId("btn_generate_1time_key")
+            .setLabel("⚡ Generate OneTime Key")
+            .setStyle(ButtonStyle.Success)
+    );
+
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu), buttonRow] };
+}
+
+async function getDynamicReportPanel() {
+    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("report");
+    const defaultDesc = `🚨 **মেম্বার বা স্টাফ রিপোর্ট করার স্থান** 🚨`;
+
+    const embed = new EmbedBuilder()
+         .setTitle(fullData.title || "🚨 MEMBER & STAFF REPORT CENTER")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.REPORT)
+        .setColor(getPanelColor(fullData, "#ED4245"))
+        .setFooter({ text: getPanelFooter(fullData, "Report Center"), iconURL: client.user.displayAvatarURL() });
+
+    const menu = new StringSelectMenuBuilder().setCustomId("select_report_category").setPlaceholder(getPanelPlaceholder(fullData, "❓ রিপোর্ট করার কারণ সিলেক্ট করুন...")).addOptions(options);
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
+}
+
+async function getDynamicCustomerPanel() {
+    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("customer");
+    const defaultDesc = `💬 **কাস্টমার সাপোর্ট অ্যান্ড কুয়েরি** 💬`;
+
+    const embed = new EmbedBuilder()
+         .setTitle(fullData.title || "💬 VIP CUSTOMER SUPPORT CENTER")
+        .setDescription(customDescription || defaultDesc)
+        .setImage(customImage || COVER_IMAGES.CUSTOMER)
+        .setColor(getPanelColor(fullData, "#57F287"))
+        .setFooter({ text: getPanelFooter(fullData, "Customer Support"), iconURL: client.user.displayAvatarURL() });
+
+    const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder(getPanelPlaceholder(fullData, "❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...")).addOptions(options);
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
+}
+
+async function getDynamicPaymentPanel() {
+    const { options, customDescription, customImage, fullData } = await fetchFirebasePanelData("payment");
+    const defaultDesc = `💳 **Premium Store & Automatic Payment Gateway** 💳`;
+
+    const readerStatusText = "\n\n🟠 **ONLINE CHECK:** Package ও bKash/Nagad নির্বাচন করার পর Reader-এর live status যাচাই হবে। Online check সফল না হলে payment number দেখানো হবে না।\n🎟️ **Auto Coupon:** default ON — overpayment থেকে তৈরি আপনার active coupon পরের checkout-এ নিজে থেকে প্রযোজ্য হবে। নিচের ON/OFF বোতাম দিয়ে বন্ধ করলে পরের checkout-এ coupon code manually দেওয়া যাবে।";
+    let panelDescription = customDescription || defaultDesc;
+    // Always hide payment numbers on the shop panel; reveal a provider-specific number only after live check.
+    for (const number of Object.values(PAYMENT_NUMBERS).filter(Boolean)) {
+        panelDescription = panelDescription.split(number).join("[পেমেন্ট ধাপে দেখানো হবে]");
+    }
+    panelDescription = panelDescription.replace(/(?:\+?880)?0?1[3-9](?:[\s-]?\d){8}|01[3-9]X{8}/gi, "[পেমেন্ট ধাপে দেখানো হবে]");
+    const embed = new EmbedBuilder()
+         .setTitle(fullData.title || "🛍️ AUTOMATED SHOP & PAYMENT PANELS")
+        .setDescription(panelDescription + readerStatusText)
+        .setImage(customImage || COVER_IMAGES.PAYMENT)
+        .setColor(getPanelColor(fullData, "#3498DB"))
+        .setFooter({ text: getPanelFooter(fullData, "Automated Payment Bot"), iconURL: client.user.displayAvatarURL() });
+
+    const menu = new StringSelectMenuBuilder().setCustomId("select_buy_category").setPlaceholder(getPanelPlaceholder(fullData, "🛍️ আপনার কাঙ্ক্ষিত মেম্বারশিপ/সার্ভিস সিলেক্ট করুন...")).addOptions(options);
+    const autoCouponToggle = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId("toggle_auto_coupon").setLabel("🎟️ Auto Coupon ON/OFF (নিজের সেটিং)").setStyle(ButtonStyle.Secondary)
+    );
+    return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu), autoCouponToggle] };
+}
+
+// Admin Commands
+client.on("messageCreate", async (message) => {
+    if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
+
+    const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(getConfiguredRoleId("admin"));
+
+    // Developer/admin access to the one-time-key panel is checked independently of general admin commands.
+    if (message.content === "!onetime key" || message.content === "!onetimekey") {
+        if (!isFeatureEnabled("oneTimeKeyEnabled")) return message.reply("🔑 One-Time Key Generator বর্তমানে বন্ধ আছে।");
+        const canOpenKeyPanel = isServerAdmin || message.member.roles.cache.has(getConfiguredRoleId("developer"));
+        if (canOpenKeyPanel && (getConfiguredChannelIds("oneTimeKey").includes(message.channelId) || isServerAdmin)) {
+            return message.channel.send(await getDynamicOneTimeKeyPanel());
+        }
+        return;
+    }
+
+    if (!isServerAdmin) return;
+
+    if (message.content === "!setup") return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
+    if (message.content === "!ticket" && message.channelId === getConfiguredChannelId("ticketPanel")) return message.channel.send(await getDynamicTicketPanel());
+    if (message.content === "!report" && message.channelId === getConfiguredChannelId("reportPanel")) return message.channel.send(await getDynamicReportPanel());
+    if (message.content === "!customer" && message.channelId === getConfiguredChannelId("customerPanel")) return message.channel.send(await getDynamicCustomerPanel());
+    if (message.content === "!orderguide" && message.channelId === getConfiguredChannelId("orderGuide")) return message.channel.send(await getDynamicOrderGuidePanel());
+    
+});
+
+// ================================
+// 🔄 REALTIME FIREBASE SYNC LISTENER
+// ================================
+// ================================
+// ⚡ QUEUE SYSTEM FOR SAFE BULK AVATAR & USERNAME UPDATES
+// ================================
+
+const updateQueue = new Map(); 
+let isProcessingQueue = false;
+
+// 📥 ২০টি ২০টি করে ব্যাচ প্রসেস করার ফাংশন
+async function processUpdateQueue() {
+    if (isProcessingQueue || updateQueue.size === 0) return;
+    isProcessingQueue = true;
+
+    // কিউ থেকে একসাথে প্রথম ২০ জন ইউজারকে বের করা
+    const queueEntries = Array.from(updateQueue.entries()).slice(0, 20);
+
+    for (const [userId, data] of queueEntries) {
+        try {
+            const { newAvatar, newUsername } = data;
+
+            // 1️⃣ users নোড আপডেট (ফায়ারবেস)
+            const usersRef = db.ref("users");
+            const snapshot = await usersRef.orderByChild("discordId").equalTo(userId).once("value");
+
+            if (snapshot.exists()) {
+                const updates = [];
+                snapshot.forEach((childSnapshot) => {
+                    updates.push(childSnapshot.ref.update({
+                        avatarUrl: newAvatar,
+                        discordUsername: newUsername,
+                        lastUpdated: Date.now()
+                    }));
+                });
+                await Promise.all(updates);
+                console.log(`⚡ [Queue Sync] Updated user node for Discord ID: ${userId}`);
+            }
+
+            // 2️⃣ keys (1TIME Key) নোড আপডেট (ফায়ারবেস)
+            const keysRef = db.ref("keys");
+            const keySnap = await keysRef.orderByChild("userId").equalTo(userId).once("value");
+
+            if (keySnap.exists()) {
+                const updates = [];
+                keySnap.forEach((childSnapshot) => {
+                    updates.push(childSnapshot.ref.update({
+                        avatarUrl: newAvatar,
+                        username: newUsername,
+                        lastUpdated: Date.now()
+                    }));
+                });
+                await Promise.all(updates);
+                console.log(`⚡ [Queue Sync] Updated keys node for Discord ID: ${userId}`);
+            }
+
+        } catch (err) {
+            console.error(`❌ Queue Update Error for User ${userId}:`, err);
+        } finally {
+            // নতুন profile change while processing হলে সেটিকে কিউতে রেখে দিন।
+            if (updateQueue.get(userId) === data) updateQueue.delete(userId);
+        }
+    }
+
+    isProcessingQueue = false;
+
+    // যদি ২০ জনের বেশি ইউজার থাকে, তবে ২ সেকেন্ড বিরতি দিয়ে পরবর্তী ২০ জন প্রসেস করবে
+    if (updateQueue.size > 0) {
+        setTimeout(processUpdateQueue, 2000); // ২ সেকেন্ড বিরতি
+    }
+}
+
+// --------------------------------
+// ⚡ DISCORD PROFILE CHANGE LISTENERS
+// --------------------------------
+
+// ১. মেম্বার সার্ভার প্রোফাইল বা অবতার চেঞ্জ করলে
+client.on("guildMemberUpdate", (oldMember, newMember) => {
+    if (!isFeatureEnabled("profileSyncEnabled")) return;
+    const userId = newMember.id;
+    const newAvatar = newMember.user.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+    const newUsername = newMember.user.username;
+
+    // কিউতে তথ্য যোগ করা
+    updateQueue.set(userId, { newAvatar, newUsername });
+    processUpdateQueue();
+});
+
+// ২. মেম্বার গ্লোবাল ডিসকর্ড অবতার চেঞ্জ করলে
+client.on("userUpdate", (oldUser, newUser) => {
+    if (!isFeatureEnabled("profileSyncEnabled")) return;
+    const userId = newUser.id;
+    const newAvatar = newUser.displayAvatarURL({ extension: "png", dynamic: true, size: 512 });
+    const newUsername = newUser.username;
+
+    updateQueue.set(userId, { newAvatar, newUsername });
+    processUpdateQueue();
+});
+function findPanelMessage(messages, expectedCustomId) {
+    return messages?.find(message =>
+        message.author.id === client.user.id &&
+        message.components?.some(row => row.components?.some(component => component.customId === expectedCustomId))
+    ) || null;
+}
+
+const WEEKLY_STATS_PATH = "runtime/botStats/weekly";
+async function countWeeklyMessage(message) {
+    if (!isFeatureEnabled("weeklyReportEnabled") || !message.guild || message.guild.id !== ALLOWED_GUILD_ID || message.author.bot) return;
+    try {
+        await db.ref(`${WEEKLY_STATS_PATH}/messageCount`).transaction(current => (Number(current) || 0) + 1, undefined, false);
+        await db.ref(`${WEEKLY_STATS_PATH}/updatedAt`).set(Date.now());
+    } catch (err) { console.error("Weekly message stats update failed:", err.message); }
+}
+client.on("messageCreate", message => { countWeeklyMessage(message).catch(err => console.error(err.message)); });
+
+client.on("voiceStateUpdate", async (oldState, newState) => {
+    if (!isFeatureEnabled("voiceStatsEnabled")) return;
+    if (!newState.guild || newState.guild.id !== ALLOWED_GUILD_ID || newState.member?.user?.bot) return;
+    const userId = newState.id || oldState.id;
+    if (!userId) return;
+    const ref = db.ref(`runtime/botStats/voice/${userId}`);
+    const now = Date.now();
+    const nextChannelId = newState.channelId || null;
+    try {
+        let elapsedToAdd = 0;
+        const result = await ref.transaction(current => {
+            const value = current && typeof current === "object" ? current : { totalMs: 0, channelId: null, joinedAt: null };
+            let totalMs = Math.max(0, Number(value.totalMs) || 0);
+            let channelId = value.channelId || null;
+            let joinedAt = Number(value.joinedAt) || null;
+            elapsedToAdd = 0;
+            if (channelId && joinedAt && (!nextChannelId || nextChannelId !== channelId)) {
+                elapsedToAdd = Math.max(0, now - joinedAt);
+                totalMs += elapsedToAdd;
+                channelId = null; joinedAt = null;
+            }
+            if (nextChannelId && (!channelId || nextChannelId !== channelId)) {
+                channelId = nextChannelId; joinedAt = now;
+            }
+            return { totalMs, channelId, joinedAt, updatedAt: now };
+        }, undefined, false);
+        if (result.committed && elapsedToAdd > 0) {
+            await db.ref(`${WEEKLY_STATS_PATH}/voiceMs`).transaction(currentMs => (Number(currentMs) || 0) + elapsedToAdd, undefined, false);
+        }
+    } catch (err) { console.error("Voice statistics update failed:", err.message); }
+});
+
+async function maybePublishWeeklyReport() {
+    if (!isFeatureEnabled("weeklyReportEnabled") || !client.isReady()) return;
+    const stateRef = db.ref("runtime/botStats/reportState");
+    const stateSnap = await stateRef.once("value");
+    const state = stateSnap.val() || {};
+    const now = Date.now();
+    if (!state.lastSentAt) {
+        await stateRef.update({ lastSentAt: now, note: "Weekly report timer initialized" });
+        return;
+    }
+    if (now - Number(state.lastSentAt) < 7 * 24 * 60 * 60 * 1000) return;
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    const reportChannel = guild?.channels.cache.get(getConfiguredChannelId("weeklyReport"));
+    if (!reportChannel || !reportChannel.isTextBased()) {
+        console.warn("Weekly report skipped: configured report channel is missing or not text-based.");
+        return;
+    }
+    const statsRef = db.ref(WEEKLY_STATS_PATH);
+    const statsSnap = await statsRef.once("value");
+    const stats = statsSnap.val() || {};
+    const messageCount = Math.max(0, Number(stats.messageCount) || 0);
+    const voiceMinutes = Math.floor(Math.max(0, Number(stats.voiceMs) || 0) / 60000);
+    const reportEmbed = new EmbedBuilder()
+        .setTitle("📊 RKBACKLES Weekly Activity Report")
+        .setColor("Blue")
+        .addFields(
+            { name: "Guild", value: guild.name.slice(0, 100), inline: true },
+            { name: "Messages counted", value: String(messageCount), inline: true },
+            { name: "Voice session minutes", value: String(voiceMinutes), inline: true }
+        )
+        .setFooter({ text: "Voice minutes are accumulated when members leave/change voice channels; sessions crossing a report boundary may be counted at end." })
+        .setTimestamp(new Date(now));
+    await reportChannel.send({ embeds: [reportEmbed] });
+    await statsRef.set({ messageCount: 0, voiceMs: 0, updatedAt: now });
+    await stateRef.update({ lastSentAt: now, lastReportMessageId: "sent" });
+}
+
+let weeklyReportTimer = null;
+let realtimeListenersRegistered = false;
+let panelSyncRunning = false;
+let panelSyncPending = false;
+
+async function syncManagedPanelType(guild, spec) {
+    let desiredChannelIds = spec.channelList ? getConfiguredChannelIds(spec.channelList) : [getConfiguredChannelId(spec.channelKey)].filter(Boolean);
+    desiredChannelIds = [...new Set(desiredChannelIds.map(String).filter(id => /^\d{15,25}$/.test(id)))].slice(0, 10);
+    if (!desiredChannelIds.length) return;
+
+    const stateRef = db.ref(`runtime/panels/managed/${spec.type}`);
+    const stateSnap = await stateRef.once("value").catch(() => null);
+    const prevState = stateSnap?.val() || {};
+    const oldChannels = prevState.channels && typeof prevState.channels === "object" ? prevState.channels : {};
+    const newChannels = {};
+
+    // Remove this Bot's old managed panel when an Admin routes it to a different channel.
+    for (const oldChannelId of Object.keys(oldChannels)) {
+        if (desiredChannelIds.includes(oldChannelId)) continue;
+        const previous = oldChannels[oldChannelId] || {};
+        try {
+            const oldChannel = guild.channels.cache.get(oldChannelId) || await guild.channels.fetch(oldChannelId).catch(() => null);
+            if (oldChannel?.messages && previous.messageId) {
+                const oldMessage = await oldChannel.messages.fetch(String(previous.messageId)).catch(() => null);
+                if (oldMessage && oldMessage.author?.id === client.user.id) await oldMessage.delete().catch(() => {});
+            }
+        } catch (err) {
+            console.warn(`Could not clean old ${spec.type} panel in ${oldChannelId}:`, err.message);
+        }
+    }
+
+    for (const channelId of desiredChannelIds) {
+        const previous = oldChannels[channelId] || {};
+        try {
+            const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+            if (!channel || !channel.isTextBased() || !channel.messages) {
+                console.warn(`Panel ${spec.type} destination ${channelId} is missing or not text-based.`);
+                if (previous.messageId) newChannels[channelId] = previous;
+                continue;
+            }
+
+            let message = null;
+            if (previous.messageId) {
+                message = await channel.messages.fetch(String(previous.messageId)).catch(() => null);
+                if (message && message.author?.id !== client.user.id) message = null;
+            }
+            // Preserve messages created by older releases and the original payment panel pointer.
+            if (!message && spec.type === "payment") {
+                const legacyId = (await db.ref("runtime/panels/paymentMessageId").once("value").catch(() => null))?.val();
+                if (legacyId) {
+                    const legacyMessage = await channel.messages.fetch(String(legacyId)).catch(() => null);
+                    if (legacyMessage?.author?.id === client.user.id) message = legacyMessage;
+                }
+            }
+            if (!message) {
+                const history = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+                if (spec.customId) message = findPanelMessage(history, spec.customId);
+                if (!message && spec.footerText) {
+                    message = history?.find(item => item.author?.id === client.user.id && item.embeds?.some(embed => embed.footer?.text === spec.footerText)) || null;
+                }
+            }
+
+            const payload = await spec.builder();
+            if (message) await message.edit(payload);
+            else message = await channel.send(payload);
+            newChannels[channelId] = { messageId: message.id, channelId, updatedAt: Date.now() };
+            console.log(`✅ ${spec.type} Discord panel live-synced in channel ${channelId}.`);
+        } catch (err) {
+            console.error(`❌ Failed to sync ${spec.type} panel in ${channelId}:`, err.message);
+            if (previous.messageId) newChannels[channelId] = previous;
+        }
+    }
+
+    await stateRef.set({ channelIds: desiredChannelIds, channels: newChannels, updatedAt: Date.now() });
+    if (spec.type === "payment") {
+        const primary = desiredChannelIds.map(id => newChannels[id]?.messageId).find(Boolean);
+        if (primary) await db.ref("runtime/panels/paymentMessageId").set(primary).catch(() => {});
+    }
+}
+
+async function runManagedPanelSyncOnce() {
+    if (!client.isReady()) return;
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (!guild) {
+        console.error("❌ Configured Discord guild not found:", ALLOWED_GUILD_ID);
+        return;
+    }
+    const specs = [
+        { type: "payment", channelKey: "paymentPanel", customId: "select_buy_category", builder: getDynamicPaymentPanel },
+        { type: "ticket", channelKey: "ticketPanel", customId: "select_product_ticket", builder: getDynamicTicketPanel },
+        { type: "report", channelKey: "reportPanel", customId: "select_report_category", builder: getDynamicReportPanel },
+        { type: "customer", channelKey: "customerPanel", customId: "select_customer_category", builder: getDynamicCustomerPanel },
+        { type: "onetime_key", channelList: "oneTimeKey", customId: "select_key_category", builder: getDynamicOneTimeKeyPanel },
+        { type: "order_guide", channelKey: "orderGuide", footerText: "Order Guide System", builder: getDynamicOrderGuidePanel }
+    ];
+    for (const spec of specs) await syncManagedPanelType(guild, spec);
+}
+
+async function syncAllManagedPanels() {
+    if (!client.isReady()) return;
+    if (panelSyncRunning) { panelSyncPending = true; return; }
+    panelSyncRunning = true;
+    try {
+        do {
+            panelSyncPending = false;
+            await runManagedPanelSyncOnce();
+        } while (panelSyncPending && client.isReady());
+    } finally {
+        panelSyncRunning = false;
+    }
+}
+
+async function refreshPaymentPanel() {
+    // Backward-compatible entry point used by the original checkout code.
+    return syncAllManagedPanels();
+}
+
+client.on("ready", async () => {
+    console.log(`🤖 Logged in as ${client.user.tag}!`);
+    setBotPresence();
+    registerCouponRequestListener();
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message));
+    heartbeatTimer = setInterval(() => publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message)), 30_000);
+    if (weeklyReportTimer) clearInterval(weeklyReportTimer);
+    maybePublishWeeklyReport().catch(err => console.error("Weekly report check failed:", err.message));
+    weeklyReportTimer = setInterval(() => maybePublishWeeklyReport().catch(err => console.error("Weekly report check failed:", err.message)), 60 * 60 * 1000);
+
+    if (realtimeListenersRegistered) return;
+    realtimeListenersRegistered = true;
+    db.ref("panels").on("value", () => {
+        syncAllManagedPanels().catch(err => console.error("Realtime panel sync failed:", err.message));
+    }, err => console.error("Firebase panels listener failed:", err.message));
+    await syncAllManagedPanels().catch(err => console.error("Initial Discord panel sync failed:", err.message));
+});
+
+// Approved manual coupon requests are processed idempotently. A deterministic couponCode is
+// allocated by the Admin Panel before approval; a retry cannot create a second coupon.
+const couponRequestLocks = new Set();
+async function processCouponRequest(requestId, request) {
+    if (!requestId || !request || !["approved", "processing"].includes(String(request.status || ""))) return;
+    if (couponRequestLocks.has(requestId)) return;
+    couponRequestLocks.add(requestId);
+    try {
+        const requestRef = db.ref(`couponRequests/${requestId}`);
+        const currentSnap = await requestRef.once("value");
+        const current = currentSnap.val() || {};
+        if (!["approved", "processing"].includes(String(current.status || ""))) return;
+        const code = String(current.couponCode || "").toUpperCase();
+        if (!/^[A-Z0-9_-]{5,32}$/.test(code) || !current.userId || !(Number(current.couponValue) > 0)) {
+            await requestRef.update({ status: "error", errorCode: "invalid_request_data", updatedAt: Date.now() });
+            return;
+        }
+        const couponRef = db.ref(`coupons/${code}`);
+        const createResult = await couponRef.transaction(existing => {
+            if (existing && existing.sourceRequestId === requestId) return existing;
+            if (existing !== null) return;
+            return {
+                couponCode: code,
+                userId: String(current.userId),
+                username: String(current.username || "unknown").slice(0, 100),
+                couponValue: Number(current.couponValue),
+                remainingValue: Number(current.couponValue),
+                extraPaymentAmount: Number(current.extraPaymentAmount || current.couponValue),
+                createdAt: Date.now(),
+                expiresAt: Number(current.expiresAt) || (Date.now() + 90 * 86400000),
+                status: "active",
+                source: "manual_overpayment_approval",
+                sourceRequestId: requestId,
+                approvedBy: String(current.approvedBy || "admin_panel")
+            };
+        }, undefined, false);
+        if (!createResult.committed || createResult.snapshot.val()?.sourceRequestId !== requestId) {
+            await requestRef.update({ status: "error", errorCode: "coupon_code_conflict", updatedAt: Date.now() });
+            return;
+        }
+        await requestRef.update({ status: "fulfilled", couponCode: code, fulfilledAt: Date.now(), updatedAt: Date.now(), errorCode: null });
+    } catch (err) {
+        console.error("Manual coupon request processing failed:", requestId, err.message);
+    } finally {
+        couponRequestLocks.delete(requestId);
+    }
+}
+
+let couponRequestListenerRegistered = false;
+function registerCouponRequestListener() {
+    if (couponRequestListenerRegistered) return;
+    couponRequestListenerRegistered = true;
+    db.ref("couponRequests").on("child_added", snap => processCouponRequest(snap.key, snap.val()).catch(err => console.error(err.message)));
+    db.ref("couponRequests").on("child_changed", snap => processCouponRequest(snap.key, snap.val()).catch(err => console.error(err.message)));
+}
+
+let heartbeatTimer = null;
+async function publishBotHeartbeat() {
+    const host = String(process.env.RENDER_SERVICE_NAME || process.env.RAILWAY_SERVICE_NAME || os.hostname()).slice(0, 120);
+    await db.ref("runtime/bot").update({
+        online: true,
+        lastHeartbeatAt: Date.now(),
+        host,
+        nodeVersion: process.version,
+        botVersion: require("./package.json").version
+    });
+}
+
+function setBotPresence() {
+    if (!client.user) return;
+    const cfg = ADMIN_BOT_CONFIG.presence || {};
+    const statusCandidate = String(cfg.status || "online").toLowerCase();
+    const status = ["online", "idle", "dnd", "invisible"].includes(statusCandidate) ? statusCandidate : "online";
+    const typeCandidate = String(cfg.activityType || "Watching");
+    const activityType = Object.prototype.hasOwnProperty.call(ActivityType, typeCandidate) ? ActivityType[typeCandidate] : ActivityType.Watching;
+    const activityText = String(cfg.activityText || "Security & Verification").trim().slice(0, 128) || "Security & Verification";
+    client.user.setPresence({ activities: [{ name: activityText, type: activityType }], status });
+}
+
+function startBot() {
+    if (!TOKEN) {
+        console.error("❌ TOKEN Environment Variable is missing!");
+        return;
+    }
+    client.login(TOKEN).catch(err => {
+        console.error("❌ Discord Login Failed:", err);
+    });
+}
+
+startBot();
+
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, async () => {
+        if (heartbeatTimer) clearInterval(heartbeatTimer);
+        if (weeklyReportTimer) clearInterval(weeklyReportTimer);
+        try { await db.ref("runtime/bot").update({ online: false, lastHeartbeatAt: Date.now(), offlineReason: signal }); } catch (_) {}
+        try { client.destroy(); } catch (_) {}
+        process.exit(0);
+    });
+}
