@@ -30,7 +30,8 @@ const {
     MessageFlags,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle
+    TextInputStyle,
+    Events
 } = require("discord.js");
 
 // html-transcripts ইম্পোর্ট
@@ -1940,15 +1941,6 @@ liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
     db.ref("auditLog").push({ adminUid: ticketRecord.uid, actionType: "discord_live_voice_start", timestamp: Date.now(), summary: `Admin opened two-way live voice relay in ${session.channelName || session.channelId}; audio not stored` }).catch(err => console.error("Live voice audit write failed:", err.message));
     sendLiveVoiceJson(socket, { type: "connected", channelName: session.channelName || "voice channel", audioIsNotStored: true });
 });
-client.once("ready", () => {
-    if (!(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET)) return;
-    try {
-        const runtime = getLiveKitRuntime();
-        runtime.roomService.listRooms().then(rooms => Promise.all((rooms || []).filter(room => String(room.name || "").startsWith(`rkbs_${ALLOWED_GUILD_ID}_`)).map(room =>
-            runtime.roomService.deleteRoom(room.name).then(() => console.log(`Removed stale Live Studio room after Bot restart: ${room.name}`)).catch(err => console.warn("Stale Live Studio room cleanup failed:", err.message))
-        ))).catch(err => console.warn("Live Studio startup cleanup failed:", err.message));
-    } catch (err) { console.warn("Live Studio disabled until credentials are configured:", err.apiError || err.message); }
-});
 server.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
 // ================================
@@ -2209,6 +2201,37 @@ const client = new Client({
         GatewayIntentBits.GuildMessageReactions
     ],
     partials: [Partials.Channel, Partials.GuildMember, Partials.Message, Partials.Reaction]
+});
+
+// Prefer the event name exported by the installed discord.js version. Older releases
+// that predate Events.ClientReady fall back to "ready" without registering a deprecated alias.
+const CLIENT_READY_EVENT = Events?.ClientReady || "ready";
+function onClientReadyOnce(handler) {
+    let handled = false;
+    const invoke = (...args) => {
+        if (handled) return;
+        handled = true;
+        try {
+            const result = handler(...args);
+            if (result && typeof result.catch === "function") {
+                result.catch(err => console.error("Discord client-ready initialization failed:", err?.message || err));
+            }
+        } catch (err) {
+            console.error("Discord client-ready initialization failed:", err?.message || err);
+        }
+    };
+    client.once(CLIENT_READY_EVENT, invoke);
+}
+
+// Register this handler only after the Discord client has been initialized.
+onClientReadyOnce(() => {
+    if (!(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET)) return;
+    try {
+        const runtime = getLiveKitRuntime();
+        runtime.roomService.listRooms().then(rooms => Promise.all((rooms || []).filter(room => String(room.name || "").startsWith(`rkbs_${ALLOWED_GUILD_ID}_`)).map(room =>
+            runtime.roomService.deleteRoom(room.name).then(() => console.log(`Removed stale Live Studio room after Bot restart: ${room.name}`)).catch(err => console.warn("Stale Live Studio room cleanup failed:", err.message))
+        ))).catch(err => console.warn("Live Studio startup cleanup failed:", err.message));
+    } catch (err) { console.warn("Live Studio disabled until credentials are configured:", err.apiError || err.message); }
 });
 
 process.on("unhandledRejection", (err) => {
@@ -4567,7 +4590,7 @@ async function refreshPaymentPanel() {
     return syncAllManagedPanels();
 }
 
-client.on("ready", async () => {
+onClientReadyOnce(async () => {
     console.log(`🤖 Logged in as ${client.user.tag}!`);
     setBotPresence();
     registerCouponRequestListener();

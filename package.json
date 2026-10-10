@@ -1,6 +1,6 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.16",
+  "version": "1.5.17",
   "private": true,
   "description": "Discord admin bot with Bengali automation, voice controls, and temporary LiveKit screen-sharing rooms",
   "main": "index.js",
