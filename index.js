@@ -458,6 +458,13 @@ app.use(express.json({ limit: "32kb", type: "application/json" }));
 const ADMIN_PANEL_ORIGINS = new Set(String(process.env.ADMIN_PANEL_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean));
 app.use((req, res, next) => {
     const origin = String(req.get("origin") || "");
+    // Public, non-sensitive health probe: allow the panel to read it even when its origin
+    // is misconfigured, so the UI can display the exact origin that must be allowlisted.
+    // Authenticated account endpoints below still require an exact ADMIN_PANEL_ORIGINS match.
+    if (req.path === "/api/cpp/health" && req.method === "GET") {
+        res.set("Access-Control-Allow-Origin", "*");
+        return next();
+    }
     if (origin && ADMIN_PANEL_ORIGINS.has(origin)) {
         res.set("Access-Control-Allow-Origin", origin);
         res.set("Vary", "Origin");
@@ -468,7 +475,11 @@ app.use((req, res, next) => {
     return next();
 });
 app.get("/", (req, res) => { res.send("Bot is running!"); });
-app.get("/api/cpp/health", (req, res) => res.json({ ok: true, service: "rkbackles-cpp-bridge", version: require("./package.json").version }));
+app.get("/api/cpp/health", (req, res) => {
+    const origin = String(req.get("origin") || "");
+    return res.json({ ok: true, service: "rkbackles-cpp-bridge", version: require("./package.json").version,
+        panelOrigin: origin, corsAllowed: origin ? ADMIN_PANEL_ORIGINS.has(origin) : null });
+});
 
 // Small in-memory per-IP limiter for the C++ credential endpoints. Do not log request bodies.
 const cppRateLimits = new Map();
