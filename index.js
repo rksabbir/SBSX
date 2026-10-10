@@ -1119,13 +1119,21 @@ async function fetchFirebasePanelData(panelType) {
             .filter(option => option.label && option.value && !usedValues.has(option.value) && usedValues.add(option.value))
             .slice(0, 25);
 
-        const paymentPackageAliases = new Set(["weekly", "weekly_plan", "monthly", "monthly_plan", "2_months", "two_months", "two_months_plan", "two", "2months", "2month"]);
-        if (panelType === "payment" && (options.length === 0 || options.every(option => paymentPackageAliases.has(String(option.value).trim().toLowerCase())))) {
-            // Package values/availability are authoritative from adminConfig, not stale labels in panels/payment.
+        const paymentPackageAliases = new Set(["weekly", "weekly_plan", "week", "monthly", "monthly_plan", "month", "2_months", "two_months", "two_months_plan", "two", "2months", "2month"]);
+        if (panelType === "payment") {
+            // Always normalize the shop dropdown to the three supported canonical package keys.
+            // A stale/custom label or value must never route a click to the wrong package (e.g. weekly fallback).
+            const customLabels = new Map();
+            for (const option of rawOptions) {
+                const rawValue = String(option.value || "").trim().toLowerCase();
+                if (!paymentPackageAliases.has(rawValue)) continue;
+                const normalized = getNormalizedCategory(rawValue);
+                if (!customLabels.has(normalized) && option.label) customLabels.set(normalized, String(option.label).trim());
+            }
             options.length = 0;
-            if (isPackageEnabled("weekly")) options.push({ label: `Weekly — ${getPackagePrice("weekly")} BDT`, value: "weekly" });
-            if (isPackageEnabled("monthly")) options.push({ label: `Monthly — ${getPackagePrice("monthly")} BDT`, value: "monthly" });
-            if (isPackageEnabled("2_months")) options.push({ label: `2 Months — ${getPackagePrice("2_months")} BDT`, value: "2_months" });
+            if (isPackageEnabled("weekly")) options.push({ label: `${customLabels.get("weekly") || "Weekly"} — ${getPackagePrice("weekly")} BDT`, value: "weekly" });
+            if (isPackageEnabled("monthly")) options.push({ label: `${customLabels.get("monthly") || "Monthly"} — ${getPackagePrice("monthly")} BDT`, value: "monthly" });
+            if (isPackageEnabled("2_months")) options.push({ label: `${customLabels.get("2_months") || "2 Months"} — ${getPackagePrice("2_months")} BDT`, value: "2_months" });
             if (options.length === 0) options.push({ label: "Temporarily Unavailable", value: "none" });
         } else if (options.length === 0) {
             options.push({ label: "No Options Found", value: "none" });
@@ -1597,6 +1605,10 @@ client.on("interactionCreate", async (interaction) => {
         else if (interaction.customId === "select_buy_category") { type = "order"; embedColor = "#9B59B6"; buttonId = `pay_gateway_${lowerVal}`; } 
 
         if (type === "order") {
+            const supportedPackageValues = new Set(["weekly", "weekly_plan", "week", "monthly", "monthly_plan", "month", "2_months", "two_months", "two_months_plan", "two", "2months", "2month"]);
+            if (!supportedPackageValues.has(lowerVal)) {
+                return interaction.reply({ content: "⚠️ Shop dropdown-এর package value পুরোনো বা ভুল। Bot নতুন version-এ restart করুন; panel automatic canonical package options sync করবে।", flags: [MessageFlags.Ephemeral] });
+            }
             const category = getNormalizedCategory(lowerVal);
             const userId = interaction.user.id;
             if (!isPackageEnabled(category)) return interaction.reply({ content: "এই প্যাকেজটি Admin Panel থেকে সাময়িকভাবে বন্ধ করা হয়েছে।", flags: [MessageFlags.Ephemeral] });
