@@ -6,6 +6,9 @@ const MAX_PCM_PACKET_BYTES = 96 * 1024;
 function normalizeRecorderMimeType(value) {
   const mime = String(value || "").trim().toLowerCase();
   if (!mime || mime.length > 120 || /[\r\n\0]/.test(mime)) return null;
+  // Preferred browser path: explicit, headerless 48 kHz stereo signed-16-bit PCM.
+  // It avoids MediaRecorder container fragmentation and does not need FFmpeg to decode mic audio.
+  if (mime === "audio/x-pcm;format=s16le;rate=48000;channels=2") return "s16le";
   if (mime.startsWith("audio/webm")) return "webm";
   if (mime.startsWith("audio/ogg")) return "ogg";
   if (mime.startsWith("audio/mp4")) return "mov";

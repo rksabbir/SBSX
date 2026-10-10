@@ -43,6 +43,7 @@ const {
 } = require("./discord-admin-policy");
 const { sanitizeVoiceSpeech, formatVerifiedAnnouncement, formatRoleChangeAnnouncement, formatLevelUpAnnouncement } = require("./discord-bengali-automation");
 const { normalizeRecorderMimeType, extractOneTimeTicketFromProtocols, packRemotePcmFrame } = require("./live-voice-protocol");
+const { createLivePcmAudioProcess } = require("./live-voice-pcm-stream");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -792,9 +793,6 @@ const LIVE_VOICE_TICKET_TTL_MS = 30_000;
 const LIVE_VOICE_MAX_BYTES_PER_SECOND = 300 * 1024;
 const LIVE_VOICE_MAX_DURATION_MS = Math.min(2 * 60 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_VOICE_MAX_DURATION_MS || 30 * 60 * 1000)));
 function getVoiceDependencies() {
-    if (!process.env.FFMPEG_PATH) {
-        try { process.env.FFMPEG_PATH = require("ffmpeg-static") || ""; } catch (_) {}
-    }
     return { voice: require("@discordjs/voice"), googleTts: require("google-tts-api"), OpusScript: require("opusscript") };
 }
 function sendLiveVoiceJson(socket, data) {
@@ -826,36 +824,40 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
     if (!session?.connection || session.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Voice connection is not ready"), { apiError: "voice_not_connected", statusCode: 409 });
     if (session.liveProcess || session.player?.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player is busy"), { apiError: "voice_busy", statusCode: 409 });
     if (session.liveStartedAt && Date.now() - session.liveStartedAt > LIVE_VOICE_MAX_DURATION_MS) throw Object.assign(new Error("Live voice duration limit reached"), { apiError: "live_voice_duration_limit", statusCode: 429 });
-    let ffmpegPath = String(process.env.FFMPEG_PATH || "");
-    if (!ffmpegPath) { try { ffmpegPath = require("ffmpeg-static") || ""; } catch (_) {} }
-    if (!ffmpegPath) throw Object.assign(new Error("FFmpeg is not installed"), { apiError: "ffmpeg_unavailable", statusCode: 503 });
-    const proc = spawn(ffmpegPath, [
-        "-hide_banner", "-loglevel", "error", "-probesize", "1048576", "-analyzeduration", "1000000",
-        "-f", format, "-i", "pipe:0", "-vn", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-f", "s16le", "pipe:1"
-    ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+
+    let proc;
+    let ffmpegStderrTail = "";
+    if (format === "s16le") {
+        // Browser AudioWorklet sends headerless 48 kHz stereo PCM frames directly. Passing these
+        // through avoids FFmpeg dying on fragmented WebM/MediaRecorder input or host codec quirks.
+        proc = createLivePcmAudioProcess();
+    } else {
+        let ffmpegPath = String(process.env.FFMPEG_PATH || "");
+        if (!ffmpegPath) { try { ffmpegPath = require("ffmpeg-static") || ""; } catch (_) {} }
+        if (!ffmpegPath) throw Object.assign(new Error("FFmpeg is not installed"), { apiError: "ffmpeg_unavailable", statusCode: 503 });
+        proc = spawn(ffmpegPath, [
+            "-hide_banner", "-loglevel", "error", "-probesize", "1048576", "-analyzeduration", "1000000",
+            "-f", format, "-i", "pipe:0", "-vn", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-f", "s16le", "pipe:1"
+        ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+        proc.stderr?.on("data", chunk => { ffmpegStderrTail = (ffmpegStderrTail + chunk.toString("utf8")).slice(-3000); });
+        proc.stdin?.on("error", err => { if (err?.code !== "EPIPE") console.error("Live voice FFmpeg stdin error:", err?.message || err); });
+    }
+
     session.liveProcess = proc;
     session.liveStartedAt = Date.now();
     session.liveActorUid = actorUid;
-    let ffmpegStderrTail = "";
-    let ffmpegInputBytes = 0;
-    // FFmpeg may fail shortly after spawn (bad/incomplete MediaRecorder container, missing codec,
-    // or host binary issue). Keep a bounded diagnostic tail so the real cause is visible in host logs.
-    proc.stderr?.on("data", chunk => { ffmpegStderrTail = (ffmpegStderrTail + chunk.toString("utf8")).slice(-3000); });
-    proc.stdin?.on("error", err => {
-        if (err?.code !== "EPIPE") console.error("Live voice FFmpeg stdin error:", err?.message || err);
-    });
     const resource = voice.createAudioResource(proc.stdout, { inputType: voice.StreamType.Raw, metadata: { adminUid: actorUid, source: "live-admin-microphone" } });
     session.liveResource = resource;
     proc.once("spawn", () => {
         if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket) { stopLiveMicProcess(session); return; }
         if (!proc.stdin || proc.stdin.destroyed || !proc.stdin.writable || proc.exitCode !== null) {
-            sendLiveVoiceJson(socket, { type: "error", error: "live_voice_transcode_failed" });
-            closeLiveVoiceSocket(session, 1011, "microphone transcoder is not writable");
+            sendLiveVoiceJson(socket, { type: "error", error: proc.rawPcm ? "live_voice_audio_pipeline_failed" : "live_voice_transcode_failed" });
+            closeLiveVoiceSocket(session, 1011, "microphone audio input is not writable");
             return;
         }
         try {
             session.player.play(resource);
-            sendLiveVoiceJson(socket, { type: "mic-ready", sampleRate: 48000, channels: 2 });
+            sendLiveVoiceJson(socket, { type: "mic-ready", sampleRate: 48000, channels: 2, mode: proc.rawPcm ? "pcm" : "ffmpeg" });
         } catch (err) {
             console.error("Live voice player start failed:", err?.message || err);
             sendLiveVoiceJson(socket, { type: "error", error: "live_voice_player_failed" });
@@ -863,10 +865,11 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
         }
     });
     proc.once("error", err => {
-        console.error("Live voice FFmpeg spawn failed:", err?.message || err);
+        console.error(proc.rawPcm ? "Live voice PCM pipeline failed:" : "Live voice FFmpeg spawn failed:", err?.message || err);
         if (session.liveProcess === proc) session.liveProcess = null;
-        sendLiveVoiceJson(socket, { type: "error", error: "ffmpeg_unavailable" });
-        closeLiveVoiceSocket(session, 1011, "microphone transcoder unavailable");
+        socket.liveFailureNotified = true;
+        sendLiveVoiceJson(socket, { type: "error", error: proc.rawPcm ? "live_voice_audio_pipeline_failed" : "ffmpeg_unavailable" });
+        closeLiveVoiceSocket(session, 1011, proc.rawPcm ? "microphone PCM pipeline failed" : "microphone transcoder unavailable");
     });
     proc.once("close", code => {
         const endedUnexpectedly = socket.liveStarted && session.liveSocket === socket;
@@ -875,22 +878,23 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
         if (endedUnexpectedly) {
             socket.liveStarted = false;
             socket.liveFailureNotified = true;
-            const errorCode = code === 0 ? "live_voice_stream_ended" : "live_voice_transcode_failed";
-            ffmpegInputBytes = proc.liveInputBytes || 0;
-            console.error(`Live voice FFmpeg exited unexpectedly (code=${code}, inputBytes=${ffmpegInputBytes}): ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600)}`);
+            const errorCode = proc.rawPcm
+                ? (code === 0 ? "live_voice_stream_ended" : "live_voice_audio_pipeline_failed")
+                : (code === 0 ? "live_voice_stream_ended" : "live_voice_transcode_failed");
+            const inputBytes = proc.liveInputBytes || 0;
+            const diagnostic = proc.rawPcm ? "direct PCM stream" : (ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600);
+            console.error(`Live voice ${proc.rawPcm ? "PCM stream" : "FFmpeg"} exited unexpectedly (code=${code}, inputBytes=${inputBytes}): ${diagnostic}`);
             if (socket.readyState === WebSocket.OPEN) {
                 sendLiveVoiceJson(socket, { type: "error", error: errorCode });
-                // A dead transcoder cannot accept further MediaRecorder chunks. Close the relay now
-                // so the browser stops the microphone rather than generating repeated mic_not_started errors.
-                try { socket.close(1011, "microphone transcoder exited"); } catch (_) { try { socket.terminate(); } catch (_) {} }
+                try { socket.close(1011, proc.rawPcm ? "microphone PCM stream ended" : "microphone transcoder exited"); } catch (_) { try { socket.terminate(); } catch (_) {} }
             }
         } else if (code && code !== 0 && socket.readyState === WebSocket.OPEN && !socket.liveStopping) {
-            console.error(`Live voice FFmpeg exited (code=${code}): ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600)}`);
+            console.error(`Live voice ${proc.rawPcm ? "PCM stream" : "FFmpeg"} exited (code=${code}): ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1200)}`);
         }
     });
     proc.on("exit", code => {
         if (code !== null && code !== 0 && session.liveProcess === proc) {
-            console.error(`Live voice FFmpeg process exit code ${code}: ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1200)}`);
+            console.error(`Live voice ${proc.rawPcm ? "PCM" : "FFmpeg"} process exit code ${code}: ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1200)}`);
         }
     });
 }
@@ -1418,15 +1422,21 @@ liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
     socket.on("message", (data, isBinary) => {
         if (isBinary) {
             if (!socket.liveStarted || session.liveSocket !== socket || !session.liveProcess || !session.liveProcess.stdin || session.liveProcess.stdin.destroyed || !session.liveProcess.stdin.writable) {
-                // An inactive/dead FFmpeg process must not leave the browser sending audio forever.
-                // Close once instead of replying with mic_not_started for every 100 ms audio chunk.
+                // An inactive/dead audio pipeline must not leave the browser sending audio forever.
+                // Close once instead of replying for every subsequent PCM packet.
                 if (socket.readyState === WebSocket.OPEN) {
                     if (!socket.liveFailureNotified) {
                         socket.liveFailureNotified = true;
-                        sendLiveVoiceJson(socket, { type: "error", error: session.liveProcess ? "live_voice_transcode_failed" : "live_voice_stream_ended" });
+                        sendLiveVoiceJson(socket, { type: "error", error: session.liveProcess?.rawPcm ? "live_voice_audio_pipeline_failed" : (session.liveProcess ? "live_voice_transcode_failed" : "live_voice_stream_ended") });
                     }
                     try { socket.close(1011, "microphone stream is not writable"); } catch (_) { try { socket.terminate(); } catch (_) {} }
                 }
+                return;
+            }
+            const activeProcess = session.liveProcess;
+            if (activeProcess.rawPcm && (data.length === 0 || data.length > 96 * 1024 || data.length % 4 !== 0)) {
+                sendLiveVoiceJson(socket, { type: "error", error: "live_voice_invalid_pcm_frame" });
+                try { socket.close(1003, "invalid PCM frame"); } catch (_) {}
                 return;
             }
             const now = Date.now();
