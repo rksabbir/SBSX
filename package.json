@@ -1,6 +1,6 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.9",
+  "version": "1.5.10",
   "private": true,
   "description": "Discord.js bot with Bengali role announcements and admin voice/TTS and live two-way audio controls",
   "main": "index.js",

@@ -830,27 +830,43 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
     if (!ffmpegPath) { try { ffmpegPath = require("ffmpeg-static") || ""; } catch (_) {} }
     if (!ffmpegPath) throw Object.assign(new Error("FFmpeg is not installed"), { apiError: "ffmpeg_unavailable", statusCode: 503 });
     const proc = spawn(ffmpegPath, [
-        "-hide_banner", "-loglevel", "error", "-probesize", "32768", "-analyzeduration", "150000",
+        "-hide_banner", "-loglevel", "error", "-probesize", "1048576", "-analyzeduration", "1000000",
         "-f", format, "-i", "pipe:0", "-vn", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-f", "s16le", "pipe:1"
-    ], { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
+    ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
     session.liveProcess = proc;
     session.liveStartedAt = Date.now();
     session.liveActorUid = actorUid;
+    let ffmpegStderrTail = "";
+    let ffmpegInputBytes = 0;
+    // FFmpeg may fail shortly after spawn (bad/incomplete MediaRecorder container, missing codec,
+    // or host binary issue). Keep a bounded diagnostic tail so the real cause is visible in host logs.
+    proc.stderr?.on("data", chunk => { ffmpegStderrTail = (ffmpegStderrTail + chunk.toString("utf8")).slice(-3000); });
+    proc.stdin?.on("error", err => {
+        if (err?.code !== "EPIPE") console.error("Live voice FFmpeg stdin error:", err?.message || err);
+    });
     const resource = voice.createAudioResource(proc.stdout, { inputType: voice.StreamType.Raw, metadata: { adminUid: actorUid, source: "live-admin-microphone" } });
     session.liveResource = resource;
     proc.once("spawn", () => {
         if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket) { stopLiveMicProcess(session); return; }
+        if (!proc.stdin || proc.stdin.destroyed || !proc.stdin.writable || proc.exitCode !== null) {
+            sendLiveVoiceJson(socket, { type: "error", error: "live_voice_transcode_failed" });
+            closeLiveVoiceSocket(session, 1011, "microphone transcoder is not writable");
+            return;
+        }
         try {
             session.player.play(resource);
             sendLiveVoiceJson(socket, { type: "mic-ready", sampleRate: 48000, channels: 2 });
-        } catch (_) {
+        } catch (err) {
+            console.error("Live voice player start failed:", err?.message || err);
             sendLiveVoiceJson(socket, { type: "error", error: "live_voice_player_failed" });
-            stopLiveMicProcess(session);
+            closeLiveVoiceSocket(session, 1011, "microphone player start failed");
         }
     });
-    proc.once("error", () => {
+    proc.once("error", err => {
+        console.error("Live voice FFmpeg spawn failed:", err?.message || err);
         if (session.liveProcess === proc) session.liveProcess = null;
         sendLiveVoiceJson(socket, { type: "error", error: "ffmpeg_unavailable" });
+        closeLiveVoiceSocket(session, 1011, "microphone transcoder unavailable");
     });
     proc.once("close", code => {
         const endedUnexpectedly = socket.liveStarted && session.liveSocket === socket;
@@ -858,9 +874,23 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
         if (session.liveResource === resource) session.liveResource = null;
         if (endedUnexpectedly) {
             socket.liveStarted = false;
-            if (socket.readyState === WebSocket.OPEN) sendLiveVoiceJson(socket, { type: "error", error: code === 0 ? "live_voice_stream_ended" : "live_voice_transcode_failed" });
-        } else if (code && code !== 0 && socket.readyState === WebSocket.OPEN) {
-            sendLiveVoiceJson(socket, { type: "error", error: "live_voice_transcode_failed" });
+            socket.liveFailureNotified = true;
+            const errorCode = code === 0 ? "live_voice_stream_ended" : "live_voice_transcode_failed";
+            ffmpegInputBytes = proc.liveInputBytes || 0;
+            console.error(`Live voice FFmpeg exited unexpectedly (code=${code}, inputBytes=${ffmpegInputBytes}): ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600)}`);
+            if (socket.readyState === WebSocket.OPEN) {
+                sendLiveVoiceJson(socket, { type: "error", error: errorCode });
+                // A dead transcoder cannot accept further MediaRecorder chunks. Close the relay now
+                // so the browser stops the microphone rather than generating repeated mic_not_started errors.
+                try { socket.close(1011, "microphone transcoder exited"); } catch (_) { try { socket.terminate(); } catch (_) {} }
+            }
+        } else if (code && code !== 0 && socket.readyState === WebSocket.OPEN && !socket.liveStopping) {
+            console.error(`Live voice FFmpeg exited (code=${code}): ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600)}`);
+        }
+    });
+    proc.on("exit", code => {
+        if (code !== null && code !== 0 && session.liveProcess === proc) {
+            console.error(`Live voice FFmpeg process exit code ${code}: ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1200)}`);
         }
     });
 }
@@ -1009,7 +1039,7 @@ app.post("/api/admin/discord/voice/speak", async (req, res) => {
         const { voice, googleTts } = getVoiceDependencies();
         if (session.player.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player busy"),{statusCode:409,apiError:"voice_busy"});
         const audioUrl = googleTts.getAudioUrl(text,{lang:"bn",slow:false,host:"https://translate.google.com"});
-        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.8"}});
+        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.10"}});
         if (!response.ok || !response.body) throw Object.assign(new Error("TTS provider failed"),{statusCode:502,apiError:"tts_provider_failed"});
         const resource = voice.createAudioResource(Readable.fromWeb(response.body),{inputType:voice.StreamType.Arbitrary,metadata:{adminUid:actor.uid,queuedAt:Date.now()}});
         session.player.play(resource);
@@ -1387,16 +1417,28 @@ liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
     if (typeof authCheckTimer.unref === "function") authCheckTimer.unref();
     socket.on("message", (data, isBinary) => {
         if (isBinary) {
-            if (!socket.liveStarted || session.liveSocket !== socket || !session.liveProcess || !session.liveProcess.stdin || session.liveProcess.stdin.destroyed) {
-                sendLiveVoiceJson(socket, { type: "error", error: "live_voice_mic_not_started" });
+            if (!socket.liveStarted || session.liveSocket !== socket || !session.liveProcess || !session.liveProcess.stdin || session.liveProcess.stdin.destroyed || !session.liveProcess.stdin.writable) {
+                // An inactive/dead FFmpeg process must not leave the browser sending audio forever.
+                // Close once instead of replying with mic_not_started for every 100 ms audio chunk.
+                if (socket.readyState === WebSocket.OPEN) {
+                    if (!socket.liveFailureNotified) {
+                        socket.liveFailureNotified = true;
+                        sendLiveVoiceJson(socket, { type: "error", error: session.liveProcess ? "live_voice_transcode_failed" : "live_voice_stream_ended" });
+                    }
+                    try { socket.close(1011, "microphone stream is not writable"); } catch (_) { try { socket.terminate(); } catch (_) {} }
+                }
                 return;
             }
             const now = Date.now();
             if (now - socket.liveByteWindowStartedAt >= 1000) { socket.liveByteWindowStartedAt = now; socket.liveBytesInWindow = 0; }
             socket.liveBytesInWindow += data.length;
             if (socket.liveBytesInWindow > LIVE_VOICE_MAX_BYTES_PER_SECOND) { socket.close(1008, "microphone bitrate limit exceeded"); return; }
-            try { session.liveProcess.stdin.write(data); }
-            catch (_) { socket.close(1011, "microphone stream failed"); }
+            try { session.liveProcess.stdin.write(data); session.liveProcess.liveInputBytes = (session.liveProcess.liveInputBytes || 0) + data.length; }
+            catch (err) {
+                console.error("Live voice audio write failed:", err?.message || err);
+                sendLiveVoiceJson(socket, { type: "error", error: "live_voice_transcode_failed" });
+                try { socket.close(1011, "microphone stream write failed"); } catch (_) { try { socket.terminate(); } catch (_) {} }
+            }
             return;
         }
         let payload;
