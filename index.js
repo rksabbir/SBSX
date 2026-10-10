@@ -801,6 +801,10 @@ function sendLiveVoiceJson(socket, data) {
     }
 }
 function stopLiveMicProcess(session) {
+    if (session?.liveInputWatchdog) {
+        clearInterval(session.liveInputWatchdog);
+        session.liveInputWatchdog = null;
+    }
     const proc = session?.liveProcess;
     if (!proc) return;
     session.liveProcess = null;
@@ -846,6 +850,28 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
     session.liveProcess = proc;
     session.liveStartedAt = Date.now();
     session.liveActorUid = actorUid;
+    if (proc.rawPcm) {
+        // The browser must keep sending PCM packets even during silence. The clocked PCM
+        // source pads transient jitter with silence; if packets stop entirely, end the
+        // session with a distinct error rather than leaving a silent voice session open.
+        session.liveInputWatchdog = setInterval(() => {
+            if (session.liveProcess !== proc || !socket.liveStarted || session.liveSocket !== socket || socket.readyState !== WebSocket.OPEN) return;
+            const lastInputAt = Number(proc.lastInputAt || proc.startedAt || session.liveStartedAt || Date.now());
+            const inputIdleMs = Math.max(0, Date.now() - lastInputAt);
+            if (inputIdleMs < 5000) return;
+            const reason = `No microphone PCM packets received for ${inputIdleMs}ms; outputFrames=${proc.outputFrames || 0},underrunFrames=${proc.underrunFrames || 0},droppedInputBytes=${proc.droppedInputBytes || 0}`;
+            proc.failureReason = reason.slice(0, 300);
+            socket.liveFailureNotified = true;
+            console.error("Live voice microphone input stalled:", proc.failureReason, `inputBytes=${proc.liveInputBytes || 0}`);
+            sendLiveVoiceJson(socket, {
+                type: "error",
+                error: "live_voice_input_stalled",
+                diagnostic: { inputBytes: proc.liveInputBytes || 0, inputIdleMs, outputFrames: proc.outputFrames || 0, underrunFrames: proc.underrunFrames || 0, reason: proc.failureReason }
+            });
+            closeLiveVoiceSocket(session, 1011, "microphone PCM input stalled");
+        }, 1000);
+        if (typeof session.liveInputWatchdog.unref === "function") session.liveInputWatchdog.unref();
+    }
     const resource = voice.createAudioResource(proc.stdout, { inputType: voice.StreamType.Raw, metadata: { adminUid: actorUid, source: "live-admin-microphone" } });
     session.liveResource = resource;
     // A live microphone is an unbuffered network source, unlike a local file. The voice
@@ -862,13 +888,16 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
     playerStateListener = (oldState, newState) => {
         if (oldState.resource !== resource || newState.status !== voice.AudioPlayerStatus.Idle) return;
         if (!socket.liveStarted || session.liveSocket !== socket) return;
-        const reason = `Discord AudioPlayer transitioned ${oldState.status} -> idle while the live microphone session was active`;
+        const inputIdleMs = Math.max(0, Date.now() - Number(proc.lastInputAt || proc.startedAt || Date.now()));
+        const connectionState = session.connection?.state?.status || "unknown";
+        const playStream = resource.playStream;
+        const reason = `AudioPlayer ${oldState.status}->idle; connection=${connectionState},playStreamDestroyed=${Boolean(playStream?.destroyed)},playStreamEnded=${Boolean(playStream?.readableEnded)},inputIdleMs=${inputIdleMs},outputFrames=${proc.outputFrames || 0},underrunFrames=${proc.underrunFrames || 0},queuedBytes=${proc.stdout?.queuedBytes || 0}`;
         console.error(`Live voice player stopped (${reason}); inputBytes=${proc.liveInputBytes || 0}`);
         socket.liveFailureNotified = true;
         sendLiveVoiceJson(socket, {
             type: "error",
             error: "live_voice_player_stopped",
-            diagnostic: { inputBytes: proc.liveInputBytes || 0, reason }
+            diagnostic: { inputBytes: proc.liveInputBytes || 0, inputIdleMs, outputFrames: proc.outputFrames || 0, underrunFrames: proc.underrunFrames || 0, reason }
         });
         closeLiveVoiceSocket(session, 1011, "Discord audio player stopped live microphone");
     };
@@ -899,7 +928,8 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
             const playbackStream = resource.playStream;
             const resourceState = `playStreamDestroyed=${Boolean(playbackStream?.destroyed)},playStreamEnded=${Boolean(playbackStream?.readableEnded)}`;
             const ageMs = session.liveStartedAt ? Math.max(0, Date.now() - session.liveStartedAt) : 0;
-            const context = `player=${playerState},connection=${connectionState},${resourceState},ageMs=${ageMs},inputBytes=${proc.liveInputBytes || 0}`;
+            const inputIdleMs = Math.max(0, Date.now() - Number(proc.lastInputAt || proc.startedAt || Date.now()));
+            const context = `player=${playerState},connection=${connectionState},${resourceState},ageMs=${ageMs},inputIdleMs=${inputIdleMs},outputFrames=${proc.outputFrames || 0},underrunFrames=${proc.underrunFrames || 0},queuedBytes=${proc.stdout?.queuedBytes || 0},inputBytes=${proc.liveInputBytes || 0}`;
             const baseReason = proc.failureReason || "Discord audio output closed before microphone input ended";
             proc.failureReason = `${baseReason}; ${context}`.slice(0, 300);
             console.error("Live voice PCM output closed while the session was active:", proc.failureReason);
