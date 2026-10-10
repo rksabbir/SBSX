@@ -1,8 +1,8 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.2",
+  "version": "1.5.3",
   "private": true,
-  "description": "discord.js v14 bot with Firebase admin configuration, advanced checkout, and secure C++ custom-auth/SSE bridge",
+  "description": "discord.js v14 bot with secure checkout, offline payment approval, account admin controls, and C++ real-time session bridge",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

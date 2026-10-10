@@ -410,7 +410,11 @@ function buildPaymentPage(category, session, readerState, providerNumber) {
                 autoCheckText
             )
             .setColor("Orange").setTimestamp();
-        return { embeds: [embed], components: [] };
+        const offlineRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`offlinepay_request_${category}_${provider}`).setLabel("🧾 Offline payment request করুন").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`offlinepay_status_${category}`).setLabel("🔄 Request status দেখুন").setStyle(ButtonStyle.Primary)
+        );
+        return { embeds: [embed], components: [offlineRow] };
 
     }
 
@@ -451,6 +455,18 @@ function buildPaymentPage(category, session, readerState, providerNumber) {
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "32kb", type: "application/json" }));
+const ADMIN_PANEL_ORIGINS = new Set(String(process.env.ADMIN_PANEL_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean));
+app.use((req, res, next) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && ADMIN_PANEL_ORIGINS.has(origin)) {
+        res.set("Access-Control-Allow-Origin", origin);
+        res.set("Vary", "Origin");
+        res.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+        res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    }
+    if (req.method === "OPTIONS") return origin && ADMIN_PANEL_ORIGINS.has(origin) ? res.sendStatus(204) : res.sendStatus(403);
+    return next();
+});
 app.get("/", (req, res) => { res.send("Bot is running!"); });
 app.get("/api/cpp/health", (req, res) => res.json({ ok: true, service: "rkbackles-cpp-bridge", version: require("./package.json").version }));
 
@@ -485,6 +501,63 @@ function readBearerToken(req) {
     const match = header.match(/^Bearer\s+(.+)$/i);
     return match ? match[1].trim() : "";
 }
+async function verifyAdminApiRequest(req) {
+    const token = readBearerToken(req);
+    if (!token) throw Object.assign(new Error("Missing admin bearer token"), { statusCode: 401 });
+    const decoded = await admin.auth().verifyIdToken(token, true);
+    const adminSnap = await db.ref(`adminUids/${decoded.uid}`).once("value");
+    if (adminSnap.val() !== true) throw Object.assign(new Error("Admin access denied"), { statusCode: 403 });
+    return decoded;
+}
+app.post("/api/admin/accounts/lookup", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const username = String(req.body?.username || "").trim().toLowerCase();
+        if (!/^[a-z0-9_]{3,20}$/.test(username)) return res.status(400).json({ ok: false, error: "invalid_username" });
+        const snap = await db.ref(`users/${username}`).once("value");
+        const record = snap.val();
+        if (!record) return res.status(404).json({ ok: false, error: "not_found" });
+        const safe = { username, status: String(record.status || "active"), category: String(record.category || ""), package: String(record.package || ""),
+            lockType: String(record.lockType || "HWID").toUpperCase(), hwid: String(record.hwid || ""), expiresAt: Number(record.expiresAt) || 0,
+            activeSession: !!record.activeSessionId, lastActive: Number(record.lastActive) || 0, discordId: String(record.discordId || "") };
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "account_lookup", timestamp: Date.now(), summary: `Looked up C++ account ${username}` });
+        return res.json({ ok: true, account: safe });
+    } catch (err) { return res.status(Number(err.statusCode) || 401).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "unauthorized" }); }
+});
+app.post("/api/admin/accounts/update", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const username = String(req.body?.username || "").trim().toLowerCase();
+        const newUsername = String(req.body?.newUsername || username).trim().toLowerCase();
+        const newPassword = String(req.body?.newPassword || "");
+        const hwid = String(req.body?.hwid || "").trim();
+        const lockType = String(req.body?.lockType || "HWID").toUpperCase();
+        const status = String(req.body?.status || "active").toLowerCase();
+        if (!/^[a-z0-9_]{3,20}$/.test(username) || !/^[a-z0-9_]{3,20}$/.test(newUsername)) return res.status(400).json({ ok: false, error: "invalid_username" });
+        if (newPassword && (newPassword.length < 8 || newPassword.length > 128)) return res.status(400).json({ ok: false, error: "invalid_password" });
+        if (hwid && !/^[A-Za-z0-9_-]{1,80}$/.test(hwid)) return res.status(400).json({ ok: false, error: "invalid_hwid" });
+        if (!["HWID", "ONLINE"].includes(lockType) || !["active", "suspended", "disabled"].includes(status)) return res.status(400).json({ ok: false, error: "invalid_settings" });
+        const usersRef = db.ref("users");
+        const existing = await usersRef.child(username).once("value");
+        if (!existing.exists()) return res.status(404).json({ ok: false, error: "not_found" });
+        const passwordHash = newPassword ? await hashCppPassword(newPassword) : null;
+        const tx = await usersRef.transaction(allUsers => {
+            if (!allUsers || !allUsers[username]) return;
+            if (newUsername !== username && allUsers[newUsername]) return;
+            const current = { ...allUsers[username] };
+            const next = { ...current, username: newUsername, lockType, status, activeSessionId: null, isLoggedIn: false,
+                adminUpdatedAt: Date.now(), adminUpdatedBy: actor.uid };
+            if (hwid) next.hwid = hwid; else delete next.hwid;
+            if (passwordHash) { next.passwordHash = passwordHash; delete next.password; }
+            allUsers[newUsername] = next;
+            if (newUsername !== username) delete allUsers[username];
+            return allUsers;
+        }, undefined, false);
+        if (!tx.committed) return res.status(409).json({ ok: false, error: "username_conflict_or_changed" });
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "cpp_account_update", timestamp: Date.now(), summary: `Updated C++ account ${username} -> ${newUsername}; lock=${lockType}; status=${status}; hwid=${hwid ? "set" : "reset"}; password=${newPassword ? "changed" : "unchanged"}` });
+        return res.json({ ok: true, username: newUsername, sessionInvalidated: true });
+    } catch (err) { console.error("Admin account update failed:", err.message); return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "update_failed" }); }
+});
 async function verifyCppRequest(req) {
     const token = readBearerToken(req);
     if (!token) throw Object.assign(new Error("Missing bearer token"), { statusCode: 401 });
@@ -537,14 +610,21 @@ app.post("/api/cpp/login", async (req, res) => {
             if (expiry > 0 && expiry <= Date.now()) return;
             const lockType = String(current.lockType || "HWID").toUpperCase();
             const savedHwid = String(current.hwid || "");
+            const activeSessionId = String(current.activeSessionId || "");
+            const lastActive = Number(current.lastActive) || 0;
+            const sessionTimeoutMs = Math.max(60_000, Number(process.env.CPP_SESSION_STALE_MS || 120_000));
+            const priorSessionFresh = !!activeSessionId && (Date.now() - lastActive) < sessionTimeoutMs;
+            // Both lock modes permit only one active session. HWID additionally pins the account to one PC.
+            if (activeSessionId && activeSessionId !== sessionId && priorSessionFresh) return;
             if (lockType === "HWID" && savedHwid && savedHwid !== hwid) return;
-            if (lockType === "DIGITAL" && current.isLoggedIn === true && current.activeSessionId && current.activeSessionId !== sessionId && Date.now() - (Number(current.lastActive) || 0) < 30000) return;
+            if (! ["HWID", "ONLINE", "DIGITAL"].includes(lockType)) return;
             return {
                 ...current,
-                hwid: lockType === "HWID" ? (savedHwid || hwid) : (savedHwid || hwid),
+                lockType: lockType === "DIGITAL" ? "ONLINE" : lockType,
+                hwid: savedHwid || hwid,
                 activeSessionId: sessionId,
                 lastActive: Date.now(),
-                isLoggedIn: lockType === "DIGITAL" ? true : Boolean(current.isLoggedIn),
+                isLoggedIn: true,
                 lastAuthAt: Date.now()
             };
         }, undefined, false);
@@ -608,7 +688,7 @@ app.post("/api/cpp/heartbeat", async (req, res) => {
                 return cppApiError(res, 403, "account_revoked", "অ্যাকাউন্ট inactive অথবা মেয়াদ শেষ।");
             }
             const updates = { lastActive: now };
-            if (String(account.lockType || "HWID").toUpperCase() === "DIGITAL") updates.isLoggedIn = true;
+            if (["ONLINE", "DIGITAL", "HWID"].includes(String(account.lockType || "HWID").toUpperCase())) updates.isLoggedIn = true;
             await ref.update(updates);
             watchCppUserProfile(username, decoded.uid);
         } else {
@@ -641,7 +721,7 @@ app.post("/api/cpp/logout", async (req, res) => {
             const cleared = await ref.transaction(current => {
                 if (!current || current.activeSessionId !== decoded.sessionId) return;
                 const next = { ...current, activeSessionId: null, lastActive: Date.now() };
-                if (String(current.lockType || "HWID").toUpperCase() === "DIGITAL") next.isLoggedIn = false;
+                next.isLoggedIn = false;
                 return next;
             }, undefined, false);
             if (cleared.committed) stopCppProfileWatcher(`user:${username}`, decoded.uid);
@@ -1523,6 +1603,18 @@ client.on("interactionCreate", async (interaction) => {
             const basePrice = getPackagePrice(category);
             const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
             await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            const existingSessionSnap = await sessionRef.once("value");
+            const existingSession = existingSessionSnap.val();
+            if (existingSession?.status === "offline_payment_approved") {
+                const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success));
+                return interaction.editReply({ content: "✅ Admin/Staff আপনার offline payment approve করেছেন। এখন account credentials তৈরি করতে পারবেন।", components: [row] });
+            }
+            if (existingSession?.status === "offline_payment_requested") {
+                return interaction.editReply("🕓 আপনার offline payment request Admin/Staff review-এর অপেক্ষায় আছে। একই request আবার পাঠানোর প্রয়োজন নেই।");
+            }
+            if (existingSession?.status === "offline_payment_rejected") {
+                return interaction.editReply("❌ আপনার offline payment request reject হয়েছে। নতুন payment করতে বা staff-এর সঙ্গে যোগাযোগ করতে পারেন।");
+            }
             const newSession = {
                 targetPrice: basePrice,
                 basePrice,
@@ -1760,6 +1852,105 @@ client.on("interactionCreate", async (interaction) => {
             .setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(couponInput));
         return interaction.showModal(modal);
+    }
+
+    // Offline payment requires explicit staff/admin approval after they verify the provider transaction manually.
+    if (interaction.isButton() && interaction.customId.startsWith("offlinepay_request_")) {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const match = /^offlinepay_request_(.+)_(bkash|nagad)$/.exec(interaction.customId);
+        if (!match) return interaction.editReply("❌ Offline payment request invalid.");
+        const category = getNormalizedCategory(match[1]);
+        const provider = match[2];
+        const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
+        const sessionSnap = await sessionRef.once("value");
+        const session = sessionSnap.val();
+        if (!session || session.provider !== provider || session.status !== "reader_offline") {
+            return interaction.editReply("⚠️ এই checkout এখন offline-payment request-এর জন্য প্রস্তুত নয়। Payment option আবার নির্বাচন করুন।");
+        }
+        const existingSnap = await db.ref("offline_payment_requests").orderByChild("discordUserId").equalTo(interaction.user.id).once("value");
+        const existing = Object.entries(existingSnap.val() || {}).find(([, r]) => r && r.category === category && r.status === "pending");
+        if (existing) return interaction.editReply(`🕓 আপনার offline payment request ইতোমধ্যে pending আছে। Request ID: \`${existing[0]}\``);
+        const reqRef = db.ref("offline_payment_requests").push();
+        const requestData = {
+            id: reqRef.key, discordUserId: interaction.user.id, discordUsername: interaction.user.username,
+            category, provider, amount: Number(session.targetPrice) || 0, status: "pending",
+            createdAt: Date.now(), checkoutKey: `${interaction.user.id}_${category}`, guildId: interaction.guild.id
+        };
+        await reqRef.set(requestData);
+        await sessionRef.update({ status: "offline_payment_requested", offlinePaymentRequestId: reqRef.key, offlinePaymentRequestedAt: Date.now() });
+        const staffChannel = interaction.guild.channels.cache.get(STAFF_ADMIN_LOG_ID);
+        if (!staffChannel || !staffChannel.isTextBased()) {
+            await reqRef.update({ status: "needs_staff_channel", updatedAt: Date.now() });
+            return interaction.editReply("⚠️ Offline request সংরক্ষিত হয়েছে, কিন্তু staff review channel পাওয়া যায়নি। Admin-কে STAFF_ADMIN_LOG_ID channel সেট করতে বলুন।");
+        }
+        const approvalRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`offlinepay_approve_${reqRef.key}`).setLabel("Approve (manual verify) ").setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`offlinepay_reject_${reqRef.key}`).setLabel("Reject").setStyle(ButtonStyle.Danger)
+        );
+        const reviewEmbed = new EmbedBuilder().setTitle("🧾 Offline Payment Approval Required")
+            .setDescription(`**User:** <@${interaction.user.id}> (\`${interaction.user.id}\`)
+**Package:** ${category}
+**Provider:** ${provider.toUpperCase()}
+**Amount:** ${requestData.amount} BDT
+**Request ID:** \`${reqRef.key}\`
+
+Approve করার আগে official bKash/Nagad transaction history নিজে যাচাই করুন। Reader evidence না থাকলে bot payment verify করেছে বলে গণ্য হবে না।`)
+            .setColor("Orange").setTimestamp();
+        await staffChannel.send({ embeds: [reviewEmbed], components: [approvalRow] });
+        return interaction.editReply("🕓 Offline payment request Admin/Staff-এর কাছে পাঠানো হয়েছে। Official transaction যাচাই করে approve না করা পর্যন্ত account তৈরি করা যাবে না।");
+    }
+
+    if (interaction.isButton() && interaction.customId.startsWith("offlinepay_status_")) {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const category = getNormalizedCategory(interaction.customId.slice("offlinepay_status_".length));
+        const sessionSnap = await db.ref(`pending_payments/${interaction.user.id}_${category}`).once("value");
+        const session = sessionSnap.val();
+        if (!session) return interaction.editReply("কোনো checkout session পাওয়া যায়নি। Shop থেকে package নির্বাচন করুন।");
+        if (session.status === "offline_payment_approved") {
+            const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success));
+            return interaction.editReply({ content: "✅ Admin/Staff offline payment approve করেছেন। নিচের বাটনে username/password তৈরি করুন।", components: [row] });
+        }
+        if (session.status === "offline_payment_requested") return interaction.editReply("🕓 Offline payment request এখনও Admin/Staff review-এর অপেক্ষায় আছে।");
+        if (session.status === "offline_payment_rejected") return interaction.editReply("❌ Offline payment request reject করা হয়েছে। সঠিক payment proof থাকলে staff-এর সঙ্গে যোগাযোগ করুন।");
+        return interaction.editReply("ℹ️ কোনো pending offline payment request নেই। Reader offline হলে payment option থেকে Offline payment request বেছে নিন।");
+    }
+
+    if (interaction.isButton() && /^offlinepay_(approve|reject)_/.test(interaction.customId)) {
+        const isApprover = interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)
+            || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin"))
+            || interaction.member?.roles?.cache?.has(getConfiguredRoleId("staff"));
+        if (!isApprover) return interaction.reply({ content: "❌ শুধু অনুমোদিত Admin/Staff offline payment request review করতে পারবেন।", flags: [MessageFlags.Ephemeral] });
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const match = /^offlinepay_(approve|reject)_(.+)$/.exec(interaction.customId);
+        const action = match[1]; const requestId = match[2];
+        const reqRef = db.ref(`offline_payment_requests/${requestId}`);
+        const claim = await reqRef.transaction(current => {
+            if (!current || current.status !== "pending") return;
+            return { ...current, status: action === "approve" ? "approved" : "rejected", reviewedBy: interaction.user.id, reviewedAt: Date.now() };
+        }, undefined, false);
+        if (!claim.committed) return interaction.editReply("⚠️ এই request আগেই review হয়েছে অথবা আর পাওয়া যাচ্ছে না।");
+        const request = claim.snapshot.val();
+        const sessionRef = db.ref(`pending_payments/${request.checkoutKey}`);
+        if (action === "approve") {
+            const approved = await sessionRef.transaction(current => {
+                if (!current || current.status !== "offline_payment_requested" || current.offlinePaymentRequestId !== requestId) return;
+                const amount = Math.max(0, Number(current.targetPrice) || 0);
+                return { ...current, status: "offline_payment_approved", totalPaid: amount,
+                    usedTxns: [...(Array.isArray(current.usedTxns) ? current.usedTxns : []), `OFFLINE_ADMIN_APPROVED:${requestId}`],
+                    offlineApprovedBy: interaction.user.id, offlineApprovedAt: Date.now(), offlinePaymentRequestId: requestId };
+            }, undefined, false);
+            if (!approved.committed) {
+                await reqRef.update({ status: "approved_but_session_changed", updatedAt: Date.now() });
+                return interaction.editReply("⚠️ Request approve হয়েছে, কিন্তু checkout session আর মেলেনি। Account credit করা হয়নি; Admin-কে session যাচাই করতে হবে।");
+            }
+            await interaction.editReply("✅ Offline payment request approve করা হয়েছে। User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।");
+        } else {
+            await sessionRef.transaction(current => current?.offlinePaymentRequestId === requestId && current.status === "offline_payment_requested"
+                ? { ...current, status: "offline_payment_rejected", offlineRejectedBy: interaction.user.id, offlineRejectedAt: Date.now() } : undefined, undefined, false);
+            await interaction.editReply("❌ Offline payment request reject করা হয়েছে।");
+        }
+        await interaction.message.edit({ components: [] }).catch(() => {});
+        return;
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("pay_provider_")) {
@@ -2287,8 +2478,10 @@ client.on("interactionCreate", async (interaction) => {
         try {
             const sessionSnap = await sessionRef.once("value");
             const initialSession = sessionSnap.val();
-            if (!initialSession || Number(initialSession.totalPaid) < Number(initialSession.targetPrice)) {
-                return interaction.editReply("❌ **পেমেন্ট অসম্পূর্ণ!** সম্পূর্ণ টাকা পরিশোধ করুন।");
+            const manuallyApprovedOffline = initialSession?.status === "offline_payment_approved"
+                && !!initialSession.offlineApprovedBy && !!initialSession.offlinePaymentRequestId;
+            if (!initialSession || (!manuallyApprovedOffline && Number(initialSession.totalPaid) < Number(initialSession.targetPrice))) {
+                return interaction.editReply("❌ **পেমেন্ট অসম্পূর্ণ!** সম্পূর্ণ টাকা পরিশোধ করুন অথবা Admin/Staff-এর offline payment approval-এর অপেক্ষা করুন।");
             }
             if (["creating", "completed"].includes(initialSession.status)) {
                 return interaction.editReply("⚠️ এই পেমেন্ট সেশন ইতোমধ্যে ব্যবহার করা হচ্ছে বা অ্যাকাউন্ট তৈরি হয়ে গেছে। একই পেমেন্ট দিয়ে দ্বিতীয় অ্যাকাউন্ট তৈরি করা যাবে না।");
@@ -2299,7 +2492,8 @@ client.on("interactionCreate", async (interaction) => {
                 if (!current || ["creating", "completed"].includes(current.status)) return;
                 const paid = Number(current.totalPaid) || 0;
                 const target = Number(current.targetPrice);
-                if (!Number.isFinite(target) || target < 0 || paid < target) return;
+                const approvedOffline = current.status === "offline_payment_approved" && !!current.offlineApprovedBy && !!current.offlinePaymentRequestId;
+                if (!Number.isFinite(target) || target < 0 || (!approvedOffline && paid < target)) return;
                 return { ...current, status: "creating", creationOwner: userId, creationStartedAt: Date.now() };
             }, undefined, false);
 
