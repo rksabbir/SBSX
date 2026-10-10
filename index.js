@@ -21,6 +21,7 @@ const {
     ActivityType,
     StringSelectMenuBuilder,
     PermissionFlagsBits,
+    Routes,
     MessageFlags,
     ModalBuilder,
     TextInputBuilder,
@@ -29,6 +30,12 @@ const {
 
 // html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
+const {
+    isValidDiscordSnowflake,
+    isSafeDiscordActionRole,
+    isProtectedDiscordTarget,
+    isAssignableDiscordRole
+} = require("./discord-admin-policy");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -88,9 +95,9 @@ function getSafeCppProfile(uid, record, kind = "user", extra = {}) {
     const now = Date.now();
     const expiresAt = Number(source.expiresAt) || 0;
     const rawStatus = String(source.status || (kind === "key" ? "VIP Access" : "active")).slice(0, 60);
-    const expired = kind === "user" && expiresAt > 0 && expiresAt <= now;
+    const expired = expiresAt > 0 && expiresAt <= now;
     const active = !!record && (kind === "key"
-        ? source.revoked !== true && source.disabled !== true && !!source.used
+        ? isCppKeyUsable(source, now) && !!source.used
         : rawStatus.toLowerCase() === "active" && !expired);
     return {
         uid,
@@ -187,6 +194,10 @@ const readerCheckLastAt = new Map();
 const READER_CHECK_LEASE_MS = Math.max(30_000, Number(process.env.READER_CHECK_LEASE_MS || 60_000));
 
 const { claimReaderCheckState, finishReaderCheckState, releaseReaderCheckState } = require("./reader-check-state");
+const { isCppKeyUsable } = require("./cpp-key-state");
+const { getPaymentTxnSubmitCooldownMs } = require("./runtime-limits");
+const { paymentTxnLocks, paymentTxnLastAt } = require("./payment-txn-state");
+const PAYMENT_TXN_SUBMIT_COOLDOWN_MS = getPaymentTxnSubmitCooldownMs(process.env.PAYMENT_TXN_SUBMIT_COOLDOWN_MS);
 
 async function getPaymentReaderState() {
     if (TRUSTED_READER_UIDS.size === 0) {
@@ -515,11 +526,258 @@ function readBearerToken(req) {
 async function verifyAdminApiRequest(req) {
     const token = readBearerToken(req);
     if (!token) throw Object.assign(new Error("Missing admin bearer token"), { statusCode: 401 });
-    const decoded = await admin.auth().verifyIdToken(token, true);
-    const adminSnap = await db.ref(`adminUids/${decoded.uid}`).once("value");
+    let decoded;
+    try {
+        decoded = await admin.auth().verifyIdToken(token, true);
+    } catch (_) {
+        throw Object.assign(new Error("Invalid or expired admin bearer token"), { statusCode: 401 });
+    }
+    let adminSnap;
+    try {
+        adminSnap = await db.ref(`adminUids/${decoded.uid}`).once("value");
+    } catch (_) {
+        throw Object.assign(new Error("Admin authorization lookup unavailable"), { statusCode: 503 });
+    }
     if (adminSnap.val() !== true) throw Object.assign(new Error("Admin access denied"), { statusCode: 403 });
     return decoded;
 }
+// ===== Admin Discord member directory / moderation API =====
+// Actions are authenticated against Firebase adminUids, rate limited, auditable,
+// and deliberately cannot grant the configured Discord Admin role.
+const DISCORD_ADMIN_ACTION_ROLES = Object.freeze({
+    developer: { configKey: "developer", label: "Developer" },
+    supportTicketReport: { configKey: "supportTicketReport", label: "Ticket moderator" },
+    supportCustomer: { configKey: "supportCustomer", label: "Customer support" },
+    verified: { configKey: "verified", label: "Verified" },
+    level: { configKey: "level", label: "Level reward" }
+});
+let adminDiscordDirectoryCache = { fetchedAt: 0, members: [], bans: [], membersTruncated: false, bansTruncated: false, guildId: "" };
+const DISCORD_DIRECTORY_CACHE_MS = 30_000;
+const DISCORD_DIRECTORY_MAX_PAGES = 10;
+const DISCORD_PAGE_SIZE = 1000;
+function adminApiError(res, err, fallback = "discord_action_failed") {
+    const status = Number(err?.statusCode) || 502;
+    const error = String(err?.apiError || (status === 401 ? "unauthorized" : status === 403 ? "forbidden" : status === 503 ? "server_unavailable" : fallback));
+    return res.status(status).json({ ok: false, error });
+}
+async function getReadyAdminGuild() {
+    if (!client.isReady()) throw Object.assign(new Error("Discord bot not ready"), { statusCode: 503, apiError: "bot_not_ready" });
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID) || await client.guilds.fetch(ALLOWED_GUILD_ID).catch(() => null);
+    if (!guild) throw Object.assign(new Error("Configured Discord guild not found"), { statusCode: 503, apiError: "guild_not_found" });
+    return guild;
+}
+function compareSnowflakes(a, b) {
+    try { const aa = BigInt(String(a || "0")), bb = BigInt(String(b || "0")); return aa < bb ? -1 : aa > bb ? 1 : 0; }
+    catch (_) { return String(a).localeCompare(String(b)); }
+}
+async function fetchAdminDiscordPages(guild, kind) {
+    const out = [];
+    let after = undefined;
+    let truncated = false;
+    for (let pageNo = 0; pageNo < DISCORD_DIRECTORY_MAX_PAGES; pageNo += 1) {
+        const query = new URLSearchParams({ limit: String(DISCORD_PAGE_SIZE) });
+        if (after) query.set("after", String(after));
+        const route = kind === "bans" ? Routes.guildBans(guild.id) : Routes.guildMembers(guild.id);
+        const batch = await client.rest.get(route, { query });
+        const values = Array.isArray(batch) ? batch : [];
+        if (!values.length) break;
+        out.push(...values);
+        const ids = values.map(value => value.user?.id).filter(Boolean).sort(compareSnowflakes);
+        const nextAfter = ids[ids.length - 1];
+        if (!nextAfter || nextAfter === after) break;
+        after = nextAfter;
+        if (values.length < DISCORD_PAGE_SIZE) break;
+        if (pageNo === DISCORD_DIRECTORY_MAX_PAGES - 1) truncated = true;
+    }
+    return { values: out, truncated };
+}
+async function getAdminDiscordDirectory(force = false) {
+    const now = Date.now();
+    if (!force && adminDiscordDirectoryCache.guildId === ALLOWED_GUILD_ID && now - adminDiscordDirectoryCache.fetchedAt < DISCORD_DIRECTORY_CACHE_MS) return adminDiscordDirectoryCache;
+    const guild = await getReadyAdminGuild();
+    const [memberResult, banResult] = await Promise.all([
+        fetchAdminDiscordPages(guild, "members"),
+        fetchAdminDiscordPages(guild, "bans")
+    ]);
+    adminDiscordDirectoryCache = {
+        fetchedAt: now,
+        guildId: guild.id,
+        members: memberResult.values,
+        bans: banResult.values,
+        membersTruncated: memberResult.truncated,
+        bansTruncated: banResult.truncated
+    };
+    return adminDiscordDirectoryCache;
+}
+function getAdminRoleBindingMap() {
+    return {
+        admin: getConfiguredRoleId("admin"),
+        developer: getConfiguredRoleId("developer"),
+        supportTicketReport: getConfiguredRoleId("supportTicketReport"),
+        supportCustomer: getConfiguredRoleId("supportCustomer"),
+        verified: getConfiguredRoleId("verified"),
+        level: getConfiguredRoleId("level")
+    };
+}
+function serializeAdminDiscordMember(member, guild, roleBindings) {
+    const user = member.user || member;
+    const roleIds = Array.isArray(member.roles) ? member.roles : (member.roles?.cache ? [...member.roles.cache.keys()] : []);
+    const filteredRoleIds = roleIds.filter(id => id !== guild.id);
+    const roles = filteredRoleIds.map(id => {
+        const role = guild.roles.cache.get(id);
+        if (!role) return { id, name: "Unknown role", key: "" };
+        const key = Object.keys(roleBindings).find(k => roleBindings[k] && roleBindings[k] === id) || "";
+        return { id: role.id, name: role.name, key };
+    }).sort((a, b) => (guild.roles.cache.get(b.id)?.position || 0) - (guild.roles.cache.get(a.id)?.position || 0));
+    const isAdminRole = roles.some(role => role.key === "admin");
+    const isDeveloper = roles.some(role => role.key === "developer");
+    const isModerator = roles.some(role => ["supportTicketReport", "supportCustomer"].includes(role.key));
+    const hasAdminPermission = filteredRoleIds.some(id => guild.roles.cache.get(id)?.permissions?.has(PermissionFlagsBits.Administrator));
+    const isAdministrator = Boolean(member.permissions?.has?.(PermissionFlagsBits.Administrator)) || Boolean(hasAdminPermission) || isAdminRole;
+    let avatarUrl = "";
+    try {
+        avatarUrl = user.displayAvatarURL ? user.displayAvatarURL({ extension: "png", size: 64 })
+            : (user.avatar ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64` : "");
+    } catch (_) {}
+    return {
+        id: String(user.id || member.id || ""), username: String(user.username || "unknown").slice(0, 100),
+        globalName: String(user.globalName || user.global_name || "").slice(0, 100),
+        displayName: String(member.displayName || member.nick || user.globalName || user.global_name || user.username || "unknown").slice(0, 100),
+        avatarUrl, bot: Boolean(user.bot), joinedAt: member.joinedTimestamp || (member.joined_at ? Date.parse(member.joined_at) : 0),
+        roles, isDeveloper, isModerator, isAdminRole, isAdministrator,
+        isOwner: String(user.id || member.id || "") === String(guild.ownerId || "")
+    };
+}
+async function beginDiscordAdminAudit(actor, actionType, summary) {
+    const ref = db.ref("auditLog").push();
+    await ref.set({ adminUid: actor.uid, actionType, timestamp: Date.now(), summary: `PENDING — ${summary}`, result: "pending" });
+    return ref;
+}
+async function runDiscordAdminAction(actor, actionType, summary, actionFn) {
+    const auditRef = await beginDiscordAdminAudit(actor, actionType, summary);
+    let result;
+    try {
+        result = await actionFn();
+    } catch (err) {
+        await auditRef.update({ result: "failed", summary: `${summary} — failed (${String(err.apiError || err.message || "discord_error").slice(0, 100)})`, completedAt: Date.now() }).catch(auditErr => console.error("Discord admin audit update failed:", auditErr.message));
+        throw err;
+    }
+    let auditLogged = true;
+    await auditRef.update({ result: "success", summary, completedAt: Date.now() }).catch(err => { auditLogged = false; console.error("Discord admin audit finalization failed:", err.message); });
+    return { ...(result || {}), auditLogged };
+}
+function validateDiscordSnowflake(value) {
+    const id = String(value || "").trim();
+    if (!isValidDiscordSnowflake(id)) throw Object.assign(new Error("Invalid Discord ID"), { statusCode: 400, apiError: "invalid_member_id" });
+    return id;
+}
+function getBotGuildMember(guild) {
+    const bot = guild.members.me;
+    if (!bot) throw Object.assign(new Error("Bot member is not cached"), { statusCode: 503, apiError: "bot_not_ready" });
+    return bot;
+}
+app.get("/api/admin/discord/members", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-directory", 20, 60_000)) return;
+        const refresh = String(req.query?.refresh || "") === "1";
+        const snapshot = await getAdminDiscordDirectory(refresh);
+        const guild = await getReadyAdminGuild();
+        const roleBindings = getAdminRoleBindingMap();
+        const members = snapshot.members.map(member => serializeAdminDiscordMember(member, guild, roleBindings));
+        const developers = members.filter(member => member.isDeveloper);
+        const moderators = members.filter(member => member.isModerator || member.isAdminRole);
+        const banned = snapshot.bans.map(entry => ({
+            id: String(entry.user?.id || ""), username: String(entry.user?.username || "Unknown user").slice(0, 100),
+            globalName: String(entry.user?.globalName || entry.user?.global_name || "").slice(0, 100),
+            reason: String(entry.reason || "No reason provided").slice(0, 400)
+        }));
+        const roleLabels = { developer: "Developer", supportTicketReport: "Ticket moderator", supportCustomer: "Customer support", verified: "Verified", level: "Level reward" };
+        const roleOptions = Object.entries(DISCORD_ADMIN_ACTION_ROLES).map(([key, item]) => {
+            const id = roleBindings[key];
+            const role = id ? guild.roles.cache.get(id) : null;
+            const botMember = guild.members.me;
+            if (!isAssignableDiscordRole({ exists: Boolean(role), managed: role?.managed, hasAdministratorPermission: role?.permissions?.has(PermissionFlagsBits.Administrator), rolePosition: role?.position, botHighestRolePosition: botMember?.roles?.highest?.position, roleId: role?.id, adminRoleId: roleBindings.admin })) return null;
+            return { key, name: roleLabels[key] || item.label };
+        }).filter(Boolean);
+        return res.json({ ok: true, guild: { id: guild.id, name: guild.name, memberCount: guild.memberCount }, members, developers, moderators, banned,
+            roleOptions, truncated: snapshot.membersTruncated || snapshot.bansTruncated, fetchedAt: snapshot.fetchedAt, adminUid: actor.uid });
+    } catch (err) { return adminApiError(res, err, "discord_directory_failed"); }
+});
+app.post("/api/admin/discord/ban", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-ban", 8, 60_000)) return;
+        const memberId = validateDiscordSnowflake(req.body?.memberId);
+        const reason = String(req.body?.reason || "Admin panel moderation action").trim().slice(0, 400) || "Admin panel moderation action";
+        const guild = await getReadyAdminGuild();
+        const botMember = getBotGuildMember(guild);
+        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) throw Object.assign(new Error("Bot missing Ban Members permission"), { statusCode: 403, apiError: "missing_permission" });
+        const member = await guild.members.fetch(memberId).catch(() => null);
+        if (!member) throw Object.assign(new Error("Member not found"), { statusCode: 404, apiError: "member_not_found" });
+        const configuredAdminRole = getConfiguredRoleId("admin");
+        if (isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId, isAdministrator: member.permissions.has(PermissionFlagsBits.Administrator) || (configuredAdminRole && member.roles.cache.has(configuredAdminRole)), targetHighestRolePosition: member.roles.highest.position, botHighestRolePosition: botMember.roles.highest.position })) {
+            throw Object.assign(new Error("Protected target"), { statusCode: 403, apiError: "protected_target" });
+        }
+        const summary = `Banned Discord member ${member.user.tag || member.id} (${member.id}); reason=${reason}`;
+        const result = await runDiscordAdminAction(actor, "discord_member_ban", summary, async () => {
+            await member.ban({ reason: `Admin panel by Firebase UID ${actor.uid}: ${reason}` });
+            return { memberId, action: "ban" };
+        });
+        return res.json({ ok: true, ...result });
+    } catch (err) { return adminApiError(res, err); }
+});
+app.post("/api/admin/discord/unban", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-unban", 8, 60_000)) return;
+        const memberId = validateDiscordSnowflake(req.body?.memberId);
+        const reason = String(req.body?.reason || "Admin panel unban").trim().slice(0, 400) || "Admin panel unban";
+        const guild = await getReadyAdminGuild();
+        const botMember = getBotGuildMember(guild);
+        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) throw Object.assign(new Error("Bot missing Ban Members permission"), { statusCode: 403, apiError: "missing_permission" });
+        const ban = await guild.bans.fetch(memberId).catch(() => null);
+        if (!ban) throw Object.assign(new Error("Not banned"), { statusCode: 404, apiError: "not_banned" });
+        const summary = `Unbanned Discord user ${ban.user.tag || memberId} (${memberId}); reason=${reason}`;
+        const result = await runDiscordAdminAction(actor, "discord_member_unban", summary, async () => {
+            await guild.bans.remove(memberId, `Admin panel by Firebase UID ${actor.uid}: ${reason}`);
+            return { memberId, action: "unban" };
+        });
+        return res.json({ ok: true, ...result });
+    } catch (err) { return adminApiError(res, err); }
+});
+app.post("/api/admin/discord/role", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-role", 15, 60_000)) return;
+        const memberId = validateDiscordSnowflake(req.body?.memberId);
+        const roleKey = String(req.body?.roleKey || "");
+        const action = String(req.body?.action || "").toLowerCase();
+        if (!isSafeDiscordActionRole(roleKey) || !Object.prototype.hasOwnProperty.call(DISCORD_ADMIN_ACTION_ROLES, roleKey) || !["add", "remove"].includes(action)) throw Object.assign(new Error("Role is not allowlisted"), { statusCode: 400, apiError: "invalid_role" });
+        const guild = await getReadyAdminGuild();
+        const botMember = getBotGuildMember(guild);
+        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) throw Object.assign(new Error("Bot missing Manage Roles permission"), { statusCode: 403, apiError: "missing_permission" });
+        const roleId = getConfiguredRoleId(DISCORD_ADMIN_ACTION_ROLES[roleKey].configKey);
+        const role = roleId ? guild.roles.cache.get(roleId) : null;
+        if (!isAssignableDiscordRole({ exists: Boolean(role), managed: role?.managed, hasAdministratorPermission: role?.permissions?.has(PermissionFlagsBits.Administrator), rolePosition: role?.position, botHighestRolePosition: botMember.roles.highest.position, roleId: role?.id, adminRoleId: getConfiguredRoleId("admin") })) {
+            throw Object.assign(new Error("Role is not eligible for assignment"), { statusCode: 400, apiError: "invalid_role" });
+        }
+        const member = await guild.members.fetch(memberId).catch(() => null);
+        if (!member) throw Object.assign(new Error("Member not found"), { statusCode: 404, apiError: "member_not_found" });
+        const configuredAdminRole = getConfiguredRoleId("admin");
+        if (isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId, isAdministrator: member.permissions.has(PermissionFlagsBits.Administrator) || (configuredAdminRole && member.roles.cache.has(configuredAdminRole)), targetHighestRolePosition: member.roles.highest.position, botHighestRolePosition: botMember.roles.highest.position })) throw Object.assign(new Error("Protected target"), { statusCode: 403, apiError: "protected_target" });
+        if (action === "add" && member.roles.cache.has(role.id)) return res.json({ ok: true, memberId, roleKey, action, alreadyApplied: true, auditLogged: true });
+        if (action === "remove" && !member.roles.cache.has(role.id)) return res.json({ ok: true, memberId, roleKey, action, alreadyApplied: true, auditLogged: true });
+        const summary = `${action === "add" ? "Granted" : "Removed"} Discord role ${role.name} (${role.id}) ${action === "add" ? "to" : "from"} ${member.user.tag || member.id} (${member.id})`;
+        const result = await runDiscordAdminAction(actor, "discord_member_role_" + action, summary, async () => {
+            if (action === "add") await member.roles.add(role, `Admin panel by Firebase UID ${actor.uid}`);
+            else await member.roles.remove(role, `Admin panel by Firebase UID ${actor.uid}`);
+            return { memberId, roleKey, roleName: role.name, action };
+        });
+        return res.json({ ok: true, ...result });
+    } catch (err) { return adminApiError(res, err); }
+});
+
 app.post("/api/admin/accounts/lookup", async (req, res) => {
     try {
         const actor = await verifyAdminApiRequest(req);
@@ -533,7 +791,11 @@ app.post("/api/admin/accounts/lookup", async (req, res) => {
             activeSession: !!record.activeSessionId, lastActive: Number(record.lastActive) || 0, discordId: String(record.discordId || "") };
         await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "account_lookup", timestamp: Date.now(), summary: `Looked up C++ account ${username}` });
         return res.json({ ok: true, account: safe });
-    } catch (err) { return res.status(Number(err.statusCode) || 401).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "unauthorized" }); }
+    } catch (err) {
+        const status = Number(err.statusCode) || 500;
+        const error = status === 403 ? "forbidden" : status === 401 ? "unauthorized" : status === 503 ? "server_unavailable" : "lookup_failed";
+        return res.status(status).json({ ok: false, error });
+    }
 });
 app.post("/api/admin/accounts/create", async (req, res) => {
     if (!checkCppRateLimit(req, res, "admin-account-create", 20, 10 * 60 * 1000)) return;
@@ -591,7 +853,9 @@ app.post("/api/admin/accounts/create", async (req, res) => {
         return res.status(201).json({ ok: true, username, package: packageName, category, status, lockType, expiresAt: account.expiresAt, paidAmount: 0, source: "admin_panel" });
     } catch (err) {
         console.error("Admin account create failed:", err.message);
-        return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : Number(err.statusCode) === 401 ? "unauthorized" : "create_failed" });
+        const status = Number(err.statusCode) || 500;
+        const error = status === 403 ? "forbidden" : status === 401 ? "unauthorized" : status === 503 ? "server_unavailable" : "create_failed";
+        return res.status(status).json({ ok: false, error });
     }
 });
 
@@ -627,7 +891,12 @@ app.post("/api/admin/accounts/update", async (req, res) => {
         if (!tx.committed) return res.status(409).json({ ok: false, error: "username_conflict_or_changed" });
         await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "cpp_account_update", timestamp: Date.now(), summary: `Updated C++ account ${username} -> ${newUsername}; lock=${lockType}; status=${status}; hwid=${hwid ? "set" : "reset"}; password=${newPassword ? "changed" : "unchanged"}` });
         return res.json({ ok: true, username: newUsername, sessionInvalidated: true });
-    } catch (err) { console.error("Admin account update failed:", err.message); return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "update_failed" }); }
+    } catch (err) {
+        console.error("Admin account update failed:", err.message);
+        const status = Number(err.statusCode) || 500;
+        const error = status === 403 ? "forbidden" : status === 401 ? "unauthorized" : status === 503 ? "server_unavailable" : "update_failed";
+        return res.status(status).json({ ok: false, error });
+    }
 });
 async function verifyCppRequest(req) {
     const token = readBearerToken(req);
@@ -722,7 +991,7 @@ app.post("/api/cpp/key-login", async (req, res) => {
         const keyRef = db.ref(`keys/${key}`);
         const sessionId = crypto.randomUUID();
         const claim = await keyRef.transaction(current => {
-            if (!current || current.disabled === true || current.revoked === true) return;
+            if (!isCppKeyUsable(current)) return;
             const savedHwid = String(current.hwid || "");
             if (current.used === true && savedHwid && savedHwid !== hwid) return;
             const expiry = Number(current.expiresAt) || 0;
@@ -768,7 +1037,7 @@ app.post("/api/cpp/heartbeat", async (req, res) => {
             if (!session || session.sessionId !== decoded.sessionId || !session.key) return cppApiError(res, 409, "session_replaced", "Developer key session শেষ হয়েছে।");
             const keySnap = await db.ref(`keys/${session.key}`).once("value");
             const keyData = keySnap.val();
-            if (!keyData || keyData.revoked === true || keyData.disabled === true || String(keyData.hwid || "") !== String(session.hwid || "") || String(keyData.activeSessionId || "") !== decoded.sessionId) {
+            if (!isCppKeyUsable(keyData, now) || String(keyData.hwid || "") !== String(session.hwid || "") || String(keyData.activeSessionId || "") !== decoded.sessionId) {
                 await db.ref(`cppProfiles/${decoded.uid}`).set(getSafeCppProfile(decoded.uid, keyData, "key", { usedKey: session.key }));
                 watchCppKeyProfile(session.key, decoded.uid);
                 return cppApiError(res, 403, "key_revoked", "Developer key বাতিল অথবা session invalid।");
@@ -2212,6 +2481,12 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             return interaction.editReply("❌ Transaction ID-তে অবৈধ অক্ষর আছে। শুধু ইংরেজি অক্ষর, সংখ্যা, _ বা - ব্যবহার করুন (৩–৬৪ অক্ষর)।");
         }
         const txnLockKey = `${userId}:${category}`;
+        if (paymentTxnLastAt.size > 5000) {
+            const staleBefore = Date.now() - PAYMENT_TXN_SUBMIT_COOLDOWN_MS;
+            for (const [key, timestamp] of paymentTxnLastAt) {
+                if (timestamp <= staleBefore) paymentTxnLastAt.delete(key);
+            }
+        }
         if (paymentTxnLocks.has(txnLockKey)) {
             return interaction.editReply("⏳ আপনার TxnID ইতোমধ্যে যাচাই হচ্ছে। একই সময়ে আবার submit করার প্রয়োজন নেই।");
         }

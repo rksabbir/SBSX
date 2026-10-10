@@ -1,8 +1,8 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.6",
+  "version": "1.5.7",
   "private": true,
-  "description": "discord.js v14 bot with secure checkout, offline payment approval, admin C++ account creation/management, and real-time session bridge",
+  "description": "discord.js v14 bot with secure checkout, admin C++ account management, Discord member moderation and safe role assignment",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
