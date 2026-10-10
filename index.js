@@ -44,6 +44,7 @@ const {
 const { sanitizeVoiceSpeech, formatVerifiedAnnouncement, formatRoleChangeAnnouncement, formatLevelUpAnnouncement } = require("./discord-bengali-automation");
 const { normalizeRecorderMimeType, extractOneTimeTicketFromProtocols, packRemotePcmFrame } = require("./live-voice-protocol");
 const { createLivePcmAudioProcess } = require("./live-voice-pcm-stream");
+const { normalizeStudioName, studioInviteDigest, isValidStudioInviteCode, isGuestStudioIdentity, buildStudioVideoGrant, isLiveStudioVoiceBound } = require("./live-studio-policy");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -792,6 +793,136 @@ const liveVoiceTickets = new Map();
 const LIVE_VOICE_TICKET_TTL_MS = 30_000;
 const LIVE_VOICE_MAX_BYTES_PER_SECOND = 300 * 1024;
 const LIVE_VOICE_MAX_DURATION_MS = Math.min(2 * 60 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_VOICE_MAX_DURATION_MS || 30 * 60 * 1000)));
+const LIVE_STUDIO_MAX_DURATION_MS = Math.min(12 * 60 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_STUDIO_MAX_DURATION_MS || 4 * 60 * 60 * 1000)));
+const LIVE_STUDIO_INVITE_TTL_MS = Math.min(30 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_STUDIO_INVITE_TTL_MS || 10 * 60 * 1000)));
+const LIVE_STUDIO_MAX_PARTICIPANTS = Math.min(50, Math.max(2, Number(process.env.LIVE_STUDIO_MAX_PARTICIPANTS || 20)));
+const liveStudioSessions = new Map(); // one LiveKit Studio room per configured Discord guild; memory only
+const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> single-use, short-lived session-bound invite
+let liveKitSdkCache = null;
+function getLiveKitRuntime() {
+    const rawUrl = String(process.env.LIVEKIT_URL || "").trim();
+    const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
+    const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
+    if (!rawUrl || !apiKey || !apiSecret) throw Object.assign(new Error("LiveKit is not configured"), { statusCode: 503, apiError: "live_studio_not_configured" });
+    let parsed;
+    try { parsed = new URL(rawUrl); } catch (_) { throw Object.assign(new Error("LIVEKIT_URL invalid"), { statusCode: 503, apiError: "live_studio_not_configured" }); }
+    let protocol = parsed.protocol;
+    if (protocol === "wss:") protocol = "https:";
+    else if (protocol === "ws:") protocol = "http:";
+    if (!(["https:", "http:"].includes(protocol)) || (protocol !== "https:" && !["localhost", "127.0.0.1"].includes(parsed.hostname))) {
+        throw Object.assign(new Error("LiveKit URL must use HTTPS/WSS outside localhost"), { statusCode: 503, apiError: "live_studio_not_configured" });
+    }
+    const apiUrl = `${protocol}//${parsed.host}`;
+    const clientUrl = `${protocol === "https:" ? "wss:" : "ws:"}//${parsed.host}`;
+    if (!liveKitSdkCache) {
+        let sdk;
+        try { sdk = require("livekit-server-sdk"); }
+        catch (_) { throw Object.assign(new Error("Install livekit-server-sdk on the Bot host"), { statusCode: 503, apiError: "live_studio_dependency_missing" }); }
+        liveKitSdkCache = { sdk, roomService: new sdk.RoomServiceClient(apiUrl, apiKey, apiSecret), apiUrl, clientUrl, apiKey, apiSecret };
+    }
+    // If a deploy changes credentials/URL, recreate the runtime client rather than retaining stale config.
+    if (liveKitSdkCache.apiUrl !== apiUrl || liveKitSdkCache.apiKey !== apiKey || liveKitSdkCache.apiSecret !== apiSecret) {
+        const sdk = liveKitSdkCache.sdk;
+        liveKitSdkCache = { sdk, roomService: new sdk.RoomServiceClient(apiUrl, apiKey, apiSecret), apiUrl, clientUrl, apiKey, apiSecret };
+    }
+    return liveKitSdkCache;
+}
+function studioSessionForGuild(guildId) {
+    const session = liveStudioSessions.get(String(guildId));
+    if (!session || session.endedAt || session.expiresAt <= Date.now()) return null;
+    const voiceSession = adminVoiceSessions.get(String(guildId));
+    let readyStatus = "Ready";
+    try { readyStatus = getVoiceDependencies().voice.VoiceConnectionStatus.Ready; } catch (_) {}
+    if (!isLiveStudioVoiceBound({ sessionChannelId: session.discordChannelId, voiceChannelId: voiceSession?.channelId,
+        voiceStatus: voiceSession?.connection?.state?.status, readyStatus, expiresAt: session.expiresAt })) return null;
+    return session;
+}
+function studioAccessToken(session, identity, name, role) {
+    const runtime = getLiveKitRuntime();
+    const { AccessToken } = runtime.sdk;
+    // A participant token stays valid until the Studio session expires (capped by the session's own lifetime).
+    // This avoids unexpectedly dropping invited guests after the previous fixed 1-hour token TTL.
+    const tokenTtlSeconds = Math.max(60, Math.ceil((Number(session.expiresAt) - Date.now()) / 1000));
+    const token = new AccessToken(runtime.apiKey, runtime.apiSecret, {
+        identity,
+        name: normalizeStudioName(name, role === "host" ? "RKBACKLES Admin" : "Guest"),
+        ttl: tokenTtlSeconds,
+        metadata: JSON.stringify({ app: "RKBACKLES", sessionId: session.sessionId, role })
+    });
+    token.addGrant({ ...buildStudioVideoGrant(role, runtime.sdk.TrackSource), room: session.roomName });
+    return token.toJwt().then(jwt => ({ token: jwt, serverUrl: runtime.clientUrl }));
+}
+async function endLiveStudioForGuild(guildId, reason = "session ended", actorUid = "system") {
+    const key = String(guildId || "");
+    const session = liveStudioSessions.get(key);
+    if (!session) return false;
+    session.endedAt = Date.now();
+    liveStudioSessions.delete(key);
+    if (session.timer) clearTimeout(session.timer);
+    if (session.moderationTimer) clearInterval(session.moderationTimer);
+    for (const [digest, invite] of liveStudioInvites) if (invite.sessionId === session.sessionId) liveStudioInvites.delete(digest);
+    try { await session.roomService.deleteRoom(session.roomName); }
+    catch (err) { console.warn("Live Studio room cleanup failed:", String(err?.message || err).slice(0, 300)); }
+    await db.ref("auditLog").push({ adminUid: actorUid, actionType: "live_studio_end", timestamp: Date.now(), summary: `Live Studio ended (${String(reason).slice(0, 180)}); room ${session.roomName} removed` }).catch(err => console.error("Live Studio audit write failed:", err.message));
+    console.log(`Live Studio ended: guild=${key}, session=${session.sessionId}, reason=${String(reason).slice(0, 180)}`);
+    return true;
+}
+async function enforceLiveStudioDeniedParticipants(session) {
+    if (!session || liveStudioSessions.get(session.guildId) !== session) return;
+    const voiceSession = adminVoiceSessions.get(session.guildId);
+    let readyStatus = "Ready";
+    try { readyStatus = getVoiceDependencies().voice.VoiceConnectionStatus.Ready; } catch (_) {}
+    const voiceReady = isLiveStudioVoiceBound({ sessionChannelId: session.discordChannelId, voiceChannelId: voiceSession?.channelId,
+        voiceStatus: voiceSession?.connection?.state?.status, readyStatus, expiresAt: session.expiresAt });
+    if (!voiceReady) {
+        session.voiceDisconnectedAt ||= Date.now();
+        // Give Discord voice transport a brief reconnection grace period before ending the invite room.
+        if (Date.now() - session.voiceDisconnectedAt > 15_000) {
+            await endLiveStudioForGuild(session.guildId, "Discord Bot voice connection stayed disconnected", "system");
+            return;
+        }
+    } else {
+        session.voiceDisconnectedAt = 0;
+    }
+    if (!session.deniedIdentities.size) return;
+    try {
+        const participants = await session.roomService.listParticipants(session.roomName);
+        const runtime = session.mutedIdentities.size ? getLiveKitRuntime() : null;
+        for (const participant of participants || []) {
+            const identity = String(participant.identity || "");
+            if (session.deniedIdentities.has(identity)) {
+                await session.roomService.removeParticipant(session.roomName, identity).catch(() => {});
+                continue;
+            }
+            // Preserve Admin mute across a reconnect: revoke publishing rights while the mute is active.
+            if (session.mutedIdentities.has(identity) && runtime) {
+                for (const track of participant.tracks || []) {
+                    const source = String(track.source ?? "").toLowerCase();
+                    if (source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE) {
+                        await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, true).catch(() => {});
+                    }
+                }
+                await session.roomService.updateParticipant(session.roomName, identity, { permission: {
+                    canPublish: true, canPublishSources: [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
+                    canPublishData: false, canSubscribe: true
+                } }).catch(() => {});
+            }
+        }
+    } catch (err) { console.warn("Live Studio moderation watchdog failed:", String(err?.message || err).slice(0, 300)); }
+}
+function safeStudioParticipant(participant, session) {
+    const metadata = (() => { try { return JSON.parse(participant.metadata || "{}"); } catch (_) { return {}; } })();
+    return {
+        identity: String(participant.identity || "").slice(0, 128),
+        name: normalizeStudioName(participant.name, "Guest"),
+        role: String(metadata.role || "guest") === "host" ? "host" : "guest",
+        adminMuted: Boolean(session?.mutedIdentities?.has(String(participant.identity || ""))),
+        tracks: (Array.isArray(participant.tracks) ? participant.tracks : []).slice(0, 10).map(track => ({
+            sid: String(track.sid || "").slice(0, 128), source: String(track.source ?? "").slice(0, 40),
+            type: String(track.type ?? "").slice(0, 40), muted: Boolean(track.muted)
+        }))
+    };
+}
 function getVoiceDependencies() {
     return { voice: require("@discordjs/voice"), googleTts: require("google-tts-api"), OpusScript: require("opusscript") };
 }
@@ -1078,7 +1209,7 @@ app.post("/api/admin/discord/voice/join", async (req, res) => {
         const { voice } = getVoiceDependencies();
         const existing = adminVoiceSessions.get(guild.id);
         if (existing?.connection && existing.channelId === channel.id && existing.connection.state.status === voice.VoiceConnectionStatus.Ready) return res.json({ok:true,connected:true,channelId,channelName:channel.name,alreadyConnected:true});
-        if (existing?.connection) { closeLiveVoiceSocket(existing, 1001, "voice channel changed"); existing.player?.stop(true); existing.connection.destroy(); }
+        if (existing?.connection) { await endLiveStudioForGuild(guild.id, "Discord voice channel changed", actor.uid); closeLiveVoiceSocket(existing, 1001, "voice channel changed"); existing.player?.stop(true); existing.connection.destroy(); }
         const player = voice.createAudioPlayer({behaviors:{noSubscriber:voice.NoSubscriberBehavior.Pause,maxMissedFrames:50}});
         player.on("error", err => console.error("Admin voice player error:", err.message));
         const connection = voice.joinVoiceChannel({channelId:channel.id,guildId:guild.id,adapterCreator:guild.voiceAdapterCreator,selfDeaf:false,selfMute:false});
@@ -1088,6 +1219,7 @@ app.post("/api/admin/discord/voice/join", async (req, res) => {
                 closeLiveVoiceSocket(ended, 1001, "Discord voice connection ended");
                 ended?.player?.stop(true);
                 adminVoiceSessions.delete(guild.id);
+                endLiveStudioForGuild(guild.id, "Discord bot voice connection destroyed", ended?.connectedBy || "system").catch(err => console.error("Live Studio shutdown after Discord voice disconnect failed:", err.message));
             }
         });
         connection.subscribe(player);
@@ -1105,6 +1237,7 @@ app.post("/api/admin/discord/voice/leave", async (req, res) => {
         const guild = await getReadyAdminGuild();
         const current = adminVoiceSessions.get(guild.id);
         if (!current?.connection) return res.json({ok:true,connected:false,alreadyDisconnected:true});
+        await endLiveStudioForGuild(guild.id, "Admin ended Discord voice session", actor.uid);
         closeLiveVoiceSocket(current, 1001, "Admin ended voice session");
         current.player?.stop(true); current.connection.destroy(); adminVoiceSessions.delete(guild.id);
         await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_leave",timestamp:Date.now(),summary:`Bot left voice channel ${current.channelName || current.channelId}`}).catch(err=>console.error("Voice audit write failed:",err.message));
@@ -1130,6 +1263,245 @@ app.post("/api/admin/discord/voice/speak", async (req, res) => {
         await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_speak",timestamp:Date.now(),summary:`Admin requested Bengali voice message (${text.length} characters) in ${session.channelName || session.channelId}`}).catch(err=>console.error("Voice audit write failed:",err.message));
         return res.json({ok:true,speaking:true,characterCount:text.length,channelName:session.channelName || session.channelId});
     } catch (err) { return adminApiError(res,err,"voice_speak_failed"); }
+});
+
+// Discord voice-member moderation. This never bypasses Discord permissions: the Bot needs Mute Members / Move Members.
+app.post("/api/admin/discord/voice/members", async (req, res) => {
+    try {
+        await verifyAdminApiRequest(req);
+        const guild = await getReadyAdminGuild();
+        const session = adminVoiceSessions.get(guild.id);
+        const { voice } = getVoiceDependencies();
+        const connected = Boolean(session?.connection && session.connection.state.status === voice.VoiceConnectionStatus.Ready);
+        if (!connected) return res.json({ ok: true, connected: false, channelName: "", members: [] });
+        const botMember = getBotGuildMember(guild);
+        const canMute = Boolean(botMember?.permissions?.has(PermissionFlagsBits.MuteMembers));
+        const canDisconnect = Boolean(botMember?.permissions?.has(PermissionFlagsBits.MoveMembers));
+        const members = [...guild.voiceStates.cache.values()].filter(state => state.channelId === session.channelId && state.member).map(state => {
+            const member = state.member;
+            const protectedTarget = isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId,
+                isAdministrator: member.permissions?.has(PermissionFlagsBits.Administrator) || Boolean(getConfiguredRoleId("admin") && member.roles?.cache?.has(getConfiguredRoleId("admin"))),
+                targetHighestRolePosition: member.roles?.highest?.position, botHighestRolePosition: botMember?.roles?.highest?.position });
+            return { id: member.id, name: normalizeStudioName(member.displayName || member.user?.username || member.id), username: String(member.user?.username || "").slice(0, 80),
+                muted: Boolean(state.serverMute), deafened: Boolean(state.serverDeaf), isBot: Boolean(member.user?.bot), protectedTarget,
+                canMute: canMute && !protectedTarget && !member.user?.bot, canDisconnect: canDisconnect && !protectedTarget && !member.user?.bot };
+        }).sort((a,b)=>a.name.localeCompare(b.name)).slice(0,200);
+        return res.json({ ok: true, connected: true, channelId: session.channelId, channelName: session.channelName || "Voice channel", canMute, canDisconnect, members });
+    } catch (err) { return adminApiError(res, err, "voice_members_failed"); }
+});
+app.post("/api/admin/discord/voice/member-action", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-discord-voice-member-action", 20, 60_000)) return;
+        const userId = validateDiscordSnowflake(req.body?.userId);
+        const action = String(req.body?.action || "").toLowerCase();
+        if (!userId || !["mute", "unmute", "disconnect"].includes(action)) throw Object.assign(new Error("Invalid member action"), { statusCode: 400, apiError: "invalid_voice_member_action" });
+        const guild = await getReadyAdminGuild();
+        const session = adminVoiceSessions.get(guild.id);
+        const { voice } = getVoiceDependencies();
+        if (!session?.connection || session.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Bot not in voice"), { statusCode: 409, apiError: "voice_not_connected" });
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (!member || member.voice?.channelId !== session.channelId) throw Object.assign(new Error("Member is not in the Bot's current voice channel"), { statusCode: 404, apiError: "voice_member_not_found" });
+        if (isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId,
+            isAdministrator: member.permissions.has(PermissionFlagsBits.Administrator) || Boolean(getConfiguredRoleId("admin") && member.roles.cache.has(getConfiguredRoleId("admin"))),
+            targetHighestRolePosition: member.roles.highest.position, botHighestRolePosition: getBotGuildMember(guild).roles.highest.position }) || member.user.bot) {
+            throw Object.assign(new Error("Protected voice moderation target"), { statusCode: 403, apiError: "protected_voice_target" });
+        }
+        const botMember = getBotGuildMember(guild);
+        if (["mute", "unmute"].includes(action) && !botMember.permissions.has(PermissionFlagsBits.MuteMembers)) throw Object.assign(new Error("Bot needs Mute Members"), { statusCode: 403, apiError: "missing_mute_members_permission" });
+        if (action === "disconnect" && !botMember.permissions.has(PermissionFlagsBits.MoveMembers)) throw Object.assign(new Error("Bot needs Move Members"), { statusCode: 403, apiError: "missing_move_members_permission" });
+        const description = action === "disconnect" ? "disconnect from voice" : `${action} in voice`;
+        if (action === "disconnect") await member.voice.disconnect(`Admin panel by Firebase UID ${actor.uid}: ${description}`);
+        else await member.voice.setMute(action === "mute", `Admin panel by Firebase UID ${actor.uid}: ${description}`);
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: `discord_voice_member_${action}`, timestamp: Date.now(), summary: `${action} voice member ${member.user?.tag || member.id} (${member.id}) in ${session.channelName || session.channelId}` }).catch(err => console.error("Voice member audit write failed:", err.message));
+        return res.json({ ok: true, userId, action, name: normalizeStudioName(member.displayName || member.user?.username || member.id) });
+    } catch (err) { return adminApiError(res, err, "voice_member_action_failed"); }
+});
+
+// Browser-based Live Studio is a separate WebRTC room (LiveKit), because the official Discord Bot API does not provide bot screen-sharing.
+// Start/invite/moderation routes are Admin-only. Guest invite codes are random, hashed, single-use, and session-bound.
+app.get("/live-room", (req, res) => res.sendFile(require("path").join(__dirname, "public", "live-room.html")));
+app.post("/api/admin/live-studio/status", async (req, res) => {
+    try {
+        await verifyAdminApiRequest(req);
+        const guild = await getReadyAdminGuild();
+        const { voice } = getVoiceDependencies();
+        const botVoice = adminVoiceSessions.get(guild.id);
+        const botConnected = Boolean(botVoice?.connection && botVoice.connection.state.status === voice.VoiceConnectionStatus.Ready);
+        let session = liveStudioSessions.get(guild.id);
+        if (session && (!botConnected || session.discordChannelId !== botVoice.channelId || session.expiresAt <= Date.now())) {
+            await endLiveStudioForGuild(guild.id, "Bot voice disconnected or session expired", "system");
+            session = null;
+        }
+        if (!session) return res.json({ ok: true, configured: Boolean(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET), active: false, botConnected, botChannelName: botVoice?.channelName || "" });
+        const participants = await session.roomService.listParticipants(session.roomName).catch(() => []);
+        return res.json({ ok: true, configured: true, active: true, sessionId: session.sessionId, roomName: session.roomName, channelName: session.discordChannelName,
+            discordChannelName: session.discordChannelName, startedAt: session.startedAt, expiresAt: session.expiresAt, participantCount: participants.length, botConnected: true });
+    } catch (err) { return adminApiError(res, err, "live_studio_status_failed"); }
+});
+app.post("/api/admin/live-studio/start", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-live-studio-start", 6, 60_000)) return;
+        const guild = await getReadyAdminGuild();
+        const voiceSession = adminVoiceSessions.get(guild.id);
+        const { voice } = getVoiceDependencies();
+        if (!voiceSession?.connection || voiceSession.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Bot must be connected to Discord voice first"), { statusCode: 409, apiError: "voice_not_connected" });
+        const runtime = getLiveKitRuntime();
+        let session = liveStudioSessions.get(guild.id);
+        if (session && (session.discordChannelId !== voiceSession.channelId || session.expiresAt <= Date.now())) { await endLiveStudioForGuild(guild.id, "replaced stale session", actor.uid); session = null; }
+        if (session && session.ownerUid !== actor.uid) throw Object.assign(new Error("A Live Studio is already active"), { statusCode: 409, apiError: "live_studio_already_active" });
+        if (!session) {
+            const sessionId = crypto.randomBytes(12).toString("base64url");
+            const roomName = `rkbs_${guild.id}_${crypto.randomBytes(7).toString("hex")}`;
+            await runtime.roomService.createRoom({ name: roomName, emptyTimeout: 60, maxParticipants: LIVE_STUDIO_MAX_PARTICIPANTS, metadata: JSON.stringify({ app: "RKBACKLES", sessionId }) });
+            session = { sessionId, guildId: guild.id, roomName, roomService: runtime.roomService, ownerUid: actor.uid, discordChannelId: voiceSession.channelId,
+                discordChannelName: voiceSession.channelName || "Discord voice", startedAt: Date.now(), expiresAt: Date.now() + LIVE_STUDIO_MAX_DURATION_MS,
+                hostIdentity: `host_${crypto.createHash("sha256").update(actor.uid).digest("hex").slice(0, 12)}`, deniedIdentities: new Set(), mutedIdentities: new Set(), endedAt: 0 };
+            liveStudioSessions.set(guild.id, session);
+            session.timer = setTimeout(() => endLiveStudioForGuild(guild.id, "maximum session duration reached", "system").catch(() => {}), LIVE_STUDIO_MAX_DURATION_MS);
+            if (typeof session.timer.unref === "function") session.timer.unref();
+            session.moderationTimer = setInterval(() => enforceLiveStudioDeniedParticipants(session).catch(() => {}), 2500);
+            if (typeof session.moderationTimer.unref === "function") session.moderationTimer.unref();
+            await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_start", timestamp: Date.now(), summary: `Live Studio started for Discord voice channel ${session.discordChannelName}; browser media is relayed live and not stored` }).catch(err => console.error("Live Studio audit write failed:", err.message));
+        }
+        const access = await studioAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host");
+        return res.json({ ok: true, active: true, sessionId: session.sessionId, roomName: session.roomName, channelName: session.discordChannelName,
+            expiresAt: session.expiresAt, identity: session.hostIdentity, role: "host", ...access });
+    } catch (err) { return adminApiError(res, err, "live_studio_start_failed"); }
+});
+app.post("/api/admin/live-studio/invite", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-live-studio-invite", 30, 60_000)) return;
+        const guild = await getReadyAdminGuild();
+        const session = studioSessionForGuild(guild.id);
+        if (!session) throw Object.assign(new Error("Start Live Studio while Bot is joined to voice"), { statusCode: 409, apiError: "live_studio_not_active" });
+        if (session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can invite participants"), { statusCode: 403, apiError: "forbidden" });
+        const now = Date.now();
+        for (const [digest, item] of liveStudioInvites) if (item.expiresAt <= now || !liveStudioSessions.has(item.guildId)) liveStudioInvites.delete(digest);
+        if (liveStudioInvites.size >= 2000) throw Object.assign(new Error("Too many pending invitations"), { statusCode: 429, apiError: "live_studio_invite_limit" });
+        const code = crypto.randomBytes(32).toString("base64url");
+        const digest = studioInviteDigest(code);
+        liveStudioInvites.set(digest, { sessionId: session.sessionId, guildId: guild.id, expiresAt: Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt), createdBy: actor.uid });
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_invite", timestamp: Date.now(), summary: `Single-use Live Studio invitation issued; room ${session.roomName}; expires in ${Math.floor(LIVE_STUDIO_INVITE_TTL_MS / 60000)} minutes` }).catch(err => console.error("Live Studio audit write failed:", err.message));
+        return res.json({ ok: true, inviteCode: code, expiresAt: Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt), sessionId: session.sessionId });
+    } catch (err) { return adminApiError(res, err, "live_studio_invite_failed"); }
+});
+app.post("/api/live-studio/redeem", async (req, res) => {
+    try {
+        if (!checkCppRateLimit(req, res, "live-studio-redeem", 12, 60_000)) return;
+        const code = String(req.body?.inviteCode || "");
+        if (!isValidStudioInviteCode(code)) throw Object.assign(new Error("Invalid invite code"), { statusCode: 400, apiError: "live_studio_invite_invalid" });
+        const digest = studioInviteDigest(code);
+        const invite = liveStudioInvites.get(digest);
+        if (!invite || invite.expiresAt <= Date.now()) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Invite expired or already used"), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
+        const session = studioSessionForGuild(invite.guildId);
+        if (!session || session.sessionId !== invite.sessionId) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Live Studio is no longer active"), { statusCode: 410, apiError: "live_studio_not_active" }); }
+        liveStudioInvites.delete(digest); // consume single-use invitation before signing any token
+        const name = normalizeStudioName(req.body?.displayName, "Live guest");
+        const identity = `guest_${crypto.randomBytes(12).toString("hex")}`;
+        const access = await studioAccessToken(session, identity, name, "guest");
+        return res.json({ ok: true, sessionId: session.sessionId, roomName: session.roomName, identity, name, role: "guest", ...access });
+    } catch (err) { return adminApiError(res, err, "live_studio_join_failed"); }
+});
+app.post("/api/admin/live-studio/participants", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const guild = await getReadyAdminGuild();
+        const session = studioSessionForGuild(guild.id);
+        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active for this Admin"), { statusCode: 409, apiError: "live_studio_not_active" });
+        const participants = await session.roomService.listParticipants(session.roomName);
+        return res.json({ ok: true, participants: (participants || []).map(participant => ({ ...safeStudioParticipant(participant, session), isHost: String(participant.identity || "") === session.hostIdentity })) });
+    } catch (err) { return adminApiError(res, err, "live_studio_participants_failed"); }
+});
+app.post("/api/admin/live-studio/mute", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-live-studio-mute", 30, 60_000)) return;
+        const guild = await getReadyAdminGuild();
+        const session = studioSessionForGuild(guild.id);
+        const identity = String(req.body?.identity || "");
+        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
+        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be moderated from this panel"), { statusCode: 400, apiError: "invalid_studio_target" });
+        const participant = (await session.roomService.listParticipants(session.roomName)).find(item => String(item.identity) === identity);
+        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
+        const runtime = getLiveKitRuntime();
+        const micTracks = (participant.tracks || []).filter(track => {
+            const source = String(track.source ?? "").toLowerCase();
+            return source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE;
+        });
+        // Mark first so reconnects are also muted by the watchdog. If the API fails, rollback the state.
+        session.mutedIdentities.add(identity);
+        try {
+            for (const track of micTracks) await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, true);
+            await session.roomService.updateParticipant(session.roomName, identity, { permission: {
+                canPublish: true, canPublishSources: [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
+                canPublishData: false, canSubscribe: true
+            } });
+        } catch (err) {
+            session.mutedIdentities.delete(identity);
+            throw err;
+        }
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_mute", timestamp: Date.now(), summary: `Muted and revoked microphone publishing for Live Studio participant ${identity}` }).catch(err => console.error("Live Studio audit write failed:", err.message));
+        return res.json({ ok: true, identity, muted: true, adminMuted: true });
+    } catch (err) { return adminApiError(res, err, "live_studio_mute_failed"); }
+});
+app.post("/api/admin/live-studio/unmute", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-live-studio-unmute", 30, 60_000)) return;
+        const guild = await getReadyAdminGuild();
+        const session = studioSessionForGuild(guild.id);
+        const identity = String(req.body?.identity || "");
+        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
+        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be moderated from this panel"), { statusCode: 400, apiError: "invalid_studio_target" });
+        const participant = (await session.roomService.listParticipants(session.roomName)).find(item => String(item.identity) === identity);
+        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
+        const runtime = getLiveKitRuntime();
+        await session.roomService.updateParticipant(session.roomName, identity, { permission: {
+            canPublish: true, canPublishSources: [runtime.sdk.TrackSource.MICROPHONE, runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO], canPublishData: false, canSubscribe: true
+        }});
+        session.mutedIdentities.delete(identity);
+        // Remote unmute is disabled in some LiveKit configurations; allow publishing and let the guest toggle mic if needed.
+        let remotelyUnmuted = false;
+        const micTrack = (participant.tracks || []).find(track => {
+            const source = String(track.source ?? "").toLowerCase();
+            return source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE;
+        });
+        if (micTrack) {
+            try { await session.roomService.mutePublishedTrack(session.roomName, identity, micTrack.sid, false); remotelyUnmuted = true; }
+            catch (_) { /* permission restored; participant may need to toggle mic locally */ }
+        }
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_unmute", timestamp: Date.now(), summary: `Restored microphone publishing permission for Live Studio participant ${identity}` }).catch(err => console.error("Live Studio audit write failed:", err.message));
+        return res.json({ ok: true, identity, muted: false, remotelyUnmuted, mayNeedMicToggle: !remotelyUnmuted });
+    } catch (err) { return adminApiError(res, err, "live_studio_unmute_failed"); }
+});
+app.post("/api/admin/live-studio/kick", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-live-studio-kick", 20, 60_000)) return;
+        const guild = await getReadyAdminGuild();
+        const session = studioSessionForGuild(guild.id);
+        const identity = String(req.body?.identity || "");
+        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
+        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be removed from the panel"), { statusCode: 400, apiError: "invalid_studio_target" });
+        session.deniedIdentities.add(identity);
+        try { await session.roomService.removeParticipant(session.roomName, identity, { revokeTokenTs: BigInt(Math.floor(Date.now() / 1000)) }); }
+        catch (err) { session.deniedIdentities.delete(identity); throw err; }
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_kick", timestamp: Date.now(), summary: `Removed Live Studio participant ${identity}; denied for remaining session` }).catch(err => console.error("Live Studio audit write failed:", err.message));
+        return res.json({ ok: true, identity, removed: true });
+    } catch (err) { return adminApiError(res, err, "live_studio_kick_failed"); }
+});
+app.post("/api/admin/live-studio/end", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const guild = await getReadyAdminGuild();
+        const session = liveStudioSessions.get(guild.id);
+        if (session && session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can end Live Studio"), { statusCode: 403, apiError: "forbidden" });
+        await endLiveStudioForGuild(guild.id, "Admin ended Live Studio", actor.uid);
+        return res.json({ ok: true, active: false });
+    } catch (err) { return adminApiError(res, err, "live_studio_end_failed"); }
 });
 
 app.post("/api/admin/accounts/lookup", async (req, res) => {
@@ -1567,6 +1939,15 @@ liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
     socket.once("error", err => console.error("Admin live voice websocket error:", err.message));
     db.ref("auditLog").push({ adminUid: ticketRecord.uid, actionType: "discord_live_voice_start", timestamp: Date.now(), summary: `Admin opened two-way live voice relay in ${session.channelName || session.channelId}; audio not stored` }).catch(err => console.error("Live voice audit write failed:", err.message));
     sendLiveVoiceJson(socket, { type: "connected", channelName: session.channelName || "voice channel", audioIsNotStored: true });
+});
+client.once("ready", () => {
+    if (!(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET)) return;
+    try {
+        const runtime = getLiveKitRuntime();
+        runtime.roomService.listRooms().then(rooms => Promise.all((rooms || []).filter(room => String(room.name || "").startsWith(`rkbs_${ALLOWED_GUILD_ID}_`)).map(room =>
+            runtime.roomService.deleteRoom(room.name).then(() => console.log(`Removed stale Live Studio room after Bot restart: ${room.name}`)).catch(err => console.warn("Stale Live Studio room cleanup failed:", err.message))
+        ))).catch(err => console.warn("Live Studio startup cleanup failed:", err.message));
+    } catch (err) { console.warn("Live Studio disabled until credentials are configured:", err.apiError || err.message); }
 });
 server.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
