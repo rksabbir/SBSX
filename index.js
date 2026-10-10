@@ -848,6 +848,33 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
     session.liveActorUid = actorUid;
     const resource = voice.createAudioResource(proc.stdout, { inputType: voice.StreamType.Raw, metadata: { adminUid: actorUid, source: "live-admin-microphone" } });
     session.liveResource = resource;
+    // A live microphone is an unbuffered network source, unlike a local file. The voice
+    // player's default maxMissedFrames=5 can stop/destroy the resource after ~100 ms of
+    // packet jitter, which in turn closes the PCM stream. Give live audio a bounded 1 s
+    // underrun tolerance, while still letting the player's stream-error path fail closed.
+    let playerStateListener = null;
+    const removePlayerStateListener = () => {
+        if (playerStateListener) {
+            session.player.off("stateChange", playerStateListener);
+            playerStateListener = null;
+        }
+    };
+    playerStateListener = (oldState, newState) => {
+        if (oldState.resource !== resource || newState.status !== voice.AudioPlayerStatus.Idle) return;
+        if (!socket.liveStarted || session.liveSocket !== socket) return;
+        const reason = `Discord AudioPlayer transitioned ${oldState.status} -> idle while the live microphone session was active`;
+        console.error(`Live voice player stopped (${reason}); inputBytes=${proc.liveInputBytes || 0}`);
+        socket.liveFailureNotified = true;
+        sendLiveVoiceJson(socket, {
+            type: "error",
+            error: "live_voice_player_stopped",
+            diagnostic: { inputBytes: proc.liveInputBytes || 0, reason }
+        });
+        closeLiveVoiceSocket(session, 1011, "Discord audio player stopped live microphone");
+    };
+    session.player.on("stateChange", playerStateListener);
+    proc.once("close", removePlayerStateListener);
+    proc.once("error", removePlayerStateListener);
     proc.once("spawn", () => {
         if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket) { stopLiveMicProcess(session); return; }
         if (!proc.stdin || proc.stdin.destroyed || !proc.stdin.writable || proc.exitCode !== null) {
@@ -864,8 +891,23 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
             closeLiveVoiceSocket(session, 1011, "microphone player start failed");
         }
     });
+    if (proc.rawPcm && proc.stdout && typeof proc.stdout.once === "function") {
+        proc.stdout.once("close", () => {
+            if (!socket.liveStarted || session.liveSocket !== socket) return;
+            const playerState = session.player?.state?.status || "unknown";
+            const connectionState = session.connection?.state?.status || "unknown";
+            const playbackStream = resource.playStream;
+            const resourceState = `playStreamDestroyed=${Boolean(playbackStream?.destroyed)},playStreamEnded=${Boolean(playbackStream?.readableEnded)}`;
+            const ageMs = session.liveStartedAt ? Math.max(0, Date.now() - session.liveStartedAt) : 0;
+            const context = `player=${playerState},connection=${connectionState},${resourceState},ageMs=${ageMs},inputBytes=${proc.liveInputBytes || 0}`;
+            const baseReason = proc.failureReason || "Discord audio output closed before microphone input ended";
+            proc.failureReason = `${baseReason}; ${context}`.slice(0, 300);
+            console.error("Live voice PCM output closed while the session was active:", proc.failureReason);
+        });
+    }
     proc.once("error", err => {
-        console.error(proc.rawPcm ? "Live voice PCM pipeline failed:" : "Live voice FFmpeg spawn failed:", err?.message || err);
+        const detail = proc.failureReason || err?.message || "unknown error";
+        console.error(proc.rawPcm ? "Live voice PCM pipeline failed:" : "Live voice FFmpeg spawn failed:", detail);
         if (session.liveProcess === proc) session.liveProcess = null;
         socket.liveFailureNotified = true;
         sendLiveVoiceJson(socket, {
@@ -1007,7 +1049,7 @@ app.post("/api/admin/discord/voice/join", async (req, res) => {
         const existing = adminVoiceSessions.get(guild.id);
         if (existing?.connection && existing.channelId === channel.id && existing.connection.state.status === voice.VoiceConnectionStatus.Ready) return res.json({ok:true,connected:true,channelId,channelName:channel.name,alreadyConnected:true});
         if (existing?.connection) { closeLiveVoiceSocket(existing, 1001, "voice channel changed"); existing.player?.stop(true); existing.connection.destroy(); }
-        const player = voice.createAudioPlayer({behaviors:{noSubscriber:voice.NoSubscriberBehavior.Pause}});
+        const player = voice.createAudioPlayer({behaviors:{noSubscriber:voice.NoSubscriberBehavior.Pause,maxMissedFrames:50}});
         player.on("error", err => console.error("Admin voice player error:", err.message));
         const connection = voice.joinVoiceChannel({channelId:channel.id,guildId:guild.id,adapterCreator:guild.voiceAdapterCreator,selfDeaf:false,selfMute:false});
         connection.on("stateChange", (_oldState, newState) => {
@@ -1051,7 +1093,7 @@ app.post("/api/admin/discord/voice/speak", async (req, res) => {
         const { voice, googleTts } = getVoiceDependencies();
         if (session.player.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player busy"),{statusCode:409,apiError:"voice_busy"});
         const audioUrl = googleTts.getAudioUrl(text,{lang:"bn",slow:false,host:"https://translate.google.com"});
-        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.12"}});
+        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.13"}});
         if (!response.ok || !response.body) throw Object.assign(new Error("TTS provider failed"),{statusCode:502,apiError:"tts_provider_failed"});
         const resource = voice.createAudioResource(Readable.fromWeb(response.body),{inputType:voice.StreamType.Arbitrary,metadata:{adminUid:actor.uid,queuedAt:Date.now()}});
         session.player.play(resource);
@@ -1451,7 +1493,12 @@ liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
             if (now - socket.liveByteWindowStartedAt >= 1000) { socket.liveByteWindowStartedAt = now; socket.liveBytesInWindow = 0; }
             socket.liveBytesInWindow += data.length;
             if (socket.liveBytesInWindow > LIVE_VOICE_MAX_BYTES_PER_SECOND) { socket.close(1008, "microphone bitrate limit exceeded"); return; }
-            try { session.liveProcess.stdin.write(data); session.liveProcess.liveInputBytes = (session.liveProcess.liveInputBytes || 0) + data.length; }
+            try {
+                // The in-process PCM adapter counts its own writes. Count here only for the
+                // legacy child-process transcoder so diagnostic inputBytes is never doubled.
+                if (!session.liveProcess.rawPcm) session.liveProcess.liveInputBytes = (session.liveProcess.liveInputBytes || 0) + data.length;
+                session.liveProcess.stdin.write(data);
+            }
             catch (err) {
                 console.error("Live voice audio write failed:", err?.message || err);
                 sendLiveVoiceJson(socket, { type: "error", error: "live_voice_transcode_failed" });

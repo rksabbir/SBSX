@@ -59,10 +59,20 @@ function createLivePcmAudioProcess() {
 
   stdin.once("finish", () => finish(0));
   stdin.on("error", err => {
-    proc.failureReason = `microphone input write failed: ${err?.code || err?.message || "unknown error"}`;
+    // If stdout was already closed, destroying stdin can itself produce
+    // ERR_STREAM_PREMATURE_CLOSE. Preserve the earlier output-close reason instead
+    // of replacing the root symptom with this secondary cleanup error.
+    const earlierFailure = proc.failureReason;
+    const isSecondaryPrematureClose = Boolean(earlierFailure) &&
+      (err?.code === "ERR_STREAM_PREMATURE_CLOSE" || /premature close/i.test(String(err?.message || "")));
+    if (!proc.failureReason) {
+      proc.failureReason = `microphone input write failed: ${err?.code || err?.message || "unknown error"}`;
+    }
     finish(1, proc.failureReason);
     if (!stdout.destroyed) stdout.destroy();
-    proc.emit("error", err);
+    // The adapter's caller listens to this event for true unexpected errors. Do not
+    // emit a duplicate synthetic error if the downstream close reason was captured first.
+    if (!isSecondaryPrematureClose) proc.emit("error", err);
   });
   stdin.once("close", () => {
     if (!finalized && !stdin.writableEnded) finish(1, "microphone input closed before normal end");

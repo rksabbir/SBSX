@@ -1,8 +1,8 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.12",
+  "version": "1.5.14",
   "private": true,
-  "description": "Discord.js bot with Bengali automation and hardened direct-PCM two-way admin live voice",
+  "description": "Discord.js bot with Bengali automation and jitter-tolerant direct-PCM two-way admin live voice",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
