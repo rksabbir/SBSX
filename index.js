@@ -868,7 +868,11 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
         console.error(proc.rawPcm ? "Live voice PCM pipeline failed:" : "Live voice FFmpeg spawn failed:", err?.message || err);
         if (session.liveProcess === proc) session.liveProcess = null;
         socket.liveFailureNotified = true;
-        sendLiveVoiceJson(socket, { type: "error", error: proc.rawPcm ? "live_voice_audio_pipeline_failed" : "ffmpeg_unavailable" });
+        sendLiveVoiceJson(socket, {
+            type: "error",
+            error: proc.rawPcm ? "live_voice_audio_pipeline_failed" : "ffmpeg_unavailable",
+            ...(proc.rawPcm ? { diagnostic: { inputBytes: proc.liveInputBytes || 0, reason: String(proc.failureReason || err?.code || err?.message || "audio pipeline error").slice(0, 200) } } : {})
+        });
         closeLiveVoiceSocket(session, 1011, proc.rawPcm ? "microphone PCM pipeline failed" : "microphone transcoder unavailable");
     });
     proc.once("close", code => {
@@ -882,14 +886,18 @@ async function beginLiveMicStream(socket, session, actorUid, mimeType) {
                 ? (code === 0 ? "live_voice_stream_ended" : "live_voice_audio_pipeline_failed")
                 : (code === 0 ? "live_voice_stream_ended" : "live_voice_transcode_failed");
             const inputBytes = proc.liveInputBytes || 0;
-            const diagnostic = proc.rawPcm ? "direct PCM stream" : (ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600);
+            const diagnostic = proc.rawPcm ? (proc.failureReason || "direct PCM stream ended without a captured reason") : (ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600);
             console.error(`Live voice ${proc.rawPcm ? "PCM stream" : "FFmpeg"} exited unexpectedly (code=${code}, inputBytes=${inputBytes}): ${diagnostic}`);
             if (socket.readyState === WebSocket.OPEN) {
-                sendLiveVoiceJson(socket, { type: "error", error: errorCode });
+                sendLiveVoiceJson(socket, {
+                    type: "error",
+                    error: errorCode,
+                    ...(proc.rawPcm ? { diagnostic: { inputBytes, reason: String(proc.failureReason || "PCM output stream ended unexpectedly").slice(0, 200) } } : {})
+                });
                 try { socket.close(1011, proc.rawPcm ? "microphone PCM stream ended" : "microphone transcoder exited"); } catch (_) { try { socket.terminate(); } catch (_) {} }
             }
         } else if (code && code !== 0 && socket.readyState === WebSocket.OPEN && !socket.liveStopping) {
-            console.error(`Live voice ${proc.rawPcm ? "PCM stream" : "FFmpeg"} exited (code=${code}): ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1200)}`);
+            console.error(`Live voice ${proc.rawPcm ? "PCM stream" : "FFmpeg"} exited (code=${code}, inputBytes=${proc.liveInputBytes || 0}): ${(proc.rawPcm ? (proc.failureReason || "no internal failure reason captured") : (ffmpegStderrTail || "no stderr output")).replace(/[\r\n]+/g, " ").slice(-1200)}`);
         }
     });
     proc.on("exit", code => {
@@ -1043,7 +1051,7 @@ app.post("/api/admin/discord/voice/speak", async (req, res) => {
         const { voice, googleTts } = getVoiceDependencies();
         if (session.player.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player busy"),{statusCode:409,apiError:"voice_busy"});
         const audioUrl = googleTts.getAudioUrl(text,{lang:"bn",slow:false,host:"https://translate.google.com"});
-        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.10"}});
+        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.12"}});
         if (!response.ok || !response.body) throw Object.assign(new Error("TTS provider failed"),{statusCode:502,apiError:"tts_provider_failed"});
         const resource = voice.createAudioResource(Readable.fromWeb(response.body),{inputType:voice.StreamType.Arbitrary,metadata:{adminUid:actor.uid,queuedAt:Date.now()}});
         session.player.play(resource);

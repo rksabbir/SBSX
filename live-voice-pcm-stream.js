@@ -1,54 +1,99 @@
 "use strict";
 
 const { EventEmitter } = require("node:events");
-const { PassThrough } = require("node:stream");
+const { PassThrough, Writable } = require("node:stream");
 
 /**
- * Wrap raw 48 kHz stereo s16le PCM as a child-process-like object so the existing Discord
- * AudioPlayer lifecycle can consume a Readable stream. No converter/container parser is needed.
- * `stdin` and `stdout` intentionally share one PassThrough so bytes are relayed unchanged.
+ * Child-process-shaped adapter for Discord's raw 48 kHz stereo s16le AudioResource.
+ * Keep input (Writable) and output (Readable) separate. The previous implementation used
+ * one PassThrough as both stdin and stdout; destroying/closing its readable side could also
+ * destroy the writable input and prematurely terminate the live microphone pipeline.
  */
 function createLivePcmAudioProcess() {
-  const stream = new PassThrough({ highWaterMark: 128 * 1024 });
-  const processLike = new EventEmitter();
-  processLike.stdin = stream;
-  processLike.stdout = stream;
-  processLike.stderr = null;
-  processLike.exitCode = null;
-  processLike.killed = false;
-  processLike.rawPcm = true;
-  processLike.liveInputBytes = 0;
+  const stdout = new PassThrough({ highWaterMark: 128 * 1024 });
+  const proc = new EventEmitter();
   let finalized = false;
 
-  const finish = code => {
+  proc.stdout = stdout;
+  proc.stderr = null;
+  proc.exitCode = null;
+  proc.killed = false;
+  proc.rawPcm = true;
+  proc.liveInputBytes = 0;
+  proc.failureReason = "";
+
+  const finish = (code, reason = "") => {
     if (finalized) return;
     finalized = true;
-    processLike.exitCode = code;
-    if (code !== 0) processLike.killed = true;
+    proc.exitCode = code;
+    if (reason) proc.failureReason = String(reason).slice(0, 300);
+    if (code !== 0) proc.killed = true;
     process.nextTick(() => {
-      processLike.emit("exit", code, null);
-      processLike.emit("close", code, null);
+      proc.emit("exit", code, null);
+      proc.emit("close", code, null);
     });
   };
 
-  stream.once("end", () => finish(0));
-  stream.on("error", err => {
-    processLike.emit("error", err);
-    finish(1);
+  const stdin = new Writable({
+    highWaterMark: 128 * 1024,
+    write(chunk, encoding, callback) {
+      if (finalized || stdout.destroyed || stdout.writableEnded) {
+        const err = new Error("PCM output stream is no longer writable");
+        err.code = "ERR_LIVE_PCM_OUTPUT_CLOSED";
+        callback(err);
+        return;
+      }
+      proc.liveInputBytes += chunk.length;
+      try {
+        stdout.write(chunk, callback);
+      } catch (err) {
+        callback(err);
+      }
+    },
+    final(callback) {
+      if (!stdout.destroyed && !stdout.writableEnded) stdout.end(callback);
+      else callback();
+    },
   });
-  stream.once("close", () => {
-    if (!finalized) finish(stream.readableEnded ? 0 : 1);
+  proc.stdin = stdin;
+
+  stdin.once("finish", () => finish(0));
+  stdin.on("error", err => {
+    proc.failureReason = `microphone input write failed: ${err?.code || err?.message || "unknown error"}`;
+    finish(1, proc.failureReason);
+    if (!stdout.destroyed) stdout.destroy();
+    proc.emit("error", err);
   });
-  processLike.kill = () => {
-    if (processLike.exitCode !== null) return false;
-    processLike.killed = true;
-    try { stream.destroy(); } catch (_) {}
-    finish(1);
+  stdin.once("close", () => {
+    if (!finalized && !stdin.writableEnded) finish(1, "microphone input closed before normal end");
+  });
+  stdout.on("error", err => {
+    proc.failureReason = `Discord audio output failed: ${err?.code || err?.message || "unknown error"}`;
+    if (!stdin.destroyed) stdin.destroy();
+    finish(1, proc.failureReason);
+    proc.emit("error", err);
+  });
+  stdout.once("close", () => {
+    if (!finalized && !stdin.writableEnded) {
+      const reason = "Discord audio output closed before microphone input ended";
+      proc.failureReason = reason;
+      if (!stdin.destroyed) stdin.destroy();
+      finish(1, reason);
+    }
+  });
+
+  proc.kill = () => {
+    if (proc.exitCode !== null) return false;
+    proc.killed = true;
+    proc.failureReason = "live PCM pipeline was stopped";
+    if (!stdin.destroyed) stdin.destroy();
+    if (!stdout.destroyed) stdout.destroy();
+    finish(1, proc.failureReason);
     return true;
   };
 
-  process.nextTick(() => processLike.emit("spawn"));
-  return processLike;
+  process.nextTick(() => proc.emit("spawn"));
+  return proc;
 }
 
 module.exports = { createLivePcmAudioProcess };
