@@ -46,6 +46,7 @@ const { sanitizeVoiceSpeech, formatVerifiedAnnouncement, formatRoleChangeAnnounc
 const { normalizeRecorderMimeType, extractOneTimeTicketFromProtocols, packRemotePcmFrame } = require("./live-voice-protocol");
 const { createLivePcmAudioProcess } = require("./live-voice-pcm-stream");
 const { normalizeStudioName, studioInviteDigest, isValidStudioInviteCode, isGuestStudioIdentity, buildStudioVideoGrant, isLiveStudioVoiceBound } = require("./live-studio-policy");
+const { attachLiveConsoleServer } = require("./live-console-server");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -799,14 +800,14 @@ const LIVE_STUDIO_INVITE_TTL_MS = Math.min(30 * 60 * 1000, Math.max(60_000, Numb
 const LIVE_STUDIO_MAX_PARTICIPANTS = Math.min(50, Math.max(2, Number(process.env.LIVE_STUDIO_MAX_PARTICIPANTS || 20)));
 const liveStudioSessions = new Map(); // one LiveKit Studio room per configured Discord guild; memory only
 const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> single-use, short-lived session-bound invite
+const DEFAULT_LIVEKIT_URL = "wss://sabbir-ylq7x559.livekit.cloud"; // Public project URL supplied by the owner; override on the Bot host if changed.
 let liveKitSdkCache = null;
 // Safe diagnostics only: never return or log the API key/secret themselves.
 function inspectLiveKitConfiguration() {
-    const rawUrl = String(process.env.LIVEKIT_URL || "").trim();
+    const rawUrl = String(process.env.LIVEKIT_URL || DEFAULT_LIVEKIT_URL).trim();
     const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
     const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
     const missingVariables = [];
-    if (!rawUrl) missingVariables.push("LIVEKIT_URL");
     if (!apiKey) missingVariables.push("LIVEKIT_API_KEY");
     if (!apiSecret) missingVariables.push("LIVEKIT_API_SECRET");
     let urlValid = false;
@@ -836,7 +837,7 @@ function inspectLiveKitConfiguration() {
 }
 function getLiveKitRuntime() {
     const config = inspectLiveKitConfiguration();
-    const rawUrl = String(process.env.LIVEKIT_URL || "").trim();
+    const rawUrl = String(process.env.LIVEKIT_URL || DEFAULT_LIVEKIT_URL).trim();
     const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
     const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
     if (config.missingVariables.length) throw Object.assign(new Error("LiveKit environment variables are missing"), { statusCode: 503, apiError: "live_studio_missing_env" });
@@ -1338,11 +1339,8 @@ app.post("/api/admin/discord/voice/member-action", async (req, res) => {
         const action = String(req.body?.action || "").toLowerCase();
         if (!userId || !["mute", "unmute", "disconnect"].includes(action)) throw Object.assign(new Error("Invalid member action"), { statusCode: 400, apiError: "invalid_voice_member_action" });
         const guild = await getReadyAdminGuild();
-        const session = adminVoiceSessions.get(guild.id);
-        const { voice } = getVoiceDependencies();
-        if (!session?.connection || session.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Bot not in voice"), { statusCode: 409, apiError: "voice_not_connected" });
         const member = await guild.members.fetch(userId).catch(() => null);
-        if (!member || member.voice?.channelId !== session.channelId) throw Object.assign(new Error("Member is not in the Bot's current voice channel"), { statusCode: 404, apiError: "voice_member_not_found" });
+        if (!member || !member.voice?.channelId) throw Object.assign(new Error("Member is not currently in a Discord voice channel"), { statusCode: 404, apiError: "voice_member_not_found" });
         if (isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId,
             isAdministrator: member.permissions.has(PermissionFlagsBits.Administrator) || Boolean(getConfiguredRoleId("admin") && member.roles.cache.has(getConfiguredRoleId("admin"))),
             targetHighestRolePosition: member.roles.highest.position, botHighestRolePosition: getBotGuildMember(guild).roles.highest.position }) || member.user.bot) {
@@ -1354,8 +1352,9 @@ app.post("/api/admin/discord/voice/member-action", async (req, res) => {
         const description = action === "disconnect" ? "disconnect from voice" : `${action} in voice`;
         if (action === "disconnect") await member.voice.disconnect(`Admin panel by Firebase UID ${actor.uid}: ${description}`);
         else await member.voice.setMute(action === "mute", `Admin panel by Firebase UID ${actor.uid}: ${description}`);
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: `discord_voice_member_${action}`, timestamp: Date.now(), summary: `${action} voice member ${member.user?.tag || member.id} (${member.id}) in ${session.channelName || session.channelId}` }).catch(err => console.error("Voice member audit write failed:", err.message));
-        return res.json({ ok: true, userId, action, name: normalizeStudioName(member.displayName || member.user?.username || member.id) });
+        const actualChannel = member.voice?.channel;
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: `discord_voice_member_${action}`, timestamp: Date.now(), summary: `${action} voice member ${member.user?.tag || member.id} (${member.id}) in ${actualChannel?.name || member.voice?.channelId || "voice channel"}` }).catch(err => console.error("Voice member action audit write failed:", err.message));
+        return res.json({ ok: true, userId, action, channelId: member.voice?.channelId || null, name: normalizeStudioName(member.displayName || member.user?.username || member.id) });
     } catch (err) { return adminApiError(res, err, "voice_member_action_failed"); }
 });
 
@@ -1886,6 +1885,7 @@ const liveVoiceWss = new WebSocketServer({
 server.on("upgrade", (request, socket, head) => {
     let parsed;
     try { parsed = new URL(request.url || "/", "http://localhost"); } catch (_) { socket.destroy(); return; }
+    if (parsed.pathname === "/api/admin/live-console/stream") { server.emit("live-console-upgrade", request, socket, head); return; }
     if (parsed.pathname !== "/api/admin/discord/voice/live") { socket.destroy(); return; }
     const origin = String(request.headers.origin || "");
     if (!origin || !ADMIN_PANEL_ORIGINS.has(origin)) { socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
@@ -2283,7 +2283,7 @@ function onClientReadyOnce(handler) {
 
 // Register this handler only after the Discord client has been initialized.
 onClientReadyOnce(() => {
-    if (!(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET)) return;
+    if (!inspectLiveKitConfiguration().configured) return;
     try {
         const runtime = getLiveKitRuntime();
         runtime.roomService.listRooms().then(rooms => Promise.all((rooms || []).filter(room => String(room.name || "").startsWith(`rkbs_${ALLOWED_GUILD_ID}_`)).map(room =>
@@ -4745,6 +4745,15 @@ function setBotPresence() {
     const activityText = String(cfg.activityText || "Security & Verification").trim().slice(0, 128) || "Security & Verification";
     client.user.setPresence({ activities: [{ name: activityText, type: activityType }], status });
 }
+
+attachLiveConsoleServer({
+    app, server, client, db, admin,
+    allowedGuildId: ALLOWED_GUILD_ID,
+    adminPanelOrigins: ADMIN_PANEL_ORIGINS,
+    verifyAdminApiRequest, getReadyAdminGuild, adminApiError, checkCppRateLimit,
+    getBotGuildMember, getConfiguredRoleId, PermissionFlagsBits, isProtectedDiscordTarget,
+    adminVoiceSessions, liveStudioSessions, inspectLiveKitConfiguration, normalizeStudioName
+});
 
 function startBot() {
     if (!TOKEN) {
