@@ -879,6 +879,15 @@ function studioSessionForGuild(guildId) {
         voiceStatus: voiceSession?.connection?.state?.status, readyStatus, expiresAt: session.expiresAt })) return null;
     return session;
 }
+function redactLiveStudioDiagnostic(value) {
+    let text = String(value == null ? "" : value);
+    for (const secret of [process.env.LIVEKIT_API_SECRET, process.env.LIVEKIT_API_KEY, process.env.TOKEN]) {
+        if (secret && String(secret).length >= 4) text = text.split(String(secret)).join("[redacted]");
+    }
+    if (process.env.FIREBASE_CONFIG) text = text.split(String(process.env.FIREBASE_CONFIG)).join("[redacted]");
+    return text.replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]").replace(/[\r\n\0]+/g, " ").slice(0, 500);
+}
+
 function studioAccessToken(session, identity, name, role) {
     const runtime = getLiveKitRuntime();
     const { AccessToken } = runtime.sdk;
@@ -1381,13 +1390,20 @@ app.post("/api/admin/live-studio/status", async (req, res) => {
     } catch (err) { return adminApiError(res, err, "live_studio_status_failed"); }
 });
 app.post("/api/admin/live-studio/start", async (req, res) => {
+    // Track the stage so an unexpected 502 never hides the actual backend failure.
+    let stage = "admin_authorization";
+    let newlyCreatedSessionGuildId = null;
     try {
         const actor = await verifyAdminApiRequest(req);
+        stage = "rate_limit";
         if (!checkCppRateLimit(req, res, "admin-live-studio-start", 6, 60_000)) return;
+        stage = "resolve_discord_guild";
         const guild = await getReadyAdminGuild();
+        stage = "check_discord_voice";
         const voiceSession = adminVoiceSessions.get(guild.id);
         const { voice } = getVoiceDependencies();
         if (!voiceSession?.connection || voiceSession.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Bot must be connected to Discord voice first"), { statusCode: 409, apiError: "voice_not_connected" });
+        stage = "initialize_livekit_client";
         const runtime = getLiveKitRuntime();
         let session = liveStudioSessions.get(guild.id);
         if (session && (session.discordChannelId !== voiceSession.channelId || session.expiresAt <= Date.now())) { await endLiveStudioForGuild(guild.id, "replaced stale session", actor.uid); session = null; }
@@ -1395,35 +1411,63 @@ app.post("/api/admin/live-studio/start", async (req, res) => {
         if (!session) {
             const sessionId = crypto.randomBytes(12).toString("base64url");
             const roomName = `rkbs_${guild.id}_${crypto.randomBytes(7).toString("hex")}`;
+            stage = "create_livekit_room";
             try {
                 await runtime.roomService.createRoom({ name: roomName, emptyTimeout: 60, maxParticipants: LIVE_STUDIO_MAX_PARTICIPANTS, metadata: JSON.stringify({ app: "RKBACKLES", sessionId }) });
             } catch (providerErr) {
                 const providerStatus = Number(providerErr?.status || providerErr?.statusCode || providerErr?.response?.status) || 0;
                 const providerCode = String(providerErr?.code || providerErr?.name || "LiveKitError").slice(0, 100);
-                const providerMessage = String(providerErr?.message || "unknown provider error").replaceAll(String(process.env.LIVEKIT_API_SECRET || "\u0000"), "[redacted]").slice(0, 500);
-                console.error("LiveKit room creation failed:", JSON.stringify({ status: providerStatus, code: providerCode, message: providerMessage }));
+                const providerMessage = redactLiveStudioDiagnostic(providerErr?.message || "unknown provider error");
+                console.error("LiveKit room creation failed:", JSON.stringify({ stage, status: providerStatus, code: providerCode, message: providerMessage }));
                 if ([401, 403].includes(providerStatus) || /unauthori[sz]ed|invalid.*(api.?key|secret|signature)|credential|permission denied/i.test(providerMessage)) {
                     throw Object.assign(new Error("LiveKit rejected the API key/secret"), { statusCode: 502, apiError: "live_studio_credentials_rejected" });
                 }
-                if (/ENOTFOUND|ECONN|timeout|fetch failed|network|socket hang up/i.test(providerMessage)) {
+                if (/ENOTFOUND|ECONN|timeout|fetch failed|network|socket hang up/i.test(providerMessage) || /ENOTFOUND|ECONN|ETIMEDOUT|EAI_AGAIN/.test(providerCode)) {
                     throw Object.assign(new Error("Bot host cannot reach LiveKit"), { statusCode: 502, apiError: "live_studio_provider_unreachable" });
                 }
                 throw Object.assign(new Error("LiveKit room creation failed"), { statusCode: 502, apiError: "live_studio_provider_failed" });
             }
-            session = { sessionId, guildId, roomName, roomService: runtime.roomService, ownerUid: actor.uid, discordChannelId: voiceSession.channelId,
+            session = { sessionId, guildId: guild.id, roomName, roomService: runtime.roomService, ownerUid: actor.uid, discordChannelId: voiceSession.channelId,
                 discordChannelName: voiceSession.channelName || "Discord voice", startedAt: Date.now(), expiresAt: Date.now() + LIVE_STUDIO_MAX_DURATION_MS,
                 hostIdentity: `host_${crypto.createHash("sha256").update(actor.uid).digest("hex").slice(0, 12)}`, deniedIdentities: new Set(), mutedIdentities: new Set(), endedAt: 0 };
             liveStudioSessions.set(guild.id, session);
+            newlyCreatedSessionGuildId = guild.id;
             session.timer = setTimeout(() => endLiveStudioForGuild(guild.id, "maximum session duration reached", "system").catch(() => {}), LIVE_STUDIO_MAX_DURATION_MS);
             if (typeof session.timer.unref === "function") session.timer.unref();
             session.moderationTimer = setInterval(() => enforceLiveStudioDeniedParticipants(session).catch(() => {}), 2500);
             if (typeof session.moderationTimer.unref === "function") session.moderationTimer.unref();
             await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_start", timestamp: Date.now(), summary: `Live Studio started for Discord voice channel ${session.discordChannelName}; browser media is relayed live and not stored` }).catch(err => console.error("Live Studio audit write failed:", err.message));
         }
-        const access = await studioAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host");
+        stage = "sign_host_access_token";
+        let access;
+        try {
+            access = await studioAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host");
+        } catch (tokenErr) {
+            const safeMessage = redactLiveStudioDiagnostic(tokenErr?.message || "unknown token signing error");
+            console.error("Live Studio host token generation failed:", JSON.stringify({ stage, name: String(tokenErr?.name || "Error").slice(0, 80), code: String(tokenErr?.code || "").slice(0, 80), message: safeMessage }));
+            throw Object.assign(new Error("LiveKit host access token could not be signed"), { statusCode: 502, apiError: "live_studio_token_failed" });
+        }
+        newlyCreatedSessionGuildId = null; // Leave a healthy session running after successfully issuing its token.
         return res.json({ ok: true, active: true, sessionId: session.sessionId, roomName: session.roomName, channelName: session.discordChannelName,
             expiresAt: session.expiresAt, identity: session.hostIdentity, role: "host", ...access });
-    } catch (err) { return adminApiError(res, err, "live_studio_start_failed"); }
+    } catch (err) {
+        const statusCode = Number(err?.statusCode) || 502;
+        const safeMessage = redactLiveStudioDiagnostic(err?.message || "unknown error");
+        if (statusCode >= 500) {
+            console.error("Live Studio start diagnostic:", JSON.stringify({ stage, statusCode, apiError: String(err?.apiError || "live_studio_start_failed").slice(0, 100),
+                name: String(err?.name || "Error").slice(0, 80), code: String(err?.code || "").slice(0, 80), message: safeMessage }));
+        }
+        if (newlyCreatedSessionGuildId) {
+            await endLiveStudioForGuild(newlyCreatedSessionGuildId, `Start failed during ${stage}`, "system").catch(cleanupErr => {
+                console.error("Live Studio failed-start cleanup failed:", redactLiveStudioDiagnostic(cleanupErr?.message || cleanupErr));
+            });
+        }
+        const responseError = err?.apiError ? err : Object.assign(err instanceof Error ? err : new Error("Live Studio start failed"), {
+            statusCode,
+            apiError: statusCode >= 500 && stage === "sign_host_access_token" ? "live_studio_token_failed" : "live_studio_start_failed"
+        });
+        return adminApiError(res, responseError, "live_studio_start_failed");
+    }
 });
 app.post("/api/admin/live-studio/invite", async (req, res) => {
     try {
