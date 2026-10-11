@@ -1,13 +1,13 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.25",
+  "version": "1.5.27",
   "private": true,
-  "description": "Discord admin bot with LiveKit Studio and official Discord desktop screen-share preview",
+  "description": "Discord admin bot with role-aware LiveKit voice/screen-sharing guest rooms",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "check": "node --check index.js",
-    "test": "node --test"
+    "test": "node --test test/*.test.js"
   },
   "engines": {
     "node": ">=22.12.0"

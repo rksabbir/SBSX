@@ -47,6 +47,13 @@ const { normalizeRecorderMimeType, extractOneTimeTicketFromProtocols, packRemote
 const { createLivePcmAudioProcess } = require("./live-voice-pcm-stream");
 const { normalizeStudioName, studioInviteDigest, isValidStudioInviteCode, isGuestStudioIdentity, buildStudioVideoGrant, isLiveStudioVoiceBound } = require("./live-studio-policy");
 const { attachLiveConsoleServer } = require("./live-console-server");
+const {
+    parseCookieHeader,
+    parseDiscordIdSet,
+    isLiveStudioModerator,
+    buildDiscordOAuthAuthorizeUrl,
+    isDiscordOAuthConfigured
+} = require("./live-studio-access");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -799,7 +806,13 @@ const LIVE_STUDIO_MAX_DURATION_MS = Math.min(12 * 60 * 60 * 1000, Math.max(60_00
 const LIVE_STUDIO_INVITE_TTL_MS = Math.min(30 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_STUDIO_INVITE_TTL_MS || 10 * 60 * 1000)));
 const LIVE_STUDIO_MAX_PARTICIPANTS = Math.min(50, Math.max(2, Number(process.env.LIVE_STUDIO_MAX_PARTICIPANTS || 20)));
 const liveStudioSessions = new Map(); // one LiveKit Studio room per configured Discord guild; memory only
-const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> short-lived single-use guest invites or capped viewer links
+const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> short-lived guest invites or capped multi-user participant links
+const liveStudioOAuthStates = new Map(); // OAuth state -> short-lived invite-bound return path
+const liveStudioOAuthSessions = new Map(); // SHA-256(cookie token) -> verified Discord user session
+const LIVE_STUDIO_OAUTH_STATE_TTL_MS = 5 * 60 * 1000;
+const LIVE_STUDIO_OAUTH_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
+const LIVE_STUDIO_OAUTH_STATE_COOKIE = "rk_live_studio_oauth_state";
+const LIVE_STUDIO_OAUTH_SESSION_COOKIE = "rk_live_studio_session";
 const DEFAULT_LIVEKIT_URL = "wss://sabbir-ylq7x559.livekit.cloud"; // Public project URL supplied by the owner; override on the Bot host if changed.
 let liveKitSdkCache = null;
 // Safe diagnostics only: never return or log the API key/secret themselves.
@@ -888,7 +901,7 @@ function redactLiveStudioDiagnostic(value) {
     return text.replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]").replace(/[\r\n\0]+/g, " ").slice(0, 500);
 }
 
-function studioAccessToken(session, identity, name, role) {
+function studioAccessToken(session, identity, name, role, discordIdentity = null) {
     const runtime = getLiveKitRuntime();
     const { AccessToken } = runtime.sdk;
     // A participant token stays valid until the Studio session expires (capped by the session's own lifetime).
@@ -898,9 +911,16 @@ function studioAccessToken(session, identity, name, role) {
         identity,
         name: normalizeStudioName(name, role === "host" ? "RKBACKLES Admin" : "Guest"),
         ttl: tokenTtlSeconds,
-        metadata: JSON.stringify({ app: "RKBACKLES", sessionId: session.sessionId, role })
+        metadata: JSON.stringify({ app: "RKBACKLES", sessionId: session.sessionId, role, discordUserId: String(discordIdentity?.userId || ""), discordUsername: String(discordIdentity?.username || "").slice(0, 80) })
     });
-    token.addGrant({ ...buildStudioVideoGrant(role, runtime.sdk.TrackSource), room: session.roomName });
+    const videoGrant = buildStudioVideoGrant(role, runtime.sdk.TrackSource);
+    // If an admin has enabled Mute Everyone, new guests receive a token without microphone publishing.
+    // Their screen share remains available, and the moderator can re-enable mic publishing later.
+    if (role === "guest" && session.muteAllActive) {
+        videoGrant.canPublish = true;
+        videoGrant.canPublishSources = [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO];
+    }
+    token.addGrant({ ...videoGrant, room: session.roomName });
     return token.toJwt().then(jwt => ({ token: jwt, serverUrl: runtime.clientUrl }));
 }
 async function endLiveStudioForGuild(guildId, reason = "session ended", actorUid = "system") {
@@ -935,12 +955,13 @@ async function enforceLiveStudioDeniedParticipants(session) {
     } else {
         session.voiceDisconnectedAt = 0;
     }
-    if (!session.deniedIdentities.size) return;
+    if (!session.deniedIdentities.size && !session.mutedIdentities.size && !session.muteAllActive) return;
     try {
         const participants = await session.roomService.listParticipants(session.roomName);
-        const runtime = session.mutedIdentities.size ? getLiveKitRuntime() : null;
+        const runtime = (session.mutedIdentities.size || session.muteAllActive) ? getLiveKitRuntime() : null;
         for (const participant of participants || []) {
             const identity = String(participant.identity || "");
+            if (session.muteAllActive && isGuestStudioIdentity(identity)) session.mutedIdentities.add(identity);
             if (session.deniedIdentities.has(identity)) {
                 await session.roomService.removeParticipant(session.roomName, identity).catch(() => {});
                 continue;
@@ -967,6 +988,8 @@ function safeStudioParticipant(participant, session) {
         identity: String(participant.identity || "").slice(0, 128),
         name: normalizeStudioName(participant.name, "Guest"),
         role: String(metadata.role || "guest") === "host" ? "host" : "guest",
+        discordUserId: /^\d{17,20}$/.test(String(metadata.discordUserId || "")) ? String(metadata.discordUserId) : "",
+        discordUsername: String(metadata.discordUsername || "").slice(0, 80),
         adminMuted: Boolean(session?.mutedIdentities?.has(String(participant.identity || ""))),
         tracks: (Array.isArray(participant.tracks) ? participant.tracks : []).slice(0, 10).map(track => ({
             sid: String(track.sid || "").slice(0, 128), source: String(track.source ?? "").slice(0, 40),
@@ -1379,7 +1402,7 @@ function sendLiveStudioPublicPage(res, filename, routeName) {
         return res.status(503).type("text/plain; charset=utf-8").send(
             `RKBACKLES page asset missing (${filename}).
 
-The backend route is installed, but the required public/${filename} file is not present in this Render deployment. Deploy the v1.5.25 Main Bot package with its public/ folder at the service root.`
+The backend route is installed, but the required public/${filename} file is not present in this Render deployment. Deploy the v1.5.27 Main Bot package with its public/ folder beside index.js at the service root.`
         );
     }
     return res.sendFile(filePath, (err) => {
@@ -1464,7 +1487,7 @@ app.post("/api/admin/live-studio/start", async (req, res) => {
             }
             session = { sessionId, guildId: guild.id, roomName, roomService: runtime.roomService, ownerUid: actor.uid, discordChannelId: voiceSession.channelId,
                 discordChannelName: voiceSession.channelName || "Discord voice", startedAt: Date.now(), expiresAt: Date.now() + LIVE_STUDIO_MAX_DURATION_MS,
-                hostIdentity: `host_${crypto.createHash("sha256").update(actor.uid).digest("hex").slice(0, 12)}`, deniedIdentities: new Set(), mutedIdentities: new Set(), endedAt: 0 };
+                hostIdentity: `host_${crypto.createHash("sha256").update(actor.uid).digest("hex").slice(0, 12)}`, deniedIdentities: new Set(), mutedIdentities: new Set(), muteAllActive: false, endedAt: 0 };
             liveStudioSessions.set(guild.id, session);
             newlyCreatedSessionGuildId = guild.id;
             session.timer = setTimeout(() => endLiveStudioForGuild(guild.id, "maximum session duration reached", "system").catch(() => {}), LIVE_STUDIO_MAX_DURATION_MS);
@@ -1529,25 +1552,167 @@ app.post("/api/admin/live-studio/watch-link", async (req, res) => {
         const guild = await getReadyAdminGuild();
         const session = studioSessionForGuild(guild.id);
         if (!session) throw Object.assign(new Error("Start Live Studio while Bot is joined to voice"), { statusCode: 409, apiError: "live_studio_not_active" });
-        if (session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can create a viewer link"), { statusCode: 403, apiError: "forbidden" });
+        if (session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can create participant links"), { statusCode: 403, apiError: "forbidden" });
         const now = Date.now();
         for (const [digest, item] of liveStudioInvites) if (item.expiresAt <= now || !liveStudioSessions.has(item.guildId)) liveStudioInvites.delete(digest);
         if (liveStudioInvites.size >= 2000) throw Object.assign(new Error("Too many pending invitations"), { statusCode: 429, apiError: "live_studio_invite_limit" });
         const code = crypto.randomBytes(32).toString("base64url");
         const digest = studioInviteDigest(code);
         const expiresAt = Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt);
-        // One short-lived bearer link can be redeemed by multiple viewers. Viewer tokens are subscribe-only.
+        // This is a short-lived, capped multi-use guest link: every joined member can speak and share their own screen.
         const maxUses = Math.max(1, Math.min(20, LIVE_STUDIO_MAX_PARTICIPANTS - 1));
         liveStudioInvites.set(digest, { sessionId: session.sessionId, guildId: guild.id, expiresAt, createdBy: actor.uid,
-            role: "viewer", useLimit: maxUses, uses: 0, kind: "watch" });
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_watch_link", timestamp: Date.now(), summary: `Short-lived viewer link issued for Live Studio room ${session.roomName}; use limit ${maxUses}; expires in ${Math.floor(LIVE_STUDIO_INVITE_TTL_MS / 60000)} minutes` }).catch(err => console.error("Live Studio viewer-link audit write failed:", err.message));
-        return res.json({ ok: true, inviteCode: code, expiresAt, sessionId: session.sessionId, maxUses, role: "viewer" });
+            role: "guest", useLimit: maxUses, uses: 0, kind: "participant" });
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_participant_link", timestamp: Date.now(), summary: `Short-lived multi-use Live Studio participant link issued for room ${session.roomName}; up to ${maxUses} participants; mic + screen share enabled after Discord login` }).catch(err => console.error("Live Studio participant-link audit write failed:", err.message));
+        return res.json({ ok: true, inviteCode: code, expiresAt, sessionId: session.sessionId, maxUses, role: "guest", canPublish: true, capabilities: ["microphone", "screen_share", "screen_share_audio"] });
     } catch (err) { return adminApiError(res, err, "live_studio_invite_failed"); }
+});
+
+// Discord OAuth is required for room admission so moderator powers are bound to a real Discord account,
+// rather than a user-supplied ID or an invite link. Client secret stays on the private Render service.
+function studioOAuthConfig() {
+    return {
+        clientId: String(process.env.LIVE_STUDIO_OAUTH_CLIENT_ID || "").trim(),
+        clientSecret: String(process.env.LIVE_STUDIO_OAUTH_CLIENT_SECRET || "").trim(),
+        redirectUri: String(process.env.LIVE_STUDIO_OAUTH_REDIRECT_URI || "").trim()
+    };
+}
+function studioCookie(name, value, maxAgeSeconds, path = "/") {
+    const encoded = encodeURIComponent(String(value || ""));
+    return `${name}=${encoded}; Path=${path}; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`;
+}
+function studioSessionDigest(value) {
+    return crypto.createHash("sha256").update(String(value || "")).digest("hex");
+}
+function getLiveStudioOAuthSession(req) {
+    const raw = parseCookieHeader(req.headers.cookie || "")[LIVE_STUDIO_OAUTH_SESSION_COOKIE];
+    if (!raw || !/^[A-Za-z0-9_-]{40,60}$/.test(raw)) return null;
+    const key = studioSessionDigest(raw);
+    const session = liveStudioOAuthSessions.get(key);
+    if (!session || session.expiresAt <= Date.now() || session.guildId !== ALLOWED_GUILD_ID) {
+        liveStudioOAuthSessions.delete(key);
+        return null;
+    }
+    return { ...session, sessionKey: key };
+}
+function cleanupLiveStudioOAuthState() {
+    const now = Date.now();
+    for (const [state, value] of liveStudioOAuthStates) if (value.expiresAt <= now) liveStudioOAuthStates.delete(state);
+    for (const [digest, value] of liveStudioOAuthSessions) if (value.expiresAt <= now) liveStudioOAuthSessions.delete(digest);
+}
+async function fetchLiveStudioDiscordMember(userId) {
+    const guild = await getReadyAdminGuild();
+    const member = await guild.members.fetch({ user: String(userId), force: true }).catch(() => null);
+    if (!member) throw Object.assign(new Error("Discord account is no longer a member of the configured server"), { statusCode: 403, apiError: "live_studio_discord_guild_required" });
+    const roleIds = [...member.roles.cache.keys()].filter(roleId => String(roleId) !== String(guild.id));
+    const canManage = isLiveStudioModerator({
+        userId: member.id,
+        guildOwnerId: guild.ownerId,
+        isAdministrator: Boolean(member.permissions?.has(PermissionFlagsBits.Administrator)),
+        roleIds,
+        adminUserIds: parseDiscordIdSet(process.env.LIVE_STUDIO_ADMIN_USER_IDS),
+        adminRoleIds: parseDiscordIdSet(process.env.LIVE_STUDIO_ADMIN_ROLE_IDS)
+    });
+    return { guild, member, roleIds, canManage };
+}
+async function requireLiveStudioRoomModerator(req) {
+    const auth = getLiveStudioOAuthSession(req);
+    if (!auth) throw Object.assign(new Error("Sign in with Discord first"), { statusCode: 401, apiError: "live_studio_discord_login_required" });
+    const access = await fetchLiveStudioDiscordMember(auth.userId);
+    if (!access.canManage) throw Object.assign(new Error("Your Discord user ID or roles are not allowed to manage this Live Studio room"), { statusCode: 403, apiError: "live_studio_moderator_required" });
+    const session = studioSessionForGuild(access.guild.id);
+    if (!session || session.sessionId !== String(req.body?.sessionId || session.sessionId)) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
+    return { ...access, auth, session };
+}
+
+app.get("/api/live-studio/auth/config", (req, res) => {
+    return res.set("Cache-Control", "no-store").json({ ok: true, configured: isDiscordOAuthConfigured(process.env), loginPath: "/api/live-studio/auth/start" });
+});
+app.get("/api/live-studio/auth/start", (req, res) => {
+    if (!checkCppRateLimit(req, res, "live-studio-oauth-start", 12, 60_000)) return;
+    cleanupLiveStudioOAuthState();
+    const config = studioOAuthConfig();
+    if (!isDiscordOAuthConfigured(process.env)) return res.status(503).json({ ok: false, error: "live_studio_discord_oauth_not_configured", message: "Render-এ LIVE_STUDIO_OAUTH_CLIENT_ID, LIVE_STUDIO_OAUTH_CLIENT_SECRET এবং LIVE_STUDIO_OAUTH_REDIRECT_URI সেট করতে হবে।" });
+    const inviteCode = String(req.query.invite || "");
+    if (!isValidStudioInviteCode(inviteCode)) return res.status(400).json({ ok: false, error: "live_studio_invite_invalid" });
+    const digest = studioInviteDigest(inviteCode);
+    const invite = liveStudioInvites.get(digest);
+    if (!invite || invite.expiresAt <= Date.now()) return res.status(410).json({ ok: false, error: "live_studio_invite_expired" });
+    const state = crypto.randomBytes(32).toString("base64url");
+    liveStudioOAuthStates.set(state, { expiresAt: Date.now() + LIVE_STUDIO_OAUTH_STATE_TTL_MS, inviteCode, returnTo: `/live-room?invite=${encodeURIComponent(inviteCode)}` });
+    res.setHeader("Set-Cookie", studioCookie(LIVE_STUDIO_OAUTH_STATE_COOKIE, state, Math.ceil(LIVE_STUDIO_OAUTH_STATE_TTL_MS / 1000), "/api/live-studio/auth"));
+    const authorizationUrl = buildDiscordOAuthAuthorizeUrl({ clientId: config.clientId, redirectUri: config.redirectUri, state });
+    return res.redirect(302, authorizationUrl);
+});
+app.get("/api/live-studio/auth/callback", async (req, res) => {
+    cleanupLiveStudioOAuthState();
+    const queryState = String(req.query.state || "");
+    const cookieState = parseCookieHeader(req.headers.cookie || "")[LIVE_STUDIO_OAUTH_STATE_COOKIE] || "";
+    const pending = liveStudioOAuthStates.get(queryState);
+    liveStudioOAuthStates.delete(queryState);
+    const clearStateCookie = studioCookie(LIVE_STUDIO_OAUTH_STATE_COOKIE, "", 0, "/api/live-studio/auth");
+    if (!queryState || !cookieState || cookieState !== queryState || !pending || pending.expiresAt <= Date.now()) {
+        res.setHeader("Set-Cookie", clearStateCookie);
+        return res.status(400).type("text/plain; charset=utf-8").send("Discord sign-in state expired or did not match. Return to the invitation and try again.");
+    }
+    if (req.query.error) {
+        res.setHeader("Set-Cookie", clearStateCookie);
+        return res.status(403).type("text/plain; charset=utf-8").send("Discord sign-in was cancelled. Return to the invitation and try again.");
+    }
+    const config = studioOAuthConfig();
+    try {
+        const tokenResponse = await fetch("https://discord.com/api/v10/oauth2/token", {
+            method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
+            body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret, grant_type: "authorization_code", code: String(req.query.code || ""), redirect_uri: config.redirectUri }),
+            signal: AbortSignal.timeout(12000)
+        });
+        const tokenData = await tokenResponse.json().catch(() => ({}));
+        if (!tokenResponse.ok || !tokenData.access_token) throw Object.assign(new Error("Discord token exchange failed"), { apiError: "live_studio_discord_oauth_failed" });
+        const userResponse = await fetch("https://discord.com/api/v10/users/@me", { headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" }, signal: AbortSignal.timeout(12000) });
+        const user = await userResponse.json().catch(() => ({}));
+        if (!userResponse.ok || !/^\d{17,20}$/.test(String(user.id || ""))) throw Object.assign(new Error("Discord profile verification failed"), { apiError: "live_studio_discord_oauth_failed" });
+        const memberResponse = await fetch(`https://discord.com/api/v10/users/@me/guilds/${ALLOWED_GUILD_ID}/member`, { headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" }, signal: AbortSignal.timeout(12000) });
+        if (!memberResponse.ok) throw Object.assign(new Error("Join the configured Discord server before entering Live Studio"), { statusCode: 403, apiError: "live_studio_discord_guild_required" });
+        const rawSession = crypto.randomBytes(32).toString("base64url");
+        const digest = studioSessionDigest(rawSession);
+        liveStudioOAuthSessions.set(digest, { userId: String(user.id), username: String(user.username || "Discord user").slice(0, 80), globalName: String(user.global_name || "").slice(0, 80), guildId: ALLOWED_GUILD_ID, createdAt: Date.now(), expiresAt: Date.now() + LIVE_STUDIO_OAUTH_SESSION_TTL_MS });
+        res.setHeader("Set-Cookie", [clearStateCookie, studioCookie(LIVE_STUDIO_OAUTH_SESSION_COOKIE, rawSession, Math.ceil(LIVE_STUDIO_OAUTH_SESSION_TTL_MS / 1000), "/")]);
+        return res.redirect(302, pending.returnTo);
+    } catch (err) {
+        console.warn("Live Studio Discord OAuth failed:", String(err?.apiError || err?.message || "oauth_error").replace(/[\r\n\0]+/g, " ").slice(0, 180));
+        res.setHeader("Set-Cookie", clearStateCookie);
+        const statusCode = Number(err?.statusCode) || 502;
+        return res.status(statusCode).type("text/plain; charset=utf-8").send(statusCode === 403 ? "You must be a member of the configured Discord server before joining this room." : "Discord sign-in failed. Check the OAuth client and registered redirect URI in Render, then try again.");
+    }
+});
+app.get("/api/live-studio/auth/me", async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    const auth = getLiveStudioOAuthSession(req);
+    if (!auth) return res.status(401).json({ ok: false, error: "live_studio_discord_login_required" });
+    try {
+        const access = await fetchLiveStudioDiscordMember(auth.userId);
+        return res.json({ ok: true, userId: access.member.id, username: access.member.user?.username || auth.username, displayName: access.member.displayName || access.member.user?.globalName || auth.globalName || auth.username, canManage: access.canManage, rolesCount: access.roleIds.length });
+    } catch (err) {
+        if (Number(err?.statusCode) === 403) {
+            liveStudioOAuthSessions.delete(auth.sessionKey);
+            res.setHeader("Set-Cookie", studioCookie(LIVE_STUDIO_OAUTH_SESSION_COOKIE, "", 0, "/"));
+        }
+        return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_discord_auth_failed" });
+    }
+});
+app.post("/api/live-studio/auth/logout", (req, res) => {
+    const auth = getLiveStudioOAuthSession(req);
+    if (auth) liveStudioOAuthSessions.delete(auth.sessionKey);
+    res.setHeader("Set-Cookie", studioCookie(LIVE_STUDIO_OAUTH_SESSION_COOKIE, "", 0, "/"));
+    return res.json({ ok: true });
 });
 
 app.post("/api/live-studio/redeem", async (req, res) => {
     try {
         if (!checkCppRateLimit(req, res, "live-studio-redeem", 12, 60_000)) return;
+        const auth = getLiveStudioOAuthSession(req);
+        if (!auth) throw Object.assign(new Error("Sign in with Discord before joining Live Studio"), { statusCode: 401, apiError: "live_studio_discord_login_required" });
+        const discordAccess = await fetchLiveStudioDiscordMember(auth.userId);
         const code = String(req.body?.inviteCode || "");
         if (!isValidStudioInviteCode(code)) throw Object.assign(new Error("Invalid invite code"), { statusCode: 400, apiError: "live_studio_invite_invalid" });
         const digest = studioInviteDigest(code);
@@ -1557,20 +1722,134 @@ app.post("/api/live-studio/redeem", async (req, res) => {
         if (!session || session.sessionId !== invite.sessionId) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Live Studio is no longer active"), { statusCode: 410, apiError: "live_studio_not_active" }); }
         const useLimit = Math.max(1, Number(invite.useLimit) || 1);
         const usedCount = Math.max(0, Number(invite.uses) || 0);
-        if (usedCount >= useLimit) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Viewer link has reached its use limit"), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
+        if (usedCount >= useLimit) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Invite has reached its use limit"), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
         const role = invite.role === "viewer" ? "viewer" : "guest";
-        // Shared viewer links are capped; legacy guest invitations remain single-use.
+        // Capped participant links are multi-use; legacy direct invites remain single-use.
         if (useLimit <= 1) liveStudioInvites.delete(digest); // consume single-use invitation before signing any token
         else {
             invite.uses = usedCount + 1; // increment synchronously before token signing to prevent concurrent overuse
             if (invite.uses >= useLimit) liveStudioInvites.delete(digest);
         }
-        const name = normalizeStudioName(req.body?.displayName, role === "viewer" ? "Live viewer" : "Live guest");
+        const fallbackName = discordAccess.member.displayName || discordAccess.member.user?.globalName || discordAccess.member.user?.username || "Live guest";
+        const name = normalizeStudioName(req.body?.displayName, fallbackName);
         const identity = `guest_${crypto.randomBytes(12).toString("hex")}`;
-        const access = await studioAccessToken(session, identity, name, role);
-        return res.json({ ok: true, sessionId: session.sessionId, roomName: session.roomName, identity, name, role, ...access });
+        const discordIdentity = { userId: discordAccess.member.id, username: discordAccess.member.user?.username || auth.username };
+        const access = await studioAccessToken(session, identity, name, role, discordIdentity);
+        if (session.muteAllActive && role === "guest") session.mutedIdentities.add(identity);
+        return res.json({ ok: true, sessionId: session.sessionId, roomName: session.roomName, identity, name, role,
+            discordUserId: discordIdentity.userId, canManage: discordAccess.canManage, capabilities: role === "viewer" ? ["subscribe"] : ["microphone", "screen_share", "screen_share_audio"], ...access });
     } catch (err) { return adminApiError(res, err, "live_studio_join_failed"); }
 });
+async function setLiveStudioParticipantMuted(session, participant, muted) {
+    const identity = String(participant?.identity || "");
+    if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited participants can be moderated"), { statusCode: 400, apiError: "invalid_studio_target" });
+    const runtime = getLiveKitRuntime();
+    const micTracks = (participant.tracks || []).filter(track => {
+        const source = String(track.source ?? "").toLowerCase();
+        return source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE;
+    });
+    if (muted) {
+        session.mutedIdentities.add(identity);
+        for (const track of micTracks) await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, true);
+        await session.roomService.updateParticipant(session.roomName, identity, { permission: {
+            canPublish: true, canPublishSources: [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
+            canPublishData: false, canSubscribe: true
+        } });
+    } else {
+        await session.roomService.updateParticipant(session.roomName, identity, { permission: {
+            canPublish: true, canPublishSources: [runtime.sdk.TrackSource.MICROPHONE, runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
+            canPublishData: false, canSubscribe: true
+        } });
+        session.mutedIdentities.delete(identity);
+        for (const track of micTracks) await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, false).catch(() => {});
+    }
+    return { identity, muted: Boolean(muted) };
+}
+app.get("/api/live-studio/admin/participants", async (req, res) => {
+    try {
+        const { session, auth } = await requireLiveStudioRoomModerator(req);
+        const participants = await session.roomService.listParticipants(session.roomName);
+        return res.set("Cache-Control", "no-store").json({ ok: true, muteAllActive: Boolean(session.muteAllActive), participants: (participants || []).map(p => ({ ...safeStudioParticipant(p, session), isHost: String(p.identity || "") === session.hostIdentity, canModerate: isGuestStudioIdentity(p.identity) })) });
+    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_participants_failed" }); }
+});
+app.post("/api/live-studio/admin/mute", async (req, res) => {
+    try {
+        const { session, auth } = await requireLiveStudioRoomModerator(req);
+        if (!checkCppRateLimit(req, res, "live-studio-discord-mute", 40, 60_000)) return;
+        const identity = String(req.body?.identity || "");
+        const participant = (await session.roomService.listParticipants(session.roomName)).find(p => String(p.identity) === identity);
+        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
+        const result = await setLiveStudioParticipantMuted(session, participant, true);
+        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_mute", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} muted participant ${identity}` }).catch(() => {});
+        return res.json({ ok: true, ...result });
+    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_mute_failed" }); }
+});
+app.post("/api/live-studio/admin/unmute", async (req, res) => {
+    try {
+        const { session, auth } = await requireLiveStudioRoomModerator(req);
+        if (!checkCppRateLimit(req, res, "live-studio-discord-unmute", 40, 60_000)) return;
+        const identity = String(req.body?.identity || "");
+        const participant = (await session.roomService.listParticipants(session.roomName)).find(p => String(p.identity) === identity);
+        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
+        const result = await setLiveStudioParticipantMuted(session, participant, false);
+        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_unmute", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} unmuted participant ${identity}` }).catch(() => {});
+        return res.json({ ok: true, ...result, mayNeedMicToggle: true });
+    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_unmute_failed" }); }
+});
+app.post("/api/live-studio/admin/mute-all", async (req, res) => {
+    try {
+        const { session, auth } = await requireLiveStudioRoomModerator(req);
+        if (!checkCppRateLimit(req, res, "live-studio-discord-mute-all", 12, 60_000)) return;
+        const muted = req.body?.muted !== false;
+        session.muteAllActive = muted;
+        const participants = await session.roomService.listParticipants(session.roomName);
+        const targets = (participants || []).filter(p => isGuestStudioIdentity(p.identity));
+        const results = await Promise.allSettled(targets.map(participant => setLiveStudioParticipantMuted(session, participant, muted)));
+        const succeeded = results.filter(item => item.status === "fulfilled").length;
+        const failed = results.length - succeeded;
+        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: muted ? "live_studio_discord_mute_all" : "live_studio_discord_unmute_all", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} ${muted ? "muted" : "unmuted"} all guest participants; succeeded=${succeeded}; failed=${failed}` }).catch(() => {});
+        return res.json({ ok: failed === 0, muted, muteAllActive: session.muteAllActive, total: targets.length, succeeded, failed });
+    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_mute_all_failed" }); }
+});
+app.post("/api/live-studio/admin/kick", async (req, res) => {
+    try {
+        const { session, auth } = await requireLiveStudioRoomModerator(req);
+        if (!checkCppRateLimit(req, res, "live-studio-discord-kick", 30, 60_000)) return;
+        const identity = String(req.body?.identity || "");
+        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be removed"), { statusCode: 400, apiError: "invalid_studio_target" });
+        const participant = (await session.roomService.listParticipants(session.roomName)).find(p => String(p.identity) === identity);
+        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
+        session.deniedIdentities.add(identity);
+        try { await session.roomService.removeParticipant(session.roomName, identity, { revokeTokenTs: BigInt(Math.floor(Date.now() / 1000)) }); }
+        catch (err) { session.deniedIdentities.delete(identity); throw err; }
+        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_kick", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} removed participant ${identity}` }).catch(() => {});
+        return res.json({ ok: true, identity, removed: true });
+    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_kick_failed" }); }
+});
+
+app.post("/api/live-studio/admin/invite", async (req, res) => {
+    try {
+        const { session, auth, guild } = await requireLiveStudioRoomModerator(req);
+        if (!checkCppRateLimit(req, res, "live-studio-discord-invite", 10, 60_000)) return;
+        const now = Date.now();
+        for (const [digest, item] of liveStudioInvites) if (item.expiresAt <= now || !liveStudioSessions.has(item.guildId)) liveStudioInvites.delete(digest);
+        if (liveStudioInvites.size >= 2000) throw Object.assign(new Error("Too many pending invitations"), { statusCode: 429, apiError: "live_studio_invite_limit" });
+        const code = crypto.randomBytes(32).toString("base64url");
+        const expiresAt = Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt);
+        const maxUses = Math.max(1, Math.min(20, LIVE_STUDIO_MAX_PARTICIPANTS - 1));
+        liveStudioInvites.set(studioInviteDigest(code), { sessionId: session.sessionId, guildId: guild.id, expiresAt, createdBy: `discord:${auth.userId}`, role: "guest", useLimit: maxUses, uses: 0, kind: "participant" });
+        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_participant_link", timestamp: Date.now(), summary: `Discord room moderator ${auth.userId} created a participant invite; max uses ${maxUses}` }).catch(() => {});
+        return res.json({ ok: true, inviteCode: code, expiresAt, maxUses, role: "guest", capabilities: ["microphone", "screen_share", "screen_share_audio"] });
+    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_invite_failed" }); }
+});
+app.post("/api/live-studio/admin/end", async (req, res) => {
+    try {
+        const { session, auth, guild } = await requireLiveStudioRoomModerator(req);
+        await endLiveStudioForGuild(guild.id, `Ended by Discord Live Studio moderator ${auth.userId}`, `discord:${auth.userId}`);
+        return res.json({ ok: true, active: false, sessionId: session.sessionId });
+    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_end_failed" }); }
+});
+
 app.post("/api/admin/live-studio/participants", async (req, res) => {
     try {
         const actor = await verifyAdminApiRequest(req);
