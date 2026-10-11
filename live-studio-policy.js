@@ -21,9 +21,13 @@ function isGuestStudioIdentity(identity) {
 
 function buildStudioVideoGrant(role, TrackSource) {
   if (!TrackSource || TrackSource.MICROPHONE === undefined) throw new TypeError("LiveKit TrackSource enum is unavailable");
+  if (role === "viewer") {
+    // Links posted into Discord are watch-only: a viewer can receive host audio/video but cannot publish tracks.
+    return { roomJoin: true, canPublish: false, canSubscribe: true, canPublishData: false };
+  }
   const host = role === "host";
-  // An invited guest may share their own app/window/tab after the browser's native user-consent prompt.
-  // Screen capture is never started automatically, and guest grants still cannot manage the room.
+  // An individually invited guest may share their own app/window/tab after the browser's native user-consent prompt.
+  // Screen capture is never started automatically, and guests still cannot manage the room.
   const sources = [TrackSource.MICROPHONE, TrackSource.SCREEN_SHARE, TrackSource.SCREEN_SHARE_AUDIO];
   return {
     roomJoin: true,

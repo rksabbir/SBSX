@@ -799,7 +799,7 @@ const LIVE_STUDIO_MAX_DURATION_MS = Math.min(12 * 60 * 60 * 1000, Math.max(60_00
 const LIVE_STUDIO_INVITE_TTL_MS = Math.min(30 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_STUDIO_INVITE_TTL_MS || 10 * 60 * 1000)));
 const LIVE_STUDIO_MAX_PARTICIPANTS = Math.min(50, Math.max(2, Number(process.env.LIVE_STUDIO_MAX_PARTICIPANTS || 20)));
 const liveStudioSessions = new Map(); // one LiveKit Studio room per configured Discord guild; memory only
-const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> single-use, short-lived session-bound invite
+const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> short-lived single-use guest invites or capped viewer links
 const DEFAULT_LIVEKIT_URL = "wss://sabbir-ylq7x559.livekit.cloud"; // Public project URL supplied by the owner; override on the Bot host if changed.
 let liveKitSdkCache = null;
 // Safe diagnostics only: never return or log the API key/secret themselves.
@@ -1370,6 +1370,12 @@ app.post("/api/admin/discord/voice/member-action", async (req, res) => {
 // Browser-based Live Studio is a separate WebRTC room (LiveKit), because the official Discord Bot API does not provide bot screen-sharing.
 // Start/invite/moderation routes are Admin-only. Guest invite codes are random, hashed, single-use, and session-bound.
 app.get("/live-room", (req, res) => res.sendFile(require("path").join(__dirname, "public", "live-room.html")));
+// A local-only browser capture preview for users who want to manually publish through
+// Discord's official desktop Share Screen / Go Live UI. The page does not upload media.
+app.get("/discord-share-studio", (req, res) => {
+    res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
+    return res.sendFile(require("path").join(__dirname, "public", "discord-share-studio.html"));
+});
 app.post("/api/admin/live-studio/status", async (req, res) => {
     try {
         await verifyAdminApiRequest(req);
@@ -1487,6 +1493,29 @@ app.post("/api/admin/live-studio/invite", async (req, res) => {
         return res.json({ ok: true, inviteCode: code, expiresAt: Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt), sessionId: session.sessionId });
     } catch (err) { return adminApiError(res, err, "live_studio_invite_failed"); }
 });
+app.post("/api/admin/live-studio/watch-link", async (req, res) => {
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        if (!checkCppRateLimit(req, res, "admin-live-studio-watch-link", 12, 60_000)) return;
+        const guild = await getReadyAdminGuild();
+        const session = studioSessionForGuild(guild.id);
+        if (!session) throw Object.assign(new Error("Start Live Studio while Bot is joined to voice"), { statusCode: 409, apiError: "live_studio_not_active" });
+        if (session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can create a viewer link"), { statusCode: 403, apiError: "forbidden" });
+        const now = Date.now();
+        for (const [digest, item] of liveStudioInvites) if (item.expiresAt <= now || !liveStudioSessions.has(item.guildId)) liveStudioInvites.delete(digest);
+        if (liveStudioInvites.size >= 2000) throw Object.assign(new Error("Too many pending invitations"), { statusCode: 429, apiError: "live_studio_invite_limit" });
+        const code = crypto.randomBytes(32).toString("base64url");
+        const digest = studioInviteDigest(code);
+        const expiresAt = Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt);
+        // One short-lived bearer link can be redeemed by multiple viewers. Viewer tokens are subscribe-only.
+        const maxUses = Math.max(1, Math.min(20, LIVE_STUDIO_MAX_PARTICIPANTS - 1));
+        liveStudioInvites.set(digest, { sessionId: session.sessionId, guildId: guild.id, expiresAt, createdBy: actor.uid,
+            role: "viewer", useLimit: maxUses, uses: 0, kind: "watch" });
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_watch_link", timestamp: Date.now(), summary: `Short-lived viewer link issued for Live Studio room ${session.roomName}; use limit ${maxUses}; expires in ${Math.floor(LIVE_STUDIO_INVITE_TTL_MS / 60000)} minutes` }).catch(err => console.error("Live Studio viewer-link audit write failed:", err.message));
+        return res.json({ ok: true, inviteCode: code, expiresAt, sessionId: session.sessionId, maxUses, role: "viewer" });
+    } catch (err) { return adminApiError(res, err, "live_studio_invite_failed"); }
+});
+
 app.post("/api/live-studio/redeem", async (req, res) => {
     try {
         if (!checkCppRateLimit(req, res, "live-studio-redeem", 12, 60_000)) return;
@@ -1497,11 +1526,20 @@ app.post("/api/live-studio/redeem", async (req, res) => {
         if (!invite || invite.expiresAt <= Date.now()) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Invite expired or already used"), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
         const session = studioSessionForGuild(invite.guildId);
         if (!session || session.sessionId !== invite.sessionId) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Live Studio is no longer active"), { statusCode: 410, apiError: "live_studio_not_active" }); }
-        liveStudioInvites.delete(digest); // consume single-use invitation before signing any token
-        const name = normalizeStudioName(req.body?.displayName, "Live guest");
+        const useLimit = Math.max(1, Number(invite.useLimit) || 1);
+        const usedCount = Math.max(0, Number(invite.uses) || 0);
+        if (usedCount >= useLimit) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Viewer link has reached its use limit"), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
+        const role = invite.role === "viewer" ? "viewer" : "guest";
+        // Shared viewer links are capped; legacy guest invitations remain single-use.
+        if (useLimit <= 1) liveStudioInvites.delete(digest); // consume single-use invitation before signing any token
+        else {
+            invite.uses = usedCount + 1; // increment synchronously before token signing to prevent concurrent overuse
+            if (invite.uses >= useLimit) liveStudioInvites.delete(digest);
+        }
+        const name = normalizeStudioName(req.body?.displayName, role === "viewer" ? "Live viewer" : "Live guest");
         const identity = `guest_${crypto.randomBytes(12).toString("hex")}`;
-        const access = await studioAccessToken(session, identity, name, "guest");
-        return res.json({ ok: true, sessionId: session.sessionId, roomName: session.roomName, identity, name, role: "guest", ...access });
+        const access = await studioAccessToken(session, identity, name, role);
+        return res.json({ ok: true, sessionId: session.sessionId, roomName: session.roomName, identity, name, role, ...access });
     } catch (err) { return adminApiError(res, err, "live_studio_join_failed"); }
 });
 app.post("/api/admin/live-studio/participants", async (req, res) => {
