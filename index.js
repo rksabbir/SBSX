@@ -1369,12 +1369,41 @@ app.post("/api/admin/discord/voice/member-action", async (req, res) => {
 
 // Browser-based Live Studio is a separate WebRTC room (LiveKit), because the official Discord Bot API does not provide bot screen-sharing.
 // Start/invite/moderation routes are Admin-only. Guest invite codes are random, hashed, single-use, and session-bound.
-app.get("/live-room", (req, res) => res.sendFile(require("path").join(__dirname, "public", "live-room.html")));
+// Keep user-facing pages deployed beside index.js in ./public; an explicit diagnostic is returned if a file is missing.
+const PUBLIC_PAGES_DIR = require("path").join(__dirname, "public");
+function sendLiveStudioPublicPage(res, filename, routeName) {
+    const filePath = require("path").join(PUBLIC_PAGES_DIR, filename);
+    res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
+    if (!fs.existsSync(filePath)) {
+        console.error(`Live Studio public page missing for ${routeName}: ${filePath}`);
+        return res.status(503).type("text/plain; charset=utf-8").send(
+            `RKBACKLES page asset missing (${filename}).
+
+The backend route is installed, but the required public/${filename} file is not present in this Render deployment. Deploy the v1.5.25 Main Bot package with its public/ folder at the service root.`
+        );
+    }
+    return res.sendFile(filePath, (err) => {
+        if (!err || res.headersSent) return;
+        console.error(`Live Studio public page send failed for ${routeName}:`, String(err.message || err).slice(0, 300));
+        if (!res.headersSent) res.status(err.statusCode === 404 ? 503 : 500).type("text/plain; charset=utf-8").send(
+            `RKBACKLES could not serve ${filename}. Check the deployed public/ folder and Render logs.`
+        );
+    });
+}
+app.get("/live-room", (req, res) => sendLiveStudioPublicPage(res, "live-room.html", "/live-room"));
 // A local-only browser capture preview for users who want to manually publish through
 // Discord's official desktop Share Screen / Go Live UI. The page does not upload media.
-app.get("/discord-share-studio", (req, res) => {
-    res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
-    return res.sendFile(require("path").join(__dirname, "public", "discord-share-studio.html"));
+app.get("/discord-share-studio", (req, res) => sendLiveStudioPublicPage(res, "discord-share-studio.html", "/discord-share-studio"));
+// Public, non-sensitive route/asset check. This lets an admin confirm that Render deployed
+// the source and both HTML files together; it exposes no tokens, invite codes, or credentials.
+app.get("/api/live-studio/route-health", (req, res) => {
+    const pages = {
+        liveRoom: fs.existsSync(require("path").join(PUBLIC_PAGES_DIR, "live-room.html")),
+        discordShareStudio: fs.existsSync(require("path").join(PUBLIC_PAGES_DIR, "discord-share-studio.html"))
+    };
+    return res.set("Cache-Control", "no-store").json({ ok: true, service: "rkbackles", version: require("./package.json").version,
+        routes: { liveRoom: "/live-room", discordShareStudio: "/discord-share-studio" }, pages,
+        ready: pages.liveRoom && pages.discordShareStudio });
 });
 app.post("/api/admin/live-studio/status", async (req, res) => {
     try {

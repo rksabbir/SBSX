@@ -1,6 +1,6 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.24",
+  "version": "1.5.25",
   "private": true,
   "description": "Discord admin bot with LiveKit Studio and official Discord desktop screen-share preview",
   "main": "index.js",
