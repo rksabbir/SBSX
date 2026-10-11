@@ -800,25 +800,56 @@ const LIVE_STUDIO_MAX_PARTICIPANTS = Math.min(50, Math.max(2, Number(process.env
 const liveStudioSessions = new Map(); // one LiveKit Studio room per configured Discord guild; memory only
 const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> single-use, short-lived session-bound invite
 let liveKitSdkCache = null;
-function getLiveKitRuntime() {
+// Safe diagnostics only: never return or log the API key/secret themselves.
+function inspectLiveKitConfiguration() {
     const rawUrl = String(process.env.LIVEKIT_URL || "").trim();
     const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
     const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
-    if (!rawUrl || !apiKey || !apiSecret) throw Object.assign(new Error("LiveKit is not configured"), { statusCode: 503, apiError: "live_studio_not_configured" });
-    let parsed;
-    try { parsed = new URL(rawUrl); } catch (_) { throw Object.assign(new Error("LIVEKIT_URL invalid"), { statusCode: 503, apiError: "live_studio_not_configured" }); }
+    const missingVariables = [];
+    if (!rawUrl) missingVariables.push("LIVEKIT_URL");
+    if (!apiKey) missingVariables.push("LIVEKIT_API_KEY");
+    if (!apiSecret) missingVariables.push("LIVEKIT_API_SECRET");
+    let urlValid = false;
+    let urlIssue = rawUrl ? "invalid_url" : "missing_url";
+    let urlHost = "";
+    try {
+        if (rawUrl) {
+            const parsed = new URL(rawUrl);
+            const secureProtocol = parsed.protocol === "wss:" || parsed.protocol === "https:";
+            const localProtocol = ["ws:", "http:"].includes(parsed.protocol) && ["localhost", "127.0.0.1"].includes(parsed.hostname);
+            const originOnly = !parsed.username && !parsed.password && !parsed.search && !parsed.hash && ["", "/"].includes(parsed.pathname);
+            if (!secureProtocol && !localProtocol) urlIssue = "use_wss_or_https";
+            else if (!parsed.hostname) urlIssue = "missing_host";
+            else if (!originOnly) urlIssue = "remove_path_query_or_credentials";
+            else { urlValid = true; urlIssue = ""; urlHost = parsed.host; }
+        }
+    } catch (_) { urlIssue = rawUrl ? "invalid_url" : "missing_url"; }
+    let dependencyInstalled = false;
+    try { require.resolve("livekit-server-sdk"); dependencyInstalled = true; } catch (_) {}
+    const reason = missingVariables.length ? "missing_env" : !urlValid ? "invalid_url" : !dependencyInstalled ? "dependency_missing" : "ready";
+    return {
+        configured: missingVariables.length === 0 && urlValid && dependencyInstalled,
+        missingVariables,
+        urlPresent: Boolean(rawUrl), apiKeyPresent: Boolean(apiKey), apiSecretPresent: Boolean(apiSecret),
+        urlValid, urlIssue, urlHost, dependencyInstalled, reason
+    };
+}
+function getLiveKitRuntime() {
+    const config = inspectLiveKitConfiguration();
+    const rawUrl = String(process.env.LIVEKIT_URL || "").trim();
+    const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
+    const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
+    if (config.missingVariables.length) throw Object.assign(new Error("LiveKit environment variables are missing"), { statusCode: 503, apiError: "live_studio_missing_env" });
+    if (!config.urlValid) throw Object.assign(new Error(`LIVEKIT_URL is invalid (${config.urlIssue})`), { statusCode: 503, apiError: "live_studio_invalid_url" });
+    if (!config.dependencyInstalled) throw Object.assign(new Error("Install livekit-server-sdk on the Bot host"), { statusCode: 503, apiError: "live_studio_dependency_missing" });
+    const parsed = new URL(rawUrl);
     let protocol = parsed.protocol;
     if (protocol === "wss:") protocol = "https:";
     else if (protocol === "ws:") protocol = "http:";
-    if (!(["https:", "http:"].includes(protocol)) || (protocol !== "https:" && !["localhost", "127.0.0.1"].includes(parsed.hostname))) {
-        throw Object.assign(new Error("LiveKit URL must use HTTPS/WSS outside localhost"), { statusCode: 503, apiError: "live_studio_not_configured" });
-    }
     const apiUrl = `${protocol}//${parsed.host}`;
     const clientUrl = `${protocol === "https:" ? "wss:" : "ws:"}//${parsed.host}`;
     if (!liveKitSdkCache) {
-        let sdk;
-        try { sdk = require("livekit-server-sdk"); }
-        catch (_) { throw Object.assign(new Error("Install livekit-server-sdk on the Bot host"), { statusCode: 503, apiError: "live_studio_dependency_missing" }); }
+        const sdk = require("livekit-server-sdk");
         liveKitSdkCache = { sdk, roomService: new sdk.RoomServiceClient(apiUrl, apiKey, apiSecret), apiUrl, clientUrl, apiKey, apiSecret };
     }
     // If a deploy changes credentials/URL, recreate the runtime client rather than retaining stale config.
@@ -827,6 +858,15 @@ function getLiveKitRuntime() {
         liveKitSdkCache = { sdk, roomService: new sdk.RoomServiceClient(apiUrl, apiKey, apiSecret), apiUrl, clientUrl, apiKey, apiSecret };
     }
     return liveKitSdkCache;
+}
+function logLiveKitConfigurationStatus() {
+    const status = inspectLiveKitConfiguration();
+    console.log("LiveKit configuration check:", JSON.stringify({
+        configured: status.configured, missingVariables: status.missingVariables,
+        urlPresent: status.urlPresent, apiKeyPresent: status.apiKeyPresent, apiSecretPresent: status.apiSecretPresent,
+        urlValid: status.urlValid, urlIssue: status.urlIssue, urlHost: status.urlHost,
+        dependencyInstalled: status.dependencyInstalled, reason: status.reason
+    }));
 }
 function studioSessionForGuild(guildId) {
     const session = liveStudioSessions.get(String(guildId));
@@ -1334,9 +1374,10 @@ app.post("/api/admin/live-studio/status", async (req, res) => {
             await endLiveStudioForGuild(guild.id, "Bot voice disconnected or session expired", "system");
             session = null;
         }
-        if (!session) return res.json({ ok: true, configured: Boolean(process.env.LIVEKIT_URL && process.env.LIVEKIT_API_KEY && process.env.LIVEKIT_API_SECRET), active: false, botConnected, botChannelName: botVoice?.channelName || "" });
+        const configuration = inspectLiveKitConfiguration();
+        if (!session) return res.json({ ok: true, configured: configuration.configured, configuration, active: false, botConnected, botChannelName: botVoice?.channelName || "" });
         const participants = await session.roomService.listParticipants(session.roomName).catch(() => []);
-        return res.json({ ok: true, configured: true, active: true, sessionId: session.sessionId, roomName: session.roomName, channelName: session.discordChannelName,
+        return res.json({ ok: true, configured: configuration.configured, configuration, active: true, sessionId: session.sessionId, roomName: session.roomName, channelName: session.discordChannelName,
             discordChannelName: session.discordChannelName, startedAt: session.startedAt, expiresAt: session.expiresAt, participantCount: participants.length, botConnected: true });
     } catch (err) { return adminApiError(res, err, "live_studio_status_failed"); }
 });
@@ -1355,8 +1396,22 @@ app.post("/api/admin/live-studio/start", async (req, res) => {
         if (!session) {
             const sessionId = crypto.randomBytes(12).toString("base64url");
             const roomName = `rkbs_${guild.id}_${crypto.randomBytes(7).toString("hex")}`;
-            await runtime.roomService.createRoom({ name: roomName, emptyTimeout: 60, maxParticipants: LIVE_STUDIO_MAX_PARTICIPANTS, metadata: JSON.stringify({ app: "RKBACKLES", sessionId }) });
-            session = { sessionId, guildId: guild.id, roomName, roomService: runtime.roomService, ownerUid: actor.uid, discordChannelId: voiceSession.channelId,
+            try {
+                await runtime.roomService.createRoom({ name: roomName, emptyTimeout: 60, maxParticipants: LIVE_STUDIO_MAX_PARTICIPANTS, metadata: JSON.stringify({ app: "RKBACKLES", sessionId }) });
+            } catch (providerErr) {
+                const providerStatus = Number(providerErr?.status || providerErr?.statusCode || providerErr?.response?.status) || 0;
+                const providerCode = String(providerErr?.code || providerErr?.name || "LiveKitError").slice(0, 100);
+                const providerMessage = String(providerErr?.message || "unknown provider error").replaceAll(String(process.env.LIVEKIT_API_SECRET || "\u0000"), "[redacted]").slice(0, 500);
+                console.error("LiveKit room creation failed:", JSON.stringify({ status: providerStatus, code: providerCode, message: providerMessage }));
+                if ([401, 403].includes(providerStatus) || /unauthori[sz]ed|invalid.*(api.?key|secret|signature)|credential|permission denied/i.test(providerMessage)) {
+                    throw Object.assign(new Error("LiveKit rejected the API key/secret"), { statusCode: 502, apiError: "live_studio_credentials_rejected" });
+                }
+                if (/ENOTFOUND|ECONN|timeout|fetch failed|network|socket hang up/i.test(providerMessage)) {
+                    throw Object.assign(new Error("Bot host cannot reach LiveKit"), { statusCode: 502, apiError: "live_studio_provider_unreachable" });
+                }
+                throw Object.assign(new Error("LiveKit room creation failed"), { statusCode: 502, apiError: "live_studio_provider_failed" });
+            }
+            session = { sessionId, guildId, roomName, roomService: runtime.roomService, ownerUid: actor.uid, discordChannelId: voiceSession.channelId,
                 discordChannelName: voiceSession.channelName || "Discord voice", startedAt: Date.now(), expiresAt: Date.now() + LIVE_STUDIO_MAX_DURATION_MS,
                 hostIdentity: `host_${crypto.createHash("sha256").update(actor.uid).digest("hex").slice(0, 12)}`, deniedIdentities: new Set(), mutedIdentities: new Set(), endedAt: 0 };
             liveStudioSessions.set(guild.id, session);
@@ -1941,7 +1996,10 @@ liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
     db.ref("auditLog").push({ adminUid: ticketRecord.uid, actionType: "discord_live_voice_start", timestamp: Date.now(), summary: `Admin opened two-way live voice relay in ${session.channelName || session.channelId}; audio not stored` }).catch(err => console.error("Live voice audit write failed:", err.message));
     sendLiveVoiceJson(socket, { type: "connected", channelName: session.channelName || "voice channel", audioIsNotStored: true });
 });
-server.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
+server.listen(PORT, () => {
+    console.log(`🌐 Web server running on port ${PORT}`);
+    logLiveKitConfigurationStatus();
+});
 
 // ================================
 // 📱 Dynamic Realtime Settings (Firebase Sync)
