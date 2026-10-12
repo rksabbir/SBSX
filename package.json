@@ -1,14 +1,13 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.33",
+  "version": "1.5.28",
   "private": true,
-  "description": "RKBACKLES Discord automation, admin-protected APIs, hardened Firebase rules, continuous Live Stream Radar and invite-based LiveKit voice/screen sharing",
+  "description": "RKBACKLES Discord automation, payment review, continuous Live Stream Radar and invite-based LiveKit voice/screen sharing",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "check": "node --check index.js",
-    "test": "node --test",
-    "security:check": "node --test test/security-rules.test.js"
+    "test": "node --test"
   },
   "engines": {
     "node": ">=22.12.0"
