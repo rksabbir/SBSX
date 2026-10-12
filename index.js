@@ -547,17 +547,39 @@ async function verifyAdminApiRequest(req) {
     cleanupAdminSessions();
     const sessionKey = hashAdminSessionToken(token);
     const session = adminSessions.get(sessionKey);
-    if (!session || session.expiresAt <= Date.now()) {
-        adminSessions.delete(sessionKey);
-        throw Object.assign(new Error("Admin session expired"), { statusCode: 401 });
+    let actor = null;
+
+    // Support the current Blogger Admin Panel, which sends a refreshed Firebase ID token
+    // (currentAdmin.getIdToken(true)). Verify signature, expiry and revocation server-side.
+    // Never treat a decoded-but-unverified JWT as proof of identity.
+    if (session && session.expiresAt > Date.now()) {
+        actor = { uid: session.uid, email: session.email, sessionExpiresAt: session.expiresAt, adminSession: true, authMode: "server_session" };
+        session.lastUsedAt = Date.now();
+    } else {
+        if (session) adminSessions.delete(sessionKey);
+        let decoded;
+        try {
+            decoded = await admin.auth().verifyIdToken(token, true);
+        } catch (_) {
+            throw Object.assign(new Error("Admin session expired. Sign in again."), { statusCode: 401 });
+        }
+        actor = {
+            uid: decoded.uid,
+            email: String(decoded.email || "").slice(0, 254),
+            sessionExpiresAt: Number(decoded.exp || 0) * 1000,
+            adminSession: true,
+            authMode: "firebase_id_token"
+        };
     }
-    const adminSnap = await db.ref(`adminUids/${session.uid}`).once("value");
+
+    // Check the server-side allowlist on every request so access is revoked immediately
+    // when adminUids/{uid} is removed or changed to false.
+    const adminSnap = await db.ref(`adminUids/${actor.uid}`).once("value");
     if (adminSnap.val() !== true) {
         adminSessions.delete(sessionKey);
         throw Object.assign(new Error("Admin access revoked"), { statusCode: 403 });
     }
-    session.lastUsedAt = Date.now();
-    return { uid: session.uid, email: session.email, sessionExpiresAt: session.expiresAt, adminSession: true };
+    return actor;
 }
 // The public Blogger panel talks only to this authenticated server API; no Firebase Web config is sent to the browser.
 const ADMIN_DB_READ_ROOTS = ["adminConfig", "panels", "runtime/bot", "runtime/liveStreamRadar", "runtime/botStats/weekly", "reader_devices", "pending_payments", "transactions", "coupons", "couponRequests", "auditLog", "adminActions"];

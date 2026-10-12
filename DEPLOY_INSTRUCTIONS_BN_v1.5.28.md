@@ -58,3 +58,7 @@ Deploy-এর পরে `https://YOUR-RENDER-SERVICE.onrender.com/api/live-studi
 
 **সতর্কতা:** rules প্রকাশ করলে live database access policy বদলাবে। অন্য app-এর legitimate paths থাকলে merge না করে পুরো rules replace করবেন না।
 
+
+
+## v1.5.33 Admin Session Fix
+The current Blogger panel sends a Firebase ID token to protected Bot APIs. The Bot now verifies Firebase ID tokens server-side and checks `adminUids/{uid} = true` for every privileged request. Deploy the v1.5.33 Bot code, keep `ADMIN_PANEL_ORIGINS` set to the exact Blogger HTTPS origin, then sign in again.

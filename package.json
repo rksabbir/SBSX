@@ -1,6 +1,6 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.32",
+  "version": "1.5.33",
   "private": true,
   "description": "RKBACKLES Discord automation, admin-protected APIs, hardened Firebase rules, continuous Live Stream Radar and invite-based LiveKit voice/screen sharing",
   "main": "index.js",
