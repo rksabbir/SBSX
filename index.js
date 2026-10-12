@@ -4,14 +4,10 @@ require("dotenv").config();
 // ================================
 
 const express = require("express");
-const http = require("http");
-const { spawn } = require("child_process");
-const { WebSocketServer, WebSocket } = require("ws");
 const fs = require("fs");
 const crypto = require("crypto");
 const { promisify } = require("util");
 const os = require("os");
-const { Readable } = require("stream");
 const admin = require("firebase-admin"); // Firebase Admin SDK
 
 const {
@@ -26,34 +22,14 @@ const {
     StringSelectMenuBuilder,
     PermissionFlagsBits,
     ChannelType,
-    Routes,
     MessageFlags,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle,
-    Events
+    TextInputStyle
 } = require("discord.js");
 
 // html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
-const {
-    isValidDiscordSnowflake,
-    isSafeDiscordActionRole,
-    isProtectedDiscordTarget,
-    isAssignableDiscordRole
-} = require("./discord-admin-policy");
-const { sanitizeVoiceSpeech, formatVerifiedAnnouncement, formatRoleChangeAnnouncement, formatLevelUpAnnouncement } = require("./discord-bengali-automation");
-const { normalizeRecorderMimeType, extractOneTimeTicketFromProtocols, packRemotePcmFrame } = require("./live-voice-protocol");
-const { createLivePcmAudioProcess } = require("./live-voice-pcm-stream");
-const { normalizeStudioName, studioInviteDigest, isValidStudioInviteCode, isGuestStudioIdentity, buildStudioVideoGrant, isLiveStudioVoiceBound } = require("./live-studio-policy");
-const { attachLiveConsoleServer } = require("./live-console-server");
-const {
-    parseCookieHeader,
-    parseDiscordIdSet,
-    isLiveStudioModerator,
-    buildDiscordOAuthAuthorizeUrl,
-    isDiscordOAuthConfigured
-} = require("./live-studio-access");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -113,9 +89,9 @@ function getSafeCppProfile(uid, record, kind = "user", extra = {}) {
     const now = Date.now();
     const expiresAt = Number(source.expiresAt) || 0;
     const rawStatus = String(source.status || (kind === "key" ? "VIP Access" : "active")).slice(0, 60);
-    const expired = expiresAt > 0 && expiresAt <= now;
+    const expired = kind === "user" && expiresAt > 0 && expiresAt <= now;
     const active = !!record && (kind === "key"
-        ? isCppKeyUsable(source, now) && !!source.used
+        ? source.revoked !== true && source.disabled !== true && !!source.used
         : rawStatus.toLowerCase() === "active" && !expired);
     return {
         uid,
@@ -212,10 +188,6 @@ const readerCheckLastAt = new Map();
 const READER_CHECK_LEASE_MS = Math.max(30_000, Number(process.env.READER_CHECK_LEASE_MS || 60_000));
 
 const { claimReaderCheckState, finishReaderCheckState, releaseReaderCheckState } = require("./reader-check-state");
-const { isCppKeyUsable } = require("./cpp-key-state");
-const { getPaymentTxnSubmitCooldownMs } = require("./runtime-limits");
-const { paymentTxnLocks, paymentTxnLastAt } = require("./payment-txn-state");
-const PAYMENT_TXN_SUBMIT_COOLDOWN_MS = getPaymentTxnSubmitCooldownMs(process.env.PAYMENT_TXN_SUBMIT_COOLDOWN_MS);
 
 async function getPaymentReaderState() {
     if (TRUSTED_READER_UIDS.size === 0) {
@@ -485,6 +457,34 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "32kb", type: "application/json" }));
 const ADMIN_PANEL_ORIGINS = new Set(String(process.env.ADMIN_PANEL_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean));
+// Server-side Admin Console session bridge. The Blogger page does not load Firebase Web SDK/config.
+const FIREBASE_WEB_API_KEY = String(process.env.FIREBASE_WEB_API_KEY || "").trim();
+const ADMIN_SESSION_TTL_MS = Math.min(12 * 60 * 60 * 1000, Math.max(5 * 60 * 1000, Number(process.env.ADMIN_SESSION_TTL_MS) || 2 * 60 * 60 * 1000));
+const adminSessions = new Map(); // Stores hashes of opaque random bearer tokens; restarting the Bot invalidates sessions.
+function isAdminPanelOriginAllowed(req) {
+    const origin = String(req.get("origin") || "");
+    return !!origin && ADMIN_PANEL_ORIGINS.has(origin);
+}
+function requireAdminPanelOrigin(req, res) {
+    if (isAdminPanelOriginAllowed(req)) return true;
+    res.status(403).json({ ok: false, error: "origin_not_allowed", message: "এই Admin Panel origin-টি Bot host-এর ADMIN_PANEL_ORIGINS-এ অনুমোদিত নয়।" });
+    return false;
+}
+function hashAdminSessionToken(token) { return crypto.createHash("sha256").update(String(token)).digest("hex"); }
+function cleanupAdminSessions() {
+    const now = Date.now();
+    for (const [key, value] of adminSessions) if (!value || value.expiresAt <= now) adminSessions.delete(key);
+}
+function mintAdminSession(uid, email) {
+    cleanupAdminSessions();
+    const existing = [...adminSessions.entries()].filter(([, value]) => value.uid === uid).sort((a, b) => a[1].createdAt - b[1].createdAt);
+    while (existing.length >= 4) { const [oldest] = existing.shift(); adminSessions.delete(oldest); }
+    const token = crypto.randomBytes(32).toString("base64url");
+    const now = Date.now();
+    adminSessions.set(hashAdminSessionToken(token), { uid, email: String(email || "").slice(0, 254), createdAt: now, lastUsedAt: now, expiresAt: now + ADMIN_SESSION_TTL_MS });
+    return { token, expiresAt: now + ADMIN_SESSION_TTL_MS };
+}
+
 app.use((req, res, next) => {
     const origin = String(req.get("origin") || "");
     // Public, non-sensitive health probe: allow the panel to read it even when its origin
@@ -543,1412 +543,198 @@ function readBearerToken(req) {
 }
 async function verifyAdminApiRequest(req) {
     const token = readBearerToken(req);
-    if (!token) throw Object.assign(new Error("Missing admin bearer token"), { statusCode: 401 });
-    let decoded;
-    try {
-        decoded = await admin.auth().verifyIdToken(token, true);
-    } catch (_) {
-        throw Object.assign(new Error("Invalid or expired admin bearer token"), { statusCode: 401 });
+    if (!token) throw Object.assign(new Error("Missing Admin Console session"), { statusCode: 401 });
+    cleanupAdminSessions();
+    const sessionKey = hashAdminSessionToken(token);
+    const session = adminSessions.get(sessionKey);
+    if (!session || session.expiresAt <= Date.now()) {
+        adminSessions.delete(sessionKey);
+        throw Object.assign(new Error("Admin session expired"), { statusCode: 401 });
     }
-    let adminSnap;
-    try {
-        adminSnap = await db.ref(`adminUids/${decoded.uid}`).once("value");
-    } catch (_) {
-        throw Object.assign(new Error("Admin authorization lookup unavailable"), { statusCode: 503 });
+    const adminSnap = await db.ref(`adminUids/${session.uid}`).once("value");
+    if (adminSnap.val() !== true) {
+        adminSessions.delete(sessionKey);
+        throw Object.assign(new Error("Admin access revoked"), { statusCode: 403 });
     }
-    if (adminSnap.val() !== true) throw Object.assign(new Error("Admin access denied"), { statusCode: 403 });
-    return decoded;
+    session.lastUsedAt = Date.now();
+    return { uid: session.uid, email: session.email, sessionExpiresAt: session.expiresAt, adminSession: true };
 }
-// ===== Admin Discord member directory / moderation API =====
-// Actions are authenticated against Firebase adminUids, rate limited, auditable,
-// and deliberately cannot grant the configured Discord Admin role.
-const DISCORD_ADMIN_ACTION_ROLES = Object.freeze({
-    developer: { configKey: "developer", label: "Developer" },
-    supportTicketReport: { configKey: "supportTicketReport", label: "Ticket moderator" },
-    supportCustomer: { configKey: "supportCustomer", label: "Customer support" },
-    verified: { configKey: "verified", label: "Verified" },
-    level: { configKey: "level", label: "Level reward" }
-});
-let adminDiscordDirectoryCache = { fetchedAt: 0, members: [], bans: [], membersTruncated: false, bansTruncated: false, guildId: "" };
-const DISCORD_DIRECTORY_CACHE_MS = 30_000;
-const DISCORD_DIRECTORY_MAX_PAGES = 10;
-const DISCORD_PAGE_SIZE = 1000;
-function adminApiError(res, err, fallback = "discord_action_failed") {
-    const status = Number(err?.statusCode) || 502;
-    const error = String(err?.apiError || (status === 401 ? "unauthorized" : status === 403 ? "forbidden" : status === 503 ? "server_unavailable" : fallback));
-    return res.status(status).json({ ok: false, error });
+// The public Blogger panel talks only to this authenticated server API; no Firebase Web config is sent to the browser.
+const ADMIN_DB_READ_ROOTS = ["adminConfig", "panels", "runtime/bot", "runtime/liveStreamRadar", "runtime/botStats/weekly", "reader_devices", "pending_payments", "transactions", "coupons", "couponRequests", "auditLog", "adminActions"];
+function normalizeAdminDbPath(raw, allowRoot = false) {
+    if (typeof raw !== "string") return null;
+    const value = raw.replace(/^\/+|\/+$/g, "");
+    if (!value && allowRoot) return "";
+    if (!value || value.length > 512) return null;
+    if (value === ".info/connected") return value;
+    const parts = value.split("/");
+    if (parts.length > 10 || parts.some(part => !validRtdbSegment(part, 128))) return null;
+    return value;
 }
-async function getReadyAdminGuild() {
-    if (!client.isReady()) throw Object.assign(new Error("Discord bot not ready"), { statusCode: 503, apiError: "bot_not_ready" });
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID) || await client.guilds.fetch(ALLOWED_GUILD_ID).catch(() => null);
-    if (!guild) throw Object.assign(new Error("Configured Discord guild not found"), { statusCode: 503, apiError: "guild_not_found" });
-    return guild;
+function isSameOrChildPath(value, root) { return value === root || value.startsWith(`${root}/`); }
+function adminDbPathReadable(value) {
+    if (value === ".info/connected") return true;
+    return ADMIN_DB_READ_ROOTS.some(root => isSameOrChildPath(value, root));
 }
-function compareSnowflakes(a, b) {
-    try { const aa = BigInt(String(a || "0")), bb = BigInt(String(b || "0")); return aa < bb ? -1 : aa > bb ? 1 : 0; }
-    catch (_) { return String(a).localeCompare(String(b)); }
+function adminDbPathWritable(value) {
+    if (value === "adminConfig/bot" || value.startsWith("adminConfig/bot/")) return true;
+    if (value === "panels" || value.startsWith("panels/")) return true;
+    const parts = value.split("/");
+    return (parts[0] === "auditLog" || parts[0] === "adminActions") && parts.length === 2;
 }
-async function fetchAdminDiscordPages(guild, kind) {
-    const out = [];
-    let after = undefined;
-    let truncated = false;
-    for (let pageNo = 0; pageNo < DISCORD_DIRECTORY_MAX_PAGES; pageNo += 1) {
-        const query = new URLSearchParams({ limit: String(DISCORD_PAGE_SIZE) });
-        if (after) query.set("after", String(after));
-        const route = kind === "bans" ? Routes.guildBans(guild.id) : Routes.guildMembers(guild.id);
-        const batch = await client.rest.get(route, { query });
-        const values = Array.isArray(batch) ? batch : [];
-        if (!values.length) break;
-        out.push(...values);
-        const ids = values.map(value => value.user?.id).filter(Boolean).sort(compareSnowflakes);
-        const nextAfter = ids[ids.length - 1];
-        if (!nextAfter || nextAfter === after) break;
-        after = nextAfter;
-        if (values.length < DISCORD_PAGE_SIZE) break;
-        if (pageNo === DISCORD_DIRECTORY_MAX_PAGES - 1) truncated = true;
+async function commitAdminDbUpdates(updates, actor) {
+    if (!updates || typeof updates !== "object" || Array.isArray(updates)) throw Object.assign(new Error("Invalid update payload"), { statusCode: 400 });
+    const entries = Object.entries(updates);
+    if (!entries.length || entries.length > 50) throw Object.assign(new Error("Update batch must contain 1–50 paths"), { statusCode: 400 });
+    const cleaned = {};
+    const auditPaths = [];
+    for (const [rawPath, value] of entries) {
+        const path = normalizeAdminDbPath(rawPath);
+        if (!path || !adminDbPathWritable(path) || path === ".info/connected") throw Object.assign(new Error(`Write not allowed for path: ${String(rawPath).slice(0, 100)}`), { statusCode: 403 });
+        if (path.startsWith("auditLog/") || path.startsWith("adminActions/")) {
+            const parts = path.split("/");
+            if (parts.length !== 2 || !value || typeof value !== "object" || Array.isArray(value) || value.adminUid !== actor.uid || typeof value.actionType !== "string" || typeof value.summary !== "string") {
+                throw Object.assign(new Error("Audit entries must be complete, actor-owned records"), { statusCode: 400 });
+            }
+            auditPaths.push(path);
+        }
+        cleaned[path] = value;
     }
-    return { values: out, truncated };
+    // Audit entries are append-only through the browser API; never allow replacing a prior record.
+    if (auditPaths.length) {
+        const existing = await Promise.all(auditPaths.map(path => db.ref(path).once("value")));
+        if (existing.some(snapshot => snapshot.exists())) throw Object.assign(new Error("Audit entry already exists"), { statusCode: 409 });
+    }
+    await db.ref().update(cleaned);
+    return { ok: true, updatedPaths: entries.length };
 }
-async function getAdminDiscordDirectory(force = false) {
-    const now = Date.now();
-    if (!force && adminDiscordDirectoryCache.guildId === ALLOWED_GUILD_ID && now - adminDiscordDirectoryCache.fetchedAt < DISCORD_DIRECTORY_CACHE_MS) return adminDiscordDirectoryCache;
-    const guild = await getReadyAdminGuild();
-    const [memberResult, banResult] = await Promise.all([
-        fetchAdminDiscordPages(guild, "members"),
-        fetchAdminDiscordPages(guild, "bans")
-    ]);
-    adminDiscordDirectoryCache = {
-        fetchedAt: now,
-        guildId: guild.id,
-        members: memberResult.values,
-        bans: banResult.values,
-        membersTruncated: memberResult.truncated,
-        bansTruncated: banResult.truncated
-    };
-    return adminDiscordDirectoryCache;
-}
-function getAdminRoleBindingMap() {
-    return {
-        admin: getConfiguredRoleId("admin"),
-        developer: getConfiguredRoleId("developer"),
-        supportTicketReport: getConfiguredRoleId("supportTicketReport"),
-        supportCustomer: getConfiguredRoleId("supportCustomer"),
-        verified: getConfiguredRoleId("verified"),
-        level: getConfiguredRoleId("level")
-    };
-}
-function serializeAdminDiscordMember(member, guild, roleBindings) {
-    const user = member.user || member;
-    const roleIds = Array.isArray(member.roles) ? member.roles : (member.roles?.cache ? [...member.roles.cache.keys()] : []);
-    const filteredRoleIds = roleIds.filter(id => id !== guild.id);
-    const roles = filteredRoleIds.map(id => {
-        const role = guild.roles.cache.get(id);
-        if (!role) return { id, name: "Unknown role", key: "" };
-        const key = Object.keys(roleBindings).find(k => roleBindings[k] && roleBindings[k] === id) || "";
-        return { id: role.id, name: role.name, key };
-    }).sort((a, b) => (guild.roles.cache.get(b.id)?.position || 0) - (guild.roles.cache.get(a.id)?.position || 0));
-    const isAdminRole = roles.some(role => role.key === "admin");
-    const isDeveloper = roles.some(role => role.key === "developer");
-    const isModerator = roles.some(role => ["supportTicketReport", "supportCustomer"].includes(role.key));
-    const hasAdminPermission = filteredRoleIds.some(id => guild.roles.cache.get(id)?.permissions?.has(PermissionFlagsBits.Administrator));
-    const isAdministrator = Boolean(member.permissions?.has?.(PermissionFlagsBits.Administrator)) || Boolean(hasAdminPermission) || isAdminRole;
-    let avatarUrl = "";
+
+app.post("/api/admin/session/login", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    if (!checkCppRateLimit(req, res, "admin-session-login", 8, 15 * 60 * 1000)) return;
+    if (!FIREBASE_WEB_API_KEY) return res.status(503).json({ ok: false, error: "admin_auth_not_configured", message: "Bot host-এ FIREBASE_WEB_API_KEY Environment Variable সেট করা নেই।" });
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    const password = String(req.body?.password || "");
+    if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !password || password.length > 1024) {
+        return res.status(400).json({ ok: false, error: "auth/invalid-credential", message: "ইমেইল বা পাসওয়ার্ড সঠিক নয়।" });
+    }
     try {
-        avatarUrl = user.displayAvatarURL ? user.displayAvatarURL({ extension: "png", size: 64 })
-            : (user.avatar ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=64` : "");
-    } catch (_) {}
-    return {
-        id: String(user.id || member.id || ""), username: String(user.username || "unknown").slice(0, 100),
-        globalName: String(user.globalName || user.global_name || "").slice(0, 100),
-        displayName: String(member.displayName || member.nick || user.globalName || user.global_name || user.username || "unknown").slice(0, 100),
-        avatarUrl, bot: Boolean(user.bot), joinedAt: member.joinedTimestamp || (member.joined_at ? Date.parse(member.joined_at) : 0),
-        roles, isDeveloper, isModerator, isAdminRole, isAdministrator,
-        isOwner: String(user.id || member.id || "") === String(guild.ownerId || "")
-    };
-}
-async function beginDiscordAdminAudit(actor, actionType, summary) {
-    const ref = db.ref("auditLog").push();
-    await ref.set({ adminUid: actor.uid, actionType, timestamp: Date.now(), summary: `PENDING — ${summary}`, result: "pending" });
-    return ref;
-}
-async function runDiscordAdminAction(actor, actionType, summary, actionFn) {
-    const auditRef = await beginDiscordAdminAudit(actor, actionType, summary);
-    let result;
-    try {
-        result = await actionFn();
+        const authResponse = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(FIREBASE_WEB_API_KEY)}`, {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ email, password, returnSecureToken: true }), signal: AbortSignal.timeout(12000)
+        });
+        const authPayload = await authResponse.json().catch(() => ({}));
+        if (!authResponse.ok || !authPayload.idToken) return res.status(401).json({ ok: false, error: "auth/invalid-credential", message: "ইমেইল বা পাসওয়ার্ড সঠিক নয়।" });
+        const decoded = await admin.auth().verifyIdToken(authPayload.idToken, true);
+        const [adminSnap, userRecord] = await Promise.all([
+            db.ref(`adminUids/${decoded.uid}`).once("value"),
+            admin.auth().getUser(decoded.uid)
+        ]);
+        if (userRecord.disabled) return res.status(403).json({ ok: false, error: "auth/user-disabled", message: "এই Admin account বন্ধ আছে।" });
+        if (adminSnap.val() !== true) return res.status(403).json({ ok: false, error: "admin_not_allowed", message: "এই account-এর Admin অনুমতি নেই।" });
+        const issued = mintAdminSession(decoded.uid, userRecord.email || authPayload.email || email);
+        return res.set("Cache-Control", "no-store").json({ ok: true, token: issued.token, expiresAt: issued.expiresAt, user: { uid: decoded.uid, email: String(userRecord.email || email).slice(0, 254) } });
     } catch (err) {
-        await auditRef.update({ result: "failed", summary: `${summary} — failed (${String(err.apiError || err.message || "discord_error").slice(0, 100)})`, completedAt: Date.now() }).catch(auditErr => console.error("Discord admin audit update failed:", auditErr.message));
-        throw err;
+        console.error("Admin session login failed:", String(err?.message || err).slice(0, 220));
+        return res.status(503).json({ ok: false, error: "admin_login_unavailable", message: "Admin login service এখন পাওয়া যাচ্ছে না। Bot host Environment ও logs পরীক্ষা করুন।" });
     }
-    let auditLogged = true;
-    await auditRef.update({ result: "success", summary, completedAt: Date.now() }).catch(err => { auditLogged = false; console.error("Discord admin audit finalization failed:", err.message); });
-    return { ...(result || {}), auditLogged };
-}
-function validateDiscordSnowflake(value) {
-    const id = String(value || "").trim();
-    if (!isValidDiscordSnowflake(id)) throw Object.assign(new Error("Invalid Discord ID"), { statusCode: 400, apiError: "invalid_member_id" });
-    return id;
-}
-function getBotGuildMember(guild) {
-    const bot = guild.members.me;
-    if (!bot) throw Object.assign(new Error("Bot member is not cached"), { statusCode: 503, apiError: "bot_not_ready" });
-    return bot;
-}
-app.get("/api/admin/discord/members", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-directory", 20, 60_000)) return;
-        const refresh = String(req.query?.refresh || "") === "1";
-        const snapshot = await getAdminDiscordDirectory(refresh);
-        const guild = await getReadyAdminGuild();
-        const roleBindings = getAdminRoleBindingMap();
-        const members = snapshot.members.map(member => serializeAdminDiscordMember(member, guild, roleBindings));
-        const developers = members.filter(member => member.isDeveloper);
-        const moderators = members.filter(member => member.isModerator || member.isAdminRole);
-        const banned = snapshot.bans.map(entry => ({
-            id: String(entry.user?.id || ""), username: String(entry.user?.username || "Unknown user").slice(0, 100),
-            globalName: String(entry.user?.globalName || entry.user?.global_name || "").slice(0, 100),
-            reason: String(entry.reason || "No reason provided").slice(0, 400)
-        }));
-        const roleLabels = { developer: "Developer", supportTicketReport: "Ticket moderator", supportCustomer: "Customer support", verified: "Verified", level: "Level reward" };
-        const roleOptions = Object.entries(DISCORD_ADMIN_ACTION_ROLES).map(([key, item]) => {
-            const id = roleBindings[key];
-            const role = id ? guild.roles.cache.get(id) : null;
-            const botMember = guild.members.me;
-            if (!isAssignableDiscordRole({ exists: Boolean(role), managed: role?.managed, hasAdministratorPermission: role?.permissions?.has(PermissionFlagsBits.Administrator), rolePosition: role?.position, botHighestRolePosition: botMember?.roles?.highest?.position, roleId: role?.id, adminRoleId: roleBindings.admin })) return null;
-            return { key, name: roleLabels[key] || item.label };
-        }).filter(Boolean);
-        return res.json({ ok: true, guild: { id: guild.id, name: guild.name, memberCount: guild.memberCount }, members, developers, moderators, banned,
-            roleOptions, truncated: snapshot.membersTruncated || snapshot.bansTruncated, fetchedAt: snapshot.fetchedAt, adminUid: actor.uid });
-    } catch (err) { return adminApiError(res, err, "discord_directory_failed"); }
 });
-app.post("/api/admin/discord/ban", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-ban", 8, 60_000)) return;
-        const memberId = validateDiscordSnowflake(req.body?.memberId);
-        const reason = String(req.body?.reason || "Admin panel moderation action").trim().slice(0, 400) || "Admin panel moderation action";
-        const guild = await getReadyAdminGuild();
-        const botMember = getBotGuildMember(guild);
-        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) throw Object.assign(new Error("Bot missing Ban Members permission"), { statusCode: 403, apiError: "missing_permission" });
-        const member = await guild.members.fetch(memberId).catch(() => null);
-        if (!member) throw Object.assign(new Error("Member not found"), { statusCode: 404, apiError: "member_not_found" });
-        const configuredAdminRole = getConfiguredRoleId("admin");
-        if (isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId, isAdministrator: member.permissions.has(PermissionFlagsBits.Administrator) || (configuredAdminRole && member.roles.cache.has(configuredAdminRole)), targetHighestRolePosition: member.roles.highest.position, botHighestRolePosition: botMember.roles.highest.position })) {
-            throw Object.assign(new Error("Protected target"), { statusCode: 403, apiError: "protected_target" });
-        }
-        const summary = `Banned Discord member ${member.user.tag || member.id} (${member.id}); reason=${reason}`;
-        const result = await runDiscordAdminAction(actor, "discord_member_ban", summary, async () => {
-            await member.ban({ reason: `Admin panel by Firebase UID ${actor.uid}: ${reason}` });
-            return { memberId, action: "ban" };
-        });
-        return res.json({ ok: true, ...result });
-    } catch (err) { return adminApiError(res, err); }
+app.get("/api/admin/session/me", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    try { const actor = await verifyAdminApiRequest(req); return res.set("Cache-Control", "no-store").json({ ok: true, user: { uid: actor.uid, email: actor.email }, expiresAt: actor.sessionExpiresAt }); }
+    catch (err) { return res.status(Number(err.statusCode) || 401).json({ ok: false, error: "admin_session_expired", message: "Admin session expired. Sign in again." }); }
 });
-app.post("/api/admin/discord/unban", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-unban", 8, 60_000)) return;
-        const memberId = validateDiscordSnowflake(req.body?.memberId);
-        const reason = String(req.body?.reason || "Admin panel unban").trim().slice(0, 400) || "Admin panel unban";
-        const guild = await getReadyAdminGuild();
-        const botMember = getBotGuildMember(guild);
-        if (!botMember.permissions.has(PermissionFlagsBits.BanMembers)) throw Object.assign(new Error("Bot missing Ban Members permission"), { statusCode: 403, apiError: "missing_permission" });
-        const ban = await guild.bans.fetch(memberId).catch(() => null);
-        if (!ban) throw Object.assign(new Error("Not banned"), { statusCode: 404, apiError: "not_banned" });
-        const summary = `Unbanned Discord user ${ban.user.tag || memberId} (${memberId}); reason=${reason}`;
-        const result = await runDiscordAdminAction(actor, "discord_member_unban", summary, async () => {
-            await guild.bans.remove(memberId, `Admin panel by Firebase UID ${actor.uid}: ${reason}`);
-            return { memberId, action: "unban" };
-        });
-        return res.json({ ok: true, ...result });
-    } catch (err) { return adminApiError(res, err); }
+app.post("/api/admin/session/logout", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    const token = readBearerToken(req);
+    try { await verifyAdminApiRequest(req); adminSessions.delete(hashAdminSessionToken(token)); return res.set("Cache-Control", "no-store").json({ ok: true }); }
+    catch (_) { if (token) adminSessions.delete(hashAdminSessionToken(token)); return res.json({ ok: true }); }
 });
-app.post("/api/admin/discord/role", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-role", 15, 60_000)) return;
-        const memberId = validateDiscordSnowflake(req.body?.memberId);
-        const roleKey = String(req.body?.roleKey || "");
-        const action = String(req.body?.action || "").toLowerCase();
-        if (!isSafeDiscordActionRole(roleKey) || !Object.prototype.hasOwnProperty.call(DISCORD_ADMIN_ACTION_ROLES, roleKey) || !["add", "remove"].includes(action)) throw Object.assign(new Error("Role is not allowlisted"), { statusCode: 400, apiError: "invalid_role" });
-        const guild = await getReadyAdminGuild();
-        const botMember = getBotGuildMember(guild);
-        if (!botMember.permissions.has(PermissionFlagsBits.ManageRoles)) throw Object.assign(new Error("Bot missing Manage Roles permission"), { statusCode: 403, apiError: "missing_permission" });
-        const roleId = getConfiguredRoleId(DISCORD_ADMIN_ACTION_ROLES[roleKey].configKey);
-        const role = roleId ? guild.roles.cache.get(roleId) : null;
-        if (!isAssignableDiscordRole({ exists: Boolean(role), managed: role?.managed, hasAdministratorPermission: role?.permissions?.has(PermissionFlagsBits.Administrator), rolePosition: role?.position, botHighestRolePosition: botMember.roles.highest.position, roleId: role?.id, adminRoleId: getConfiguredRoleId("admin") })) {
-            throw Object.assign(new Error("Role is not eligible for assignment"), { statusCode: 400, apiError: "invalid_role" });
-        }
-        const member = await guild.members.fetch(memberId).catch(() => null);
-        if (!member) throw Object.assign(new Error("Member not found"), { statusCode: 404, apiError: "member_not_found" });
-        const configuredAdminRole = getConfiguredRoleId("admin");
-        if (isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId, isAdministrator: member.permissions.has(PermissionFlagsBits.Administrator) || (configuredAdminRole && member.roles.cache.has(configuredAdminRole)), targetHighestRolePosition: member.roles.highest.position, botHighestRolePosition: botMember.roles.highest.position })) throw Object.assign(new Error("Protected target"), { statusCode: 403, apiError: "protected_target" });
-        if (action === "add" && member.roles.cache.has(role.id)) return res.json({ ok: true, memberId, roleKey, action, alreadyApplied: true, auditLogged: true });
-        if (action === "remove" && !member.roles.cache.has(role.id)) return res.json({ ok: true, memberId, roleKey, action, alreadyApplied: true, auditLogged: true });
-        const summary = `${action === "add" ? "Granted" : "Removed"} Discord role ${role.name} (${role.id}) ${action === "add" ? "to" : "from"} ${member.user.tag || member.id} (${member.id})`;
-        const result = await runDiscordAdminAction(actor, "discord_member_role_" + action, summary, async () => {
-            if (action === "add") await member.roles.add(role, `Admin panel by Firebase UID ${actor.uid}`);
-            else await member.roles.remove(role, `Admin panel by Firebase UID ${actor.uid}`);
-            return { memberId, roleKey, roleName: role.name, action };
-        });
-        return res.json({ ok: true, ...result });
-    } catch (err) { return adminApiError(res, err); }
-});
-
-// Admin-only voice controls. Live microphone PCM is kept in memory and never written to disk.
-const adminVoiceSessions = new Map();
-const liveVoiceTickets = new Map();
-const LIVE_VOICE_TICKET_TTL_MS = 30_000;
-const LIVE_VOICE_MAX_BYTES_PER_SECOND = 300 * 1024;
-const LIVE_VOICE_MAX_DURATION_MS = Math.min(2 * 60 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_VOICE_MAX_DURATION_MS || 30 * 60 * 1000)));
-const LIVE_STUDIO_MAX_DURATION_MS = Math.min(12 * 60 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_STUDIO_MAX_DURATION_MS || 4 * 60 * 60 * 1000)));
-const LIVE_STUDIO_INVITE_TTL_MS = Math.min(30 * 60 * 1000, Math.max(60_000, Number(process.env.LIVE_STUDIO_INVITE_TTL_MS || 10 * 60 * 1000)));
-const LIVE_STUDIO_MAX_PARTICIPANTS = Math.min(50, Math.max(2, Number(process.env.LIVE_STUDIO_MAX_PARTICIPANTS || 20)));
-const liveStudioSessions = new Map(); // one LiveKit Studio room per configured Discord guild; memory only
-const liveStudioInvites = new Map(); // SHA-256(inviteCode) -> short-lived guest invites or capped multi-user participant links
-const liveStudioOAuthStates = new Map(); // OAuth state -> short-lived invite-bound return path
-const liveStudioOAuthSessions = new Map(); // SHA-256(cookie token) -> verified Discord user session
-const LIVE_STUDIO_OAUTH_STATE_TTL_MS = 5 * 60 * 1000;
-const LIVE_STUDIO_OAUTH_SESSION_TTL_MS = 2 * 60 * 60 * 1000;
-const LIVE_STUDIO_OAUTH_STATE_COOKIE = "rk_live_studio_oauth_state";
-const LIVE_STUDIO_OAUTH_SESSION_COOKIE = "rk_live_studio_session";
-const DEFAULT_LIVEKIT_URL = "wss://sabbir-ylq7x559.livekit.cloud"; // Public project URL supplied by the owner; override on the Bot host if changed.
-let liveKitSdkCache = null;
-// Safe diagnostics only: never return or log the API key/secret themselves.
-function inspectLiveKitConfiguration() {
-    const rawUrl = String(process.env.LIVEKIT_URL || DEFAULT_LIVEKIT_URL).trim();
-    const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
-    const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
-    const missingVariables = [];
-    if (!apiKey) missingVariables.push("LIVEKIT_API_KEY");
-    if (!apiSecret) missingVariables.push("LIVEKIT_API_SECRET");
-    let urlValid = false;
-    let urlIssue = rawUrl ? "invalid_url" : "missing_url";
-    let urlHost = "";
-    try {
-        if (rawUrl) {
-            const parsed = new URL(rawUrl);
-            const secureProtocol = parsed.protocol === "wss:" || parsed.protocol === "https:";
-            const localProtocol = ["ws:", "http:"].includes(parsed.protocol) && ["localhost", "127.0.0.1"].includes(parsed.hostname);
-            const originOnly = !parsed.username && !parsed.password && !parsed.search && !parsed.hash && ["", "/"].includes(parsed.pathname);
-            if (!secureProtocol && !localProtocol) urlIssue = "use_wss_or_https";
-            else if (!parsed.hostname) urlIssue = "missing_host";
-            else if (!originOnly) urlIssue = "remove_path_query_or_credentials";
-            else { urlValid = true; urlIssue = ""; urlHost = parsed.host; }
-        }
-    } catch (_) { urlIssue = rawUrl ? "invalid_url" : "missing_url"; }
-    let dependencyInstalled = false;
-    try { require.resolve("livekit-server-sdk"); dependencyInstalled = true; } catch (_) {}
-    const reason = missingVariables.length ? "missing_env" : !urlValid ? "invalid_url" : !dependencyInstalled ? "dependency_missing" : "ready";
-    return {
-        configured: missingVariables.length === 0 && urlValid && dependencyInstalled,
-        missingVariables,
-        urlPresent: Boolean(rawUrl), apiKeyPresent: Boolean(apiKey), apiSecretPresent: Boolean(apiSecret),
-        urlValid, urlIssue, urlHost, dependencyInstalled, reason
-    };
-}
-function getLiveKitRuntime() {
-    const config = inspectLiveKitConfiguration();
-    const rawUrl = String(process.env.LIVEKIT_URL || DEFAULT_LIVEKIT_URL).trim();
-    const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
-    const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
-    if (config.missingVariables.length) throw Object.assign(new Error("LiveKit environment variables are missing"), { statusCode: 503, apiError: "live_studio_missing_env" });
-    if (!config.urlValid) throw Object.assign(new Error(`LIVEKIT_URL is invalid (${config.urlIssue})`), { statusCode: 503, apiError: "live_studio_invalid_url" });
-    if (!config.dependencyInstalled) throw Object.assign(new Error("Install livekit-server-sdk on the Bot host"), { statusCode: 503, apiError: "live_studio_dependency_missing" });
-    const parsed = new URL(rawUrl);
-    let protocol = parsed.protocol;
-    if (protocol === "wss:") protocol = "https:";
-    else if (protocol === "ws:") protocol = "http:";
-    const apiUrl = `${protocol}//${parsed.host}`;
-    const clientUrl = `${protocol === "https:" ? "wss:" : "ws:"}//${parsed.host}`;
-    if (!liveKitSdkCache) {
-        const sdk = require("livekit-server-sdk");
-        liveKitSdkCache = { sdk, roomService: new sdk.RoomServiceClient(apiUrl, apiKey, apiSecret), apiUrl, clientUrl, apiKey, apiSecret };
-    }
-    // If a deploy changes credentials/URL, recreate the runtime client rather than retaining stale config.
-    if (liveKitSdkCache.apiUrl !== apiUrl || liveKitSdkCache.apiKey !== apiKey || liveKitSdkCache.apiSecret !== apiSecret) {
-        const sdk = liveKitSdkCache.sdk;
-        liveKitSdkCache = { sdk, roomService: new sdk.RoomServiceClient(apiUrl, apiKey, apiSecret), apiUrl, clientUrl, apiKey, apiSecret };
-    }
-    return liveKitSdkCache;
-}
-function logLiveKitConfigurationStatus() {
-    const status = inspectLiveKitConfiguration();
-    console.log("LiveKit configuration check:", JSON.stringify({
-        configured: status.configured, missingVariables: status.missingVariables,
-        urlPresent: status.urlPresent, apiKeyPresent: status.apiKeyPresent, apiSecretPresent: status.apiSecretPresent,
-        urlValid: status.urlValid, urlIssue: status.urlIssue, urlHost: status.urlHost,
-        dependencyInstalled: status.dependencyInstalled, reason: status.reason
-    }));
-}
-function studioSessionForGuild(guildId) {
-    const session = liveStudioSessions.get(String(guildId));
-    if (!session || session.endedAt || session.expiresAt <= Date.now()) return null;
-    const voiceSession = adminVoiceSessions.get(String(guildId));
-    let readyStatus = "Ready";
-    try { readyStatus = getVoiceDependencies().voice.VoiceConnectionStatus.Ready; } catch (_) {}
-    if (!isLiveStudioVoiceBound({ sessionChannelId: session.discordChannelId, voiceChannelId: voiceSession?.channelId,
-        voiceStatus: voiceSession?.connection?.state?.status, readyStatus, expiresAt: session.expiresAt })) return null;
-    return session;
-}
-function redactLiveStudioDiagnostic(value) {
-    let text = String(value == null ? "" : value);
-    for (const secret of [process.env.LIVEKIT_API_SECRET, process.env.LIVEKIT_API_KEY, process.env.TOKEN]) {
-        if (secret && String(secret).length >= 4) text = text.split(String(secret)).join("[redacted]");
-    }
-    if (process.env.FIREBASE_CONFIG) text = text.split(String(process.env.FIREBASE_CONFIG)).join("[redacted]");
-    return text.replace(/Bearer\s+[^\s]+/gi, "Bearer [redacted]").replace(/[\r\n\0]+/g, " ").slice(0, 500);
-}
-
-function studioAccessToken(session, identity, name, role, discordIdentity = null) {
-    const runtime = getLiveKitRuntime();
-    const { AccessToken } = runtime.sdk;
-    // A participant token stays valid until the Studio session expires (capped by the session's own lifetime).
-    // This avoids unexpectedly dropping invited guests after the previous fixed 1-hour token TTL.
-    const tokenTtlSeconds = Math.max(60, Math.ceil((Number(session.expiresAt) - Date.now()) / 1000));
-    const token = new AccessToken(runtime.apiKey, runtime.apiSecret, {
-        identity,
-        name: normalizeStudioName(name, role === "host" ? "RKBACKLES Admin" : "Guest"),
-        ttl: tokenTtlSeconds,
-        metadata: JSON.stringify({ app: "RKBACKLES", sessionId: session.sessionId, role, discordUserId: String(discordIdentity?.userId || ""), discordUsername: String(discordIdentity?.username || "").slice(0, 80) })
-    });
-    const videoGrant = buildStudioVideoGrant(role, runtime.sdk.TrackSource);
-    // If an admin has enabled Mute Everyone, new guests receive a token without microphone publishing.
-    // Their screen share remains available, and the moderator can re-enable mic publishing later.
-    if (role === "guest" && session.muteAllActive) {
-        videoGrant.canPublish = true;
-        videoGrant.canPublishSources = [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO];
-    }
-    token.addGrant({ ...videoGrant, room: session.roomName });
-    return token.toJwt().then(jwt => ({ token: jwt, serverUrl: runtime.clientUrl }));
-}
-async function endLiveStudioForGuild(guildId, reason = "session ended", actorUid = "system") {
-    const key = String(guildId || "");
-    const session = liveStudioSessions.get(key);
-    if (!session) return false;
-    session.endedAt = Date.now();
-    liveStudioSessions.delete(key);
-    if (session.timer) clearTimeout(session.timer);
-    if (session.moderationTimer) clearInterval(session.moderationTimer);
-    for (const [digest, invite] of liveStudioInvites) if (invite.sessionId === session.sessionId) liveStudioInvites.delete(digest);
-    try { await session.roomService.deleteRoom(session.roomName); }
-    catch (err) { console.warn("Live Studio room cleanup failed:", String(err?.message || err).slice(0, 300)); }
-    await db.ref("auditLog").push({ adminUid: actorUid, actionType: "live_studio_end", timestamp: Date.now(), summary: `Live Studio ended (${String(reason).slice(0, 180)}); room ${session.roomName} removed` }).catch(err => console.error("Live Studio audit write failed:", err.message));
-    console.log(`Live Studio ended: guild=${key}, session=${session.sessionId}, reason=${String(reason).slice(0, 180)}`);
-    return true;
-}
-async function enforceLiveStudioDeniedParticipants(session) {
-    if (!session || liveStudioSessions.get(session.guildId) !== session) return;
-    const voiceSession = adminVoiceSessions.get(session.guildId);
-    let readyStatus = "Ready";
-    try { readyStatus = getVoiceDependencies().voice.VoiceConnectionStatus.Ready; } catch (_) {}
-    const voiceReady = isLiveStudioVoiceBound({ sessionChannelId: session.discordChannelId, voiceChannelId: voiceSession?.channelId,
-        voiceStatus: voiceSession?.connection?.state?.status, readyStatus, expiresAt: session.expiresAt });
-    if (!voiceReady) {
-        session.voiceDisconnectedAt ||= Date.now();
-        // Give Discord voice transport a brief reconnection grace period before ending the invite room.
-        if (Date.now() - session.voiceDisconnectedAt > 15_000) {
-            await endLiveStudioForGuild(session.guildId, "Discord Bot voice connection stayed disconnected", "system");
-            return;
-        }
-    } else {
-        session.voiceDisconnectedAt = 0;
-    }
-    if (!session.deniedIdentities.size && !session.mutedIdentities.size && !session.muteAllActive) return;
-    try {
-        const participants = await session.roomService.listParticipants(session.roomName);
-        const runtime = (session.mutedIdentities.size || session.muteAllActive) ? getLiveKitRuntime() : null;
-        for (const participant of participants || []) {
-            const identity = String(participant.identity || "");
-            if (session.muteAllActive && isGuestStudioIdentity(identity)) session.mutedIdentities.add(identity);
-            if (session.deniedIdentities.has(identity)) {
-                await session.roomService.removeParticipant(session.roomName, identity).catch(() => {});
-                continue;
-            }
-            // Preserve Admin mute across a reconnect: revoke publishing rights while the mute is active.
-            if (session.mutedIdentities.has(identity) && runtime) {
-                for (const track of participant.tracks || []) {
-                    const source = String(track.source ?? "").toLowerCase();
-                    if (source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE) {
-                        await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, true).catch(() => {});
-                    }
-                }
-                await session.roomService.updateParticipant(session.roomName, identity, { permission: {
-                    canPublish: true, canPublishSources: [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
-                    canPublishData: false, canSubscribe: true
-                } }).catch(() => {});
-            }
-        }
-    } catch (err) { console.warn("Live Studio moderation watchdog failed:", String(err?.message || err).slice(0, 300)); }
-}
-function safeStudioParticipant(participant, session) {
-    const metadata = (() => { try { return JSON.parse(participant.metadata || "{}"); } catch (_) { return {}; } })();
-    return {
-        identity: String(participant.identity || "").slice(0, 128),
-        name: normalizeStudioName(participant.name, "Guest"),
-        role: String(metadata.role || "guest") === "host" ? "host" : "guest",
-        discordUserId: /^\d{17,20}$/.test(String(metadata.discordUserId || "")) ? String(metadata.discordUserId) : "",
-        discordUsername: String(metadata.discordUsername || "").slice(0, 80),
-        adminMuted: Boolean(session?.mutedIdentities?.has(String(participant.identity || ""))),
-        tracks: (Array.isArray(participant.tracks) ? participant.tracks : []).slice(0, 10).map(track => ({
-            sid: String(track.sid || "").slice(0, 128), source: String(track.source ?? "").slice(0, 40),
-            type: String(track.type ?? "").slice(0, 40), muted: Boolean(track.muted)
-        }))
-    };
-}
-function getVoiceDependencies() {
-    return { voice: require("@discordjs/voice"), googleTts: require("google-tts-api"), OpusScript: require("opusscript") };
-}
-function sendLiveVoiceJson(socket, data) {
-    if (socket && socket.readyState === WebSocket.OPEN) {
-        try { socket.send(JSON.stringify(data)); } catch (_) {}
-    }
-}
-function stopLiveMicProcess(session) {
-    if (session?.liveInputWatchdog) {
-        clearInterval(session.liveInputWatchdog);
-        session.liveInputWatchdog = null;
-    }
-    const proc = session?.liveProcess;
-    if (!proc) return;
-    session.liveProcess = null;
-    try { if (proc.stdin && !proc.stdin.destroyed && !proc.stdin.writableEnded) proc.stdin.end(); } catch (_) {}
-    const killer = setTimeout(() => { if (proc.exitCode === null && !proc.killed) { try { proc.kill("SIGKILL"); } catch (_) {} } }, 2500);
-    if (typeof killer.unref === "function") killer.unref();
-}
-function closeLiveVoiceSocket(session, code = 1001, reason = "voice session ended") {
-    if (!session) return;
-    const socket = session.liveSocket;
-    session.liveSocket = null;
-    stopLiveMicProcess(session);
-    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-        try { socket.close(code, String(reason).slice(0, 120)); } catch (_) { try { socket.terminate(); } catch (_) {} }
-    }
-}
-async function beginLiveMicStream(socket, session, actorUid, mimeType) {
-    const format = normalizeRecorderMimeType(mimeType);
-    if (!format) throw Object.assign(new Error("Unsupported microphone recording format"), { apiError: "live_voice_unsupported_audio", statusCode: 415 });
-    const { voice } = getVoiceDependencies();
-    if (!session?.connection || session.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Voice connection is not ready"), { apiError: "voice_not_connected", statusCode: 409 });
-    if (session.liveProcess || session.player?.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player is busy"), { apiError: "voice_busy", statusCode: 409 });
-    if (session.liveStartedAt && Date.now() - session.liveStartedAt > LIVE_VOICE_MAX_DURATION_MS) throw Object.assign(new Error("Live voice duration limit reached"), { apiError: "live_voice_duration_limit", statusCode: 429 });
-
-    let proc;
-    let ffmpegStderrTail = "";
-    if (format === "s16le") {
-        // Browser AudioWorklet sends headerless 48 kHz stereo PCM frames directly. Passing these
-        // through avoids FFmpeg dying on fragmented WebM/MediaRecorder input or host codec quirks.
-        proc = createLivePcmAudioProcess();
-    } else {
-        let ffmpegPath = String(process.env.FFMPEG_PATH || "");
-        if (!ffmpegPath) { try { ffmpegPath = require("ffmpeg-static") || ""; } catch (_) {} }
-        if (!ffmpegPath) throw Object.assign(new Error("FFmpeg is not installed"), { apiError: "ffmpeg_unavailable", statusCode: 503 });
-        proc = spawn(ffmpegPath, [
-            "-hide_banner", "-loglevel", "error", "-probesize", "1048576", "-analyzeduration", "1000000",
-            "-f", format, "-i", "pipe:0", "-vn", "-acodec", "pcm_s16le", "-ar", "48000", "-ac", "2", "-f", "s16le", "pipe:1"
-        ], { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
-        proc.stderr?.on("data", chunk => { ffmpegStderrTail = (ffmpegStderrTail + chunk.toString("utf8")).slice(-3000); });
-        proc.stdin?.on("error", err => { if (err?.code !== "EPIPE") console.error("Live voice FFmpeg stdin error:", err?.message || err); });
-    }
-
-    session.liveProcess = proc;
-    session.liveStartedAt = Date.now();
-    session.liveActorUid = actorUid;
-    if (proc.rawPcm) {
-        // The browser must keep sending PCM packets even during silence. The clocked PCM
-        // source pads transient jitter with silence; if packets stop entirely, end the
-        // session with a distinct error rather than leaving a silent voice session open.
-        session.liveInputWatchdog = setInterval(() => {
-            if (session.liveProcess !== proc || !socket.liveStarted || session.liveSocket !== socket || socket.readyState !== WebSocket.OPEN) return;
-            const lastInputAt = Number(proc.lastInputAt || proc.startedAt || session.liveStartedAt || Date.now());
-            const inputIdleMs = Math.max(0, Date.now() - lastInputAt);
-            if (inputIdleMs < 5000) return;
-            const reason = `No microphone PCM packets received for ${inputIdleMs}ms; outputFrames=${proc.outputFrames || 0},underrunFrames=${proc.underrunFrames || 0},droppedInputBytes=${proc.droppedInputBytes || 0}`;
-            proc.failureReason = reason.slice(0, 300);
-            socket.liveFailureNotified = true;
-            console.error("Live voice microphone input stalled:", proc.failureReason, `inputBytes=${proc.liveInputBytes || 0}`);
-            sendLiveVoiceJson(socket, {
-                type: "error",
-                error: "live_voice_input_stalled",
-                diagnostic: { inputBytes: proc.liveInputBytes || 0, inputIdleMs, outputFrames: proc.outputFrames || 0, underrunFrames: proc.underrunFrames || 0, reason: proc.failureReason }
-            });
-            closeLiveVoiceSocket(session, 1011, "microphone PCM input stalled");
-        }, 1000);
-        if (typeof session.liveInputWatchdog.unref === "function") session.liveInputWatchdog.unref();
-    }
-    const resource = voice.createAudioResource(proc.stdout, { inputType: voice.StreamType.Raw, metadata: { adminUid: actorUid, source: "live-admin-microphone" } });
-    session.liveResource = resource;
-    // A live microphone is an unbuffered network source, unlike a local file. The voice
-    // player's default maxMissedFrames=5 can stop/destroy the resource after ~100 ms of
-    // packet jitter, which in turn closes the PCM stream. Give live audio a bounded 1 s
-    // underrun tolerance, while still letting the player's stream-error path fail closed.
-    let playerStateListener = null;
-    const removePlayerStateListener = () => {
-        if (playerStateListener) {
-            session.player.off("stateChange", playerStateListener);
-            playerStateListener = null;
-        }
-    };
-    playerStateListener = (oldState, newState) => {
-        if (oldState.resource !== resource || newState.status !== voice.AudioPlayerStatus.Idle) return;
-        if (!socket.liveStarted || session.liveSocket !== socket) return;
-        const inputIdleMs = Math.max(0, Date.now() - Number(proc.lastInputAt || proc.startedAt || Date.now()));
-        const connectionState = session.connection?.state?.status || "unknown";
-        const playStream = resource.playStream;
-        const reason = `AudioPlayer ${oldState.status}->idle; connection=${connectionState},playStreamDestroyed=${Boolean(playStream?.destroyed)},playStreamEnded=${Boolean(playStream?.readableEnded)},inputIdleMs=${inputIdleMs},outputFrames=${proc.outputFrames || 0},underrunFrames=${proc.underrunFrames || 0},queuedBytes=${proc.stdout?.queuedBytes || 0}`;
-        console.error(`Live voice player stopped (${reason}); inputBytes=${proc.liveInputBytes || 0}`);
-        socket.liveFailureNotified = true;
-        sendLiveVoiceJson(socket, {
-            type: "error",
-            error: "live_voice_player_stopped",
-            diagnostic: { inputBytes: proc.liveInputBytes || 0, inputIdleMs, outputFrames: proc.outputFrames || 0, underrunFrames: proc.underrunFrames || 0, reason }
-        });
-        closeLiveVoiceSocket(session, 1011, "Discord audio player stopped live microphone");
-    };
-    session.player.on("stateChange", playerStateListener);
-    proc.once("close", removePlayerStateListener);
-    proc.once("error", removePlayerStateListener);
-    proc.once("spawn", () => {
-        if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket) { stopLiveMicProcess(session); return; }
-        if (!proc.stdin || proc.stdin.destroyed || !proc.stdin.writable || proc.exitCode !== null) {
-            sendLiveVoiceJson(socket, { type: "error", error: proc.rawPcm ? "live_voice_audio_pipeline_failed" : "live_voice_transcode_failed" });
-            closeLiveVoiceSocket(session, 1011, "microphone audio input is not writable");
-            return;
-        }
-        try {
-            session.player.play(resource);
-            sendLiveVoiceJson(socket, { type: "mic-ready", sampleRate: 48000, channels: 2, mode: proc.rawPcm ? "pcm" : "ffmpeg" });
-        } catch (err) {
-            console.error("Live voice player start failed:", err?.message || err);
-            sendLiveVoiceJson(socket, { type: "error", error: "live_voice_player_failed" });
-            closeLiveVoiceSocket(session, 1011, "microphone player start failed");
-        }
-    });
-    if (proc.rawPcm && proc.stdout && typeof proc.stdout.once === "function") {
-        proc.stdout.once("close", () => {
-            if (!socket.liveStarted || session.liveSocket !== socket) return;
-            const playerState = session.player?.state?.status || "unknown";
-            const connectionState = session.connection?.state?.status || "unknown";
-            const playbackStream = resource.playStream;
-            const resourceState = `playStreamDestroyed=${Boolean(playbackStream?.destroyed)},playStreamEnded=${Boolean(playbackStream?.readableEnded)}`;
-            const ageMs = session.liveStartedAt ? Math.max(0, Date.now() - session.liveStartedAt) : 0;
-            const inputIdleMs = Math.max(0, Date.now() - Number(proc.lastInputAt || proc.startedAt || Date.now()));
-            const context = `player=${playerState},connection=${connectionState},${resourceState},ageMs=${ageMs},inputIdleMs=${inputIdleMs},outputFrames=${proc.outputFrames || 0},underrunFrames=${proc.underrunFrames || 0},queuedBytes=${proc.stdout?.queuedBytes || 0},inputBytes=${proc.liveInputBytes || 0}`;
-            const baseReason = proc.failureReason || "Discord audio output closed before microphone input ended";
-            proc.failureReason = `${baseReason}; ${context}`.slice(0, 300);
-            console.error("Live voice PCM output closed while the session was active:", proc.failureReason);
-        });
-    }
-    proc.once("error", err => {
-        const detail = proc.failureReason || err?.message || "unknown error";
-        console.error(proc.rawPcm ? "Live voice PCM pipeline failed:" : "Live voice FFmpeg spawn failed:", detail);
-        if (session.liveProcess === proc) session.liveProcess = null;
-        socket.liveFailureNotified = true;
-        sendLiveVoiceJson(socket, {
-            type: "error",
-            error: proc.rawPcm ? "live_voice_audio_pipeline_failed" : "ffmpeg_unavailable",
-            ...(proc.rawPcm ? { diagnostic: { inputBytes: proc.liveInputBytes || 0, reason: String(proc.failureReason || err?.code || err?.message || "audio pipeline error").slice(0, 200) } } : {})
-        });
-        closeLiveVoiceSocket(session, 1011, proc.rawPcm ? "microphone PCM pipeline failed" : "microphone transcoder unavailable");
-    });
-    proc.once("close", code => {
-        const endedUnexpectedly = socket.liveStarted && session.liveSocket === socket;
-        if (session.liveProcess === proc) session.liveProcess = null;
-        if (session.liveResource === resource) session.liveResource = null;
-        if (endedUnexpectedly) {
-            socket.liveStarted = false;
-            socket.liveFailureNotified = true;
-            const errorCode = proc.rawPcm
-                ? (code === 0 ? "live_voice_stream_ended" : "live_voice_audio_pipeline_failed")
-                : (code === 0 ? "live_voice_stream_ended" : "live_voice_transcode_failed");
-            const inputBytes = proc.liveInputBytes || 0;
-            const diagnostic = proc.rawPcm ? (proc.failureReason || "direct PCM stream ended without a captured reason") : (ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1600);
-            console.error(`Live voice ${proc.rawPcm ? "PCM stream" : "FFmpeg"} exited unexpectedly (code=${code}, inputBytes=${inputBytes}): ${diagnostic}`);
-            if (socket.readyState === WebSocket.OPEN) {
-                sendLiveVoiceJson(socket, {
-                    type: "error",
-                    error: errorCode,
-                    ...(proc.rawPcm ? { diagnostic: { inputBytes, reason: String(proc.failureReason || "PCM output stream ended unexpectedly").slice(0, 200) } } : {})
-                });
-                try { socket.close(1011, proc.rawPcm ? "microphone PCM stream ended" : "microphone transcoder exited"); } catch (_) { try { socket.terminate(); } catch (_) {} }
-            }
-        } else if (code && code !== 0 && socket.readyState === WebSocket.OPEN && !socket.liveStopping) {
-            console.error(`Live voice ${proc.rawPcm ? "PCM stream" : "FFmpeg"} exited (code=${code}, inputBytes=${proc.liveInputBytes || 0}): ${(proc.rawPcm ? (proc.failureReason || "no internal failure reason captured") : (ffmpegStderrTail || "no stderr output")).replace(/[\r\n]+/g, " ").slice(-1200)}`);
-        }
-    });
-    proc.on("exit", code => {
-        if (code !== null && code !== 0 && session.liveProcess === proc) {
-            console.error(`Live voice ${proc.rawPcm ? "PCM" : "FFmpeg"} process exit code ${code}: ${(ffmpegStderrTail || "no stderr output").replace(/[\r\n]+/g, " ").slice(-1200)}`);
-        }
-    });
-}
-function startLiveDiscordAudioRelay(socket, session, guild) {
-    const { voice, OpusScript } = getVoiceDependencies();
-    const subscriptions = new Map();
-    const connection = session.connection;
-    const onSpeakingStart = userId => {
-        if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket || subscriptions.has(userId)) return;
-        const member = guild.members.cache.get(userId);
-        if (!member || member.user?.bot || userId === client.user?.id) return;
-        let stream;
-        let decoder;
-        try {
-            stream = connection.receiver.subscribe(userId, { end: { behavior: voice.EndBehaviorType.AfterSilence, duration: 650 } });
-            decoder = new OpusScript(48000, 2, OpusScript.Application.VOIP);
-        } catch (err) {
-            console.error("Live voice receive setup failed:", err.message);
-            return;
-        }
-        subscriptions.set(userId, { stream, decoder });
-        sendLiveVoiceJson(socket, { type: "remote-speaking", userId, username: String(member.displayName || member.user.username || "Discord member").slice(0, 80) });
-        stream.on("data", packet => {
-            if (socket.readyState !== WebSocket.OPEN || session.liveSocket !== socket || socket.bufferedAmount > 768 * 1024) return;
-            try {
-                const pcm = decoder.decode(Buffer.from(packet));
-                if (pcm?.length) socket.send(packRemotePcmFrame(userId, Buffer.from(pcm)), { binary: true });
-            } catch (_) { /* An undecodable Discord frame is dropped; no audio is persisted. */ }
-        });
-        let streamCleaned = false;
-        const cleanup = () => {
-            if (streamCleaned) return;
-            streamCleaned = true;
-            if (subscriptions.get(userId)?.stream === stream) subscriptions.delete(userId);
-            try { if (typeof decoder.delete === "function") decoder.delete(); } catch (_) {}
-            sendLiveVoiceJson(socket, { type: "remote-stopped", userId });
-        };
-        stream.once("end", cleanup);
-        stream.once("close", cleanup);
-        stream.once("error", cleanup);
-    };
-    connection.receiver.speaking.on("start", onSpeakingStart);
-    return () => {
-        connection.receiver.speaking.off("start", onSpeakingStart);
-        for (const [userId, item] of subscriptions) {
-            try { item.stream.destroy(); } catch (_) {}
-            try { if (typeof item.decoder.delete === "function") item.decoder.delete(); } catch (_) {}
-            sendLiveVoiceJson(socket, { type: "remote-stopped", userId });
-        }
-        subscriptions.clear();
-    };
-}
-app.post("/api/admin/discord/voice/live-ticket", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-live-ticket", 5, 60_000)) return;
-        const guild = await getReadyAdminGuild();
-        const session = adminVoiceSessions.get(guild.id);
-        const { voice } = getVoiceDependencies();
-        if (!session?.connection || session.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Bot is not connected to voice"), { statusCode: 409, apiError: "voice_not_connected" });
-        if (session.liveSocket && [WebSocket.OPEN, WebSocket.CONNECTING, WebSocket.CLOSING].includes(session.liveSocket.readyState)) throw Object.assign(new Error("A live browser voice session is already active"), { statusCode: 409, apiError: "live_voice_already_active" });
-        const now = Date.now();
-        for (const [key, value] of liveVoiceTickets) if (value.expiresAt <= now) liveVoiceTickets.delete(key);
-        const ticket = crypto.randomBytes(32).toString("base64url");
-        const digest = crypto.createHash("sha256").update(ticket).digest("hex");
-        liveVoiceTickets.set(digest, { uid: actor.uid, guildId: guild.id, expiresAt: now + LIVE_VOICE_TICKET_TTL_MS });
-        return res.json({ ok: true, ticket, expiresInMs: LIVE_VOICE_TICKET_TTL_MS, channelName: session.channelName || "voice channel" });
-    } catch (err) { return adminApiError(res, err, "live_voice_ticket_failed"); }
-});
-app.get("/api/admin/discord/voice/channels", async (req, res) => {
+app.get("/api/admin/db", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    if (!checkCppRateLimit(req, res, "admin-db-read", 300, 60 * 1000)) return;
     try {
         await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-voice-channels", 20, 60000)) return;
-        const guild = await getReadyAdminGuild();
-        const botMember = getBotGuildMember(guild);
-        const channels = [...guild.channels.cache.values()].filter(channel => channel.type === ChannelType.GuildVoice).map(channel => {
-            const permissions = channel.permissionsFor(botMember);
-            const missingPermissions = [];
-            for (const [name, flag] of [["ViewChannel",PermissionFlagsBits.ViewChannel],["Connect",PermissionFlagsBits.Connect],["Speak",PermissionFlagsBits.Speak]]) {
-                if (!permissions?.has(flag)) missingPermissions.push(name);
-            }
-            return { id: channel.id, name: String(channel.name || "Voice channel").slice(0,100), userLimit: channel.userLimit || 0,
-                canJoin: missingPermissions.length === 0, missingPermissions };
-        }).sort((a,b) => a.name.localeCompare(b.name));
-        const active = adminVoiceSessions.get(guild.id);
-        return res.json({ ok: true, channels, connected: Boolean(active?.connection), channelId: active?.channelId || "",
-            speaking: Boolean(active?.player && active.player.state.status !== "idle") });
-    } catch (err) { return adminApiError(res, err, "voice_directory_failed"); }
+        const path = normalizeAdminDbPath(String(req.query.path || ""));
+        if (!path || !adminDbPathReadable(path)) return res.status(403).json({ ok: false, error: "db_path_forbidden" });
+        if (path === ".info/connected") return res.set("Cache-Control", "no-store").json({ ok: true, value: true });
+        const snap = await db.ref(path).once("value");
+        return res.set("Cache-Control", "no-store").json({ ok: true, value: snap.val() });
+    } catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "admin_db_read_failed", message: Number(err.statusCode) === 401 ? "Admin session expired. Sign in again." : "Admin data read failed." }); }
 });
-app.post("/api/admin/discord/voice/join", async (req, res) => {
+app.post("/api/admin/db/batch", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    if (!checkCppRateLimit(req, res, "admin-db-write", 80, 60 * 1000)) return;
+    try { const actor = await verifyAdminApiRequest(req); const result = await commitAdminDbUpdates(req.body?.updates, actor); return res.set("Cache-Control", "no-store").json(result); }
+    catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : Number(err.statusCode) === 409 ? "conflict" : "admin_db_write_failed", message: String(err.message || "Admin data write failed.").slice(0, 220) }); }
+});
+app.put("/api/admin/db", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    if (!checkCppRateLimit(req, res, "admin-db-write", 80, 60 * 1000)) return;
+    try { const actor = await verifyAdminApiRequest(req); const path = normalizeAdminDbPath(req.body?.path); if (!path || !adminDbPathWritable(path)) return res.status(403).json({ ok: false, error: "forbidden" }); const result = await commitAdminDbUpdates({ [path]: req.body?.value ?? null }, actor); return res.set("Cache-Control", "no-store").json(result); }
+    catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "admin_db_write_failed", message: String(err.message || "Admin data write failed.").slice(0, 220) }); }
+});
+app.post("/api/admin/review-transaction", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    if (!checkCppRateLimit(req, res, "admin-transaction-review", 40, 60 * 1000)) return;
     try {
         const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-voice-join", 6, 60000)) return;
-        const channelId = validateDiscordSnowflake(req.body?.channelId);
-        const guild = await getReadyAdminGuild();
-        const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
-        if (!channel || channel.guildId !== guild.id || channel.type !== ChannelType.GuildVoice) throw Object.assign(new Error("Voice channel not found"), {statusCode:404,apiError:"voice_channel_not_found"});
-        const botMember = getBotGuildMember(guild);
-        const permissions = channel.permissionsFor(botMember);
-        if (!permissions?.has(PermissionFlagsBits.ViewChannel) || !permissions?.has(PermissionFlagsBits.Connect) || !permissions?.has(PermissionFlagsBits.Speak)) throw Object.assign(new Error("Bot needs View Channel, Connect and Speak"), {statusCode:403,apiError:"missing_voice_permission"});
-        const { voice } = getVoiceDependencies();
-        const existing = adminVoiceSessions.get(guild.id);
-        if (existing?.connection && existing.channelId === channel.id && existing.connection.state.status === voice.VoiceConnectionStatus.Ready) return res.json({ok:true,connected:true,channelId,channelName:channel.name,alreadyConnected:true});
-        if (existing?.connection) { await endLiveStudioForGuild(guild.id, "Discord voice channel changed", actor.uid); closeLiveVoiceSocket(existing, 1001, "voice channel changed"); existing.player?.stop(true); existing.connection.destroy(); }
-        const player = voice.createAudioPlayer({behaviors:{noSubscriber:voice.NoSubscriberBehavior.Pause,maxMissedFrames:50}});
-        player.on("error", err => console.error("Admin voice player error:", err.message));
-        const connection = voice.joinVoiceChannel({channelId:channel.id,guildId:guild.id,adapterCreator:guild.voiceAdapterCreator,selfDeaf:false,selfMute:false});
-        connection.on("stateChange", (_oldState, newState) => {
-            if (newState.status === voice.VoiceConnectionStatus.Destroyed && adminVoiceSessions.get(guild.id)?.connection === connection) {
-                const ended = adminVoiceSessions.get(guild.id);
-                closeLiveVoiceSocket(ended, 1001, "Discord voice connection ended");
-                ended?.player?.stop(true);
-                adminVoiceSessions.delete(guild.id);
-                endLiveStudioForGuild(guild.id, "Discord bot voice connection destroyed", ended?.connectedBy || "system").catch(err => console.error("Live Studio shutdown after Discord voice disconnect failed:", err.message));
-            }
-        });
-        connection.subscribe(player);
-        try { await voice.entersState(connection,voice.VoiceConnectionStatus.Ready,15000); }
-        catch (_) { connection.destroy(); throw Object.assign(new Error("Voice connection timed out"), {statusCode:502,apiError:"voice_connection_failed"}); }
-        adminVoiceSessions.set(guild.id,{connection,player,channelId:channel.id,channelName:channel.name,connectedAt:Date.now(),connectedBy:actor.uid});
-        await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_join",timestamp:Date.now(),summary:`Bot joined voice channel ${channel.name} (${channel.id})`}).catch(err=>console.error("Voice audit write failed:",err.message));
-        return res.json({ok:true,connected:true,channelId,channelName:channel.name});
-    } catch (err) { return adminApiError(res,err,"voice_join_failed"); }
-});
-app.post("/api/admin/discord/voice/leave", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req,res,"admin-discord-voice-leave",10,60000)) return;
-        const guild = await getReadyAdminGuild();
-        const current = adminVoiceSessions.get(guild.id);
-        if (!current?.connection) return res.json({ok:true,connected:false,alreadyDisconnected:true});
-        await endLiveStudioForGuild(guild.id, "Admin ended Discord voice session", actor.uid);
-        closeLiveVoiceSocket(current, 1001, "Admin ended voice session");
-        current.player?.stop(true); current.connection.destroy(); adminVoiceSessions.delete(guild.id);
-        await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_leave",timestamp:Date.now(),summary:`Bot left voice channel ${current.channelName || current.channelId}`}).catch(err=>console.error("Voice audit write failed:",err.message));
-        return res.json({ok:true,connected:false});
-    } catch (err) { return adminApiError(res,err,"voice_leave_failed"); }
-});
-app.post("/api/admin/discord/voice/speak", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req,res,"admin-discord-voice-speak",8,60000)) return;
-        const text = sanitizeVoiceSpeech(req.body?.text);
-        if (!text) throw Object.assign(new Error("Speech text is empty"),{statusCode:400,apiError:"invalid_speech_text"});
-        const guild = await getReadyAdminGuild();
-        const session = adminVoiceSessions.get(guild.id);
-        if (!session?.connection || !session?.player) throw Object.assign(new Error("Bot not in voice"),{statusCode:409,apiError:"voice_not_connected"});
-        const { voice, googleTts } = getVoiceDependencies();
-        if (session.player.state.status !== voice.AudioPlayerStatus.Idle) throw Object.assign(new Error("Voice player busy"),{statusCode:409,apiError:"voice_busy"});
-        const audioUrl = googleTts.getAudioUrl(text,{lang:"bn",slow:false,host:"https://translate.google.com"});
-        const response = await fetch(audioUrl,{signal:AbortSignal.timeout(12000),headers:{"User-Agent":"RKBACKLES-AdminVoice/1.5.13"}});
-        if (!response.ok || !response.body) throw Object.assign(new Error("TTS provider failed"),{statusCode:502,apiError:"tts_provider_failed"});
-        const resource = voice.createAudioResource(Readable.fromWeb(response.body),{inputType:voice.StreamType.Arbitrary,metadata:{adminUid:actor.uid,queuedAt:Date.now()}});
-        session.player.play(resource);
-        await db.ref("auditLog").push({adminUid:actor.uid,actionType:"discord_voice_speak",timestamp:Date.now(),summary:`Admin requested Bengali voice message (${text.length} characters) in ${session.channelName || session.channelId}`}).catch(err=>console.error("Voice audit write failed:",err.message));
-        return res.json({ok:true,speaking:true,characterCount:text.length,channelName:session.channelName || session.channelId});
-    } catch (err) { return adminApiError(res,err,"voice_speak_failed"); }
-});
-
-// Discord voice-member moderation. This never bypasses Discord permissions: the Bot needs Mute Members / Move Members.
-app.post("/api/admin/discord/voice/members", async (req, res) => {
-    try {
-        await verifyAdminApiRequest(req);
-        const guild = await getReadyAdminGuild();
-        const session = adminVoiceSessions.get(guild.id);
-        const { voice } = getVoiceDependencies();
-        const connected = Boolean(session?.connection && session.connection.state.status === voice.VoiceConnectionStatus.Ready);
-        if (!connected) return res.json({ ok: true, connected: false, channelName: "", members: [] });
-        const botMember = getBotGuildMember(guild);
-        const canMute = Boolean(botMember?.permissions?.has(PermissionFlagsBits.MuteMembers));
-        const canDisconnect = Boolean(botMember?.permissions?.has(PermissionFlagsBits.MoveMembers));
-        const members = [...guild.voiceStates.cache.values()].filter(state => state.channelId === session.channelId && state.member).map(state => {
-            const member = state.member;
-            const protectedTarget = isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId,
-                isAdministrator: member.permissions?.has(PermissionFlagsBits.Administrator) || Boolean(getConfiguredRoleId("admin") && member.roles?.cache?.has(getConfiguredRoleId("admin"))),
-                targetHighestRolePosition: member.roles?.highest?.position, botHighestRolePosition: botMember?.roles?.highest?.position });
-            return { id: member.id, name: normalizeStudioName(member.displayName || member.user?.username || member.id), username: String(member.user?.username || "").slice(0, 80),
-                muted: Boolean(state.serverMute), deafened: Boolean(state.serverDeaf), isBot: Boolean(member.user?.bot), protectedTarget,
-                canMute: canMute && !protectedTarget && !member.user?.bot, canDisconnect: canDisconnect && !protectedTarget && !member.user?.bot };
-        }).sort((a,b)=>a.name.localeCompare(b.name)).slice(0,200);
-        return res.json({ ok: true, connected: true, channelId: session.channelId, channelName: session.channelName || "Voice channel", canMute, canDisconnect, members });
-    } catch (err) { return adminApiError(res, err, "voice_members_failed"); }
-});
-app.post("/api/admin/discord/voice/member-action", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-discord-voice-member-action", 20, 60_000)) return;
-        const userId = validateDiscordSnowflake(req.body?.userId);
-        const action = String(req.body?.action || "").toLowerCase();
-        if (!userId || !["mute", "unmute", "disconnect"].includes(action)) throw Object.assign(new Error("Invalid member action"), { statusCode: 400, apiError: "invalid_voice_member_action" });
-        const guild = await getReadyAdminGuild();
-        const member = await guild.members.fetch(userId).catch(() => null);
-        if (!member || !member.voice?.channelId) throw Object.assign(new Error("Member is not currently in a Discord voice channel"), { statusCode: 404, apiError: "voice_member_not_found" });
-        if (isProtectedDiscordTarget({ targetId: member.id, ownerId: guild.ownerId,
-            isAdministrator: member.permissions.has(PermissionFlagsBits.Administrator) || Boolean(getConfiguredRoleId("admin") && member.roles.cache.has(getConfiguredRoleId("admin"))),
-            targetHighestRolePosition: member.roles.highest.position, botHighestRolePosition: getBotGuildMember(guild).roles.highest.position }) || member.user.bot) {
-            throw Object.assign(new Error("Protected voice moderation target"), { statusCode: 403, apiError: "protected_voice_target" });
-        }
-        const botMember = getBotGuildMember(guild);
-        if (["mute", "unmute"].includes(action) && !botMember.permissions.has(PermissionFlagsBits.MuteMembers)) throw Object.assign(new Error("Bot needs Mute Members"), { statusCode: 403, apiError: "missing_mute_members_permission" });
-        if (action === "disconnect" && !botMember.permissions.has(PermissionFlagsBits.MoveMembers)) throw Object.assign(new Error("Bot needs Move Members"), { statusCode: 403, apiError: "missing_move_members_permission" });
-        const description = action === "disconnect" ? "disconnect from voice" : `${action} in voice`;
-        if (action === "disconnect") await member.voice.disconnect(`Admin panel by Firebase UID ${actor.uid}: ${description}`);
-        else await member.voice.setMute(action === "mute", `Admin panel by Firebase UID ${actor.uid}: ${description}`);
-        const actualChannel = member.voice?.channel;
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: `discord_voice_member_${action}`, timestamp: Date.now(), summary: `${action} voice member ${member.user?.tag || member.id} (${member.id}) in ${actualChannel?.name || member.voice?.channelId || "voice channel"}` }).catch(err => console.error("Voice member action audit write failed:", err.message));
-        return res.json({ ok: true, userId, action, channelId: member.voice?.channelId || null, name: normalizeStudioName(member.displayName || member.user?.username || member.id) });
-    } catch (err) { return adminApiError(res, err, "voice_member_action_failed"); }
-});
-
-// Browser-based Live Studio is a separate WebRTC room (LiveKit), because the official Discord Bot API does not provide bot screen-sharing.
-// Start/invite/moderation routes are Admin-only. Guest invite codes are random, hashed, single-use, and session-bound.
-// Keep user-facing pages deployed beside index.js in ./public; an explicit diagnostic is returned if a file is missing.
-const PUBLIC_PAGES_DIR = require("path").join(__dirname, "public");
-function sendLiveStudioPublicPage(res, filename, routeName) {
-    const filePath = require("path").join(PUBLIC_PAGES_DIR, filename);
-    res.set({ "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer" });
-    if (!fs.existsSync(filePath)) {
-        console.error(`Live Studio public page missing for ${routeName}: ${filePath}`);
-        return res.status(503).type("text/plain; charset=utf-8").send(
-            `RKBACKLES page asset missing (${filename}).
-
-The backend route is installed, but the required public/${filename} file is not present in this Render deployment. Deploy the v1.5.27 Main Bot package with its public/ folder beside index.js at the service root.`
-        );
-    }
-    return res.sendFile(filePath, (err) => {
-        if (!err || res.headersSent) return;
-        console.error(`Live Studio public page send failed for ${routeName}:`, String(err.message || err).slice(0, 300));
-        if (!res.headersSent) res.status(err.statusCode === 404 ? 503 : 500).type("text/plain; charset=utf-8").send(
-            `RKBACKLES could not serve ${filename}. Check the deployed public/ folder and Render logs.`
-        );
-    });
-}
-app.get("/live-room", (req, res) => sendLiveStudioPublicPage(res, "live-room.html", "/live-room"));
-// A local-only browser capture preview for users who want to manually publish through
-// Discord's official desktop Share Screen / Go Live UI. The page does not upload media.
-app.get("/discord-share-studio", (req, res) => sendLiveStudioPublicPage(res, "discord-share-studio.html", "/discord-share-studio"));
-// Public, non-sensitive route/asset check. This lets an admin confirm that Render deployed
-// the source and both HTML files together; it exposes no tokens, invite codes, or credentials.
-app.get("/api/live-studio/route-health", (req, res) => {
-    const pages = {
-        liveRoom: fs.existsSync(require("path").join(PUBLIC_PAGES_DIR, "live-room.html")),
-        discordShareStudio: fs.existsSync(require("path").join(PUBLIC_PAGES_DIR, "discord-share-studio.html"))
-    };
-    return res.set("Cache-Control", "no-store").json({ ok: true, service: "rkbackles", version: require("./package.json").version,
-        routes: { liveRoom: "/live-room", discordShareStudio: "/discord-share-studio" }, pages,
-        ready: pages.liveRoom && pages.discordShareStudio });
-});
-app.post("/api/admin/live-studio/status", async (req, res) => {
-    try {
-        await verifyAdminApiRequest(req);
-        const guild = await getReadyAdminGuild();
-        const { voice } = getVoiceDependencies();
-        const botVoice = adminVoiceSessions.get(guild.id);
-        const botConnected = Boolean(botVoice?.connection && botVoice.connection.state.status === voice.VoiceConnectionStatus.Ready);
-        let session = liveStudioSessions.get(guild.id);
-        if (session && (!botConnected || session.discordChannelId !== botVoice.channelId || session.expiresAt <= Date.now())) {
-            await endLiveStudioForGuild(guild.id, "Bot voice disconnected or session expired", "system");
-            session = null;
-        }
-        const configuration = inspectLiveKitConfiguration();
-        if (!session) return res.json({ ok: true, configured: configuration.configured, configuration, active: false, botConnected, botChannelName: botVoice?.channelName || "" });
-        const participants = await session.roomService.listParticipants(session.roomName).catch(() => []);
-        return res.json({ ok: true, configured: configuration.configured, configuration, active: true, sessionId: session.sessionId, roomName: session.roomName, channelName: session.discordChannelName,
-            discordChannelName: session.discordChannelName, startedAt: session.startedAt, expiresAt: session.expiresAt, participantCount: participants.length, botConnected: true });
-    } catch (err) { return adminApiError(res, err, "live_studio_status_failed"); }
-});
-app.post("/api/admin/live-studio/start", async (req, res) => {
-    // Track the stage so an unexpected 502 never hides the actual backend failure.
-    let stage = "admin_authorization";
-    let newlyCreatedSessionGuildId = null;
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        stage = "rate_limit";
-        if (!checkCppRateLimit(req, res, "admin-live-studio-start", 6, 60_000)) return;
-        stage = "resolve_discord_guild";
-        const guild = await getReadyAdminGuild();
-        stage = "check_discord_voice";
-        const voiceSession = adminVoiceSessions.get(guild.id);
-        const { voice } = getVoiceDependencies();
-        if (!voiceSession?.connection || voiceSession.connection.state.status !== voice.VoiceConnectionStatus.Ready) throw Object.assign(new Error("Bot must be connected to Discord voice first"), { statusCode: 409, apiError: "voice_not_connected" });
-        stage = "initialize_livekit_client";
-        const runtime = getLiveKitRuntime();
-        let session = liveStudioSessions.get(guild.id);
-        if (session && (session.discordChannelId !== voiceSession.channelId || session.expiresAt <= Date.now())) { await endLiveStudioForGuild(guild.id, "replaced stale session", actor.uid); session = null; }
-        if (session && session.ownerUid !== actor.uid) throw Object.assign(new Error("A Live Studio is already active"), { statusCode: 409, apiError: "live_studio_already_active" });
-        if (!session) {
-            const sessionId = crypto.randomBytes(12).toString("base64url");
-            const roomName = `rkbs_${guild.id}_${crypto.randomBytes(7).toString("hex")}`;
-            stage = "create_livekit_room";
-            try {
-                await runtime.roomService.createRoom({ name: roomName, emptyTimeout: 60, maxParticipants: LIVE_STUDIO_MAX_PARTICIPANTS, metadata: JSON.stringify({ app: "RKBACKLES", sessionId }) });
-            } catch (providerErr) {
-                const providerStatus = Number(providerErr?.status || providerErr?.statusCode || providerErr?.response?.status) || 0;
-                const providerCode = String(providerErr?.code || providerErr?.name || "LiveKitError").slice(0, 100);
-                const providerMessage = redactLiveStudioDiagnostic(providerErr?.message || "unknown provider error");
-                console.error("LiveKit room creation failed:", JSON.stringify({ stage, status: providerStatus, code: providerCode, message: providerMessage }));
-                if ([401, 403].includes(providerStatus) || /unauthori[sz]ed|invalid.*(api.?key|secret|signature)|credential|permission denied/i.test(providerMessage)) {
-                    throw Object.assign(new Error("LiveKit rejected the API key/secret"), { statusCode: 502, apiError: "live_studio_credentials_rejected" });
-                }
-                if (/ENOTFOUND|ECONN|timeout|fetch failed|network|socket hang up/i.test(providerMessage) || /ENOTFOUND|ECONN|ETIMEDOUT|EAI_AGAIN/.test(providerCode)) {
-                    throw Object.assign(new Error("Bot host cannot reach LiveKit"), { statusCode: 502, apiError: "live_studio_provider_unreachable" });
-                }
-                throw Object.assign(new Error("LiveKit room creation failed"), { statusCode: 502, apiError: "live_studio_provider_failed" });
-            }
-            session = { sessionId, guildId: guild.id, roomName, roomService: runtime.roomService, ownerUid: actor.uid, discordChannelId: voiceSession.channelId,
-                discordChannelName: voiceSession.channelName || "Discord voice", startedAt: Date.now(), expiresAt: Date.now() + LIVE_STUDIO_MAX_DURATION_MS,
-                hostIdentity: `host_${crypto.createHash("sha256").update(actor.uid).digest("hex").slice(0, 12)}`, deniedIdentities: new Set(), mutedIdentities: new Set(), muteAllActive: false, endedAt: 0 };
-            liveStudioSessions.set(guild.id, session);
-            newlyCreatedSessionGuildId = guild.id;
-            session.timer = setTimeout(() => endLiveStudioForGuild(guild.id, "maximum session duration reached", "system").catch(() => {}), LIVE_STUDIO_MAX_DURATION_MS);
-            if (typeof session.timer.unref === "function") session.timer.unref();
-            session.moderationTimer = setInterval(() => enforceLiveStudioDeniedParticipants(session).catch(() => {}), 2500);
-            if (typeof session.moderationTimer.unref === "function") session.moderationTimer.unref();
-            await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_start", timestamp: Date.now(), summary: `Live Studio started for Discord voice channel ${session.discordChannelName}; browser media is relayed live and not stored` }).catch(err => console.error("Live Studio audit write failed:", err.message));
-        }
-        stage = "sign_host_access_token";
-        let access;
-        try {
-            access = await studioAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host");
-        } catch (tokenErr) {
-            const safeMessage = redactLiveStudioDiagnostic(tokenErr?.message || "unknown token signing error");
-            console.error("Live Studio host token generation failed:", JSON.stringify({ stage, name: String(tokenErr?.name || "Error").slice(0, 80), code: String(tokenErr?.code || "").slice(0, 80), message: safeMessage }));
-            throw Object.assign(new Error("LiveKit host access token could not be signed"), { statusCode: 502, apiError: "live_studio_token_failed" });
-        }
-        newlyCreatedSessionGuildId = null; // Leave a healthy session running after successfully issuing its token.
-        return res.json({ ok: true, active: true, sessionId: session.sessionId, roomName: session.roomName, channelName: session.discordChannelName,
-            expiresAt: session.expiresAt, identity: session.hostIdentity, role: "host", ...access });
-    } catch (err) {
-        const statusCode = Number(err?.statusCode) || 502;
-        const safeMessage = redactLiveStudioDiagnostic(err?.message || "unknown error");
-        if (statusCode >= 500) {
-            console.error("Live Studio start diagnostic:", JSON.stringify({ stage, statusCode, apiError: String(err?.apiError || "live_studio_start_failed").slice(0, 100),
-                name: String(err?.name || "Error").slice(0, 80), code: String(err?.code || "").slice(0, 80), message: safeMessage }));
-        }
-        if (newlyCreatedSessionGuildId) {
-            await endLiveStudioForGuild(newlyCreatedSessionGuildId, `Start failed during ${stage}`, "system").catch(cleanupErr => {
-                console.error("Live Studio failed-start cleanup failed:", redactLiveStudioDiagnostic(cleanupErr?.message || cleanupErr));
-            });
-        }
-        const responseError = err?.apiError ? err : Object.assign(err instanceof Error ? err : new Error("Live Studio start failed"), {
-            statusCode,
-            apiError: statusCode >= 500 && stage === "sign_host_access_token" ? "live_studio_token_failed" : "live_studio_start_failed"
-        });
-        return adminApiError(res, responseError, "live_studio_start_failed");
-    }
-});
-app.post("/api/admin/live-studio/invite", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-live-studio-invite", 30, 60_000)) return;
-        const guild = await getReadyAdminGuild();
-        const session = studioSessionForGuild(guild.id);
-        if (!session) throw Object.assign(new Error("Start Live Studio while Bot is joined to voice"), { statusCode: 409, apiError: "live_studio_not_active" });
-        if (session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can invite participants"), { statusCode: 403, apiError: "forbidden" });
+        const txnId = String(req.body?.txnId || "").trim();
+        const decision = String(req.body?.decision || "");
+        if (!validRtdbSegment(txnId, 80) || !["approve", "reject"].includes(decision)) return res.status(400).json({ ok: false, error: "invalid_review_request" });
         const now = Date.now();
-        for (const [digest, item] of liveStudioInvites) if (item.expiresAt <= now || !liveStudioSessions.has(item.guildId)) liveStudioInvites.delete(digest);
-        if (liveStudioInvites.size >= 2000) throw Object.assign(new Error("Too many pending invitations"), { statusCode: 429, apiError: "live_studio_invite_limit" });
-        const code = crypto.randomBytes(32).toString("base64url");
-        const digest = studioInviteDigest(code);
-        liveStudioInvites.set(digest, { sessionId: session.sessionId, guildId: guild.id, expiresAt: Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt), createdBy: actor.uid });
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_invite", timestamp: Date.now(), summary: `Single-use Live Studio invitation issued; room ${session.roomName}; expires in ${Math.floor(LIVE_STUDIO_INVITE_TTL_MS / 60000)} minutes` }).catch(err => console.error("Live Studio audit write failed:", err.message));
-        return res.json({ ok: true, inviteCode: code, expiresAt: Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt), sessionId: session.sessionId });
-    } catch (err) { return adminApiError(res, err, "live_studio_invite_failed"); }
+        const ref = db.ref(`transactions/${txnId}`);
+        const result = await ref.transaction(cur => {
+            if (!cur || cur.used === true) return;
+            const status = String(cur.verificationStatus || "");
+            const source = String(cur.verificationSource || "");
+            if (decision === "approve") {
+                if (!["evidence_matched", "pending_review", "verified"].includes(status)) return;
+                if (!["reader_notification_evidence", "trusted_reader_notification", "", "manual_admin_review"].includes(source)) return;
+                return { ...cur, verificationStatus: "verified", verificationSource: "manual_admin_review", reviewedBy: actor.uid, reviewedAt: now, verifiedAt: now };
+            }
+            if (!["evidence_matched", "pending_review"].includes(status)) return;
+            return { ...cur, verificationStatus: "rejected", verificationSource: "manual_admin_review", reviewedBy: actor.uid, reviewedAt: now, reviewReason: "Admin rejected after external history review" };
+        }, undefined, false);
+        if (!result.committed) return res.status(409).json({ ok: false, error: "not_reviewable", message: "Record changed, was already used, or is not reviewable." });
+        const key = db.ref("auditLog").push().key;
+        const entry = { adminUid: actor.uid, actionType: decision === "approve" ? "payment_manual_review_approved" : "payment_manual_review_rejected", timestamp: now, summary: `TxnID ${txnId} ${decision === "approve" ? "manually verified" : "rejected"} after external provider-history review.` };
+        await db.ref().update({ [`auditLog/${key}`]: entry, [`adminActions/${key}`]: entry });
+        return res.set("Cache-Control", "no-store").json({ ok: true, transaction: result.snapshot.val() });
+    } catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: "transaction_review_failed", message: String(err.message || "Transaction review failed.").slice(0, 220) }); }
 });
-app.post("/api/admin/live-studio/watch-link", async (req, res) => {
+app.post("/api/admin/decide-coupon-request", async (req, res) => {
+    if (!requireAdminPanelOrigin(req, res)) return;
+    if (!checkCppRateLimit(req, res, "admin-coupon-review", 40, 60 * 1000)) return;
     try {
         const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-live-studio-watch-link", 12, 60_000)) return;
-        const guild = await getReadyAdminGuild();
-        const session = studioSessionForGuild(guild.id);
-        if (!session) throw Object.assign(new Error("Start Live Studio while Bot is joined to voice"), { statusCode: 409, apiError: "live_studio_not_active" });
-        if (session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can create participant links"), { statusCode: 403, apiError: "forbidden" });
+        const requestId = String(req.body?.requestId || "").trim();
+        const approve = req.body?.approve === true;
+        if (!validRtdbSegment(requestId, 128)) return res.status(400).json({ ok: false, error: "invalid_coupon_request" });
+        let code = "";
+        if (approve) {
+            const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            for (let attempt = 0; attempt < 12; attempt++) {
+                code = "RK" + Array.from(crypto.randomBytes(5)).map(v => alphabet[v % alphabet.length]).join("");
+                const exists = await db.ref(`coupons/${code}`).once("value");
+                if (!exists.exists()) break;
+                code = "";
+            }
+            if (!code) return res.status(503).json({ ok: false, error: "coupon_code_unavailable" });
+        }
         const now = Date.now();
-        for (const [digest, item] of liveStudioInvites) if (item.expiresAt <= now || !liveStudioSessions.has(item.guildId)) liveStudioInvites.delete(digest);
-        if (liveStudioInvites.size >= 2000) throw Object.assign(new Error("Too many pending invitations"), { statusCode: 429, apiError: "live_studio_invite_limit" });
-        const code = crypto.randomBytes(32).toString("base64url");
-        const digest = studioInviteDigest(code);
-        const expiresAt = Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt);
-        // This is a short-lived, capped multi-use guest link: every joined member can speak and share their own screen.
-        const maxUses = Math.max(1, Math.min(20, LIVE_STUDIO_MAX_PARTICIPANTS - 1));
-        liveStudioInvites.set(digest, { sessionId: session.sessionId, guildId: guild.id, expiresAt, createdBy: actor.uid,
-            role: "guest", useLimit: maxUses, uses: 0, kind: "participant" });
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_participant_link", timestamp: Date.now(), summary: `Short-lived multi-use Live Studio participant link issued for room ${session.roomName}; up to ${maxUses} participants; mic + screen share enabled after Discord login` }).catch(err => console.error("Live Studio participant-link audit write failed:", err.message));
-        return res.json({ ok: true, inviteCode: code, expiresAt, sessionId: session.sessionId, maxUses, role: "guest", canPublish: true, capabilities: ["microphone", "screen_share", "screen_share_audio"] });
-    } catch (err) { return adminApiError(res, err, "live_studio_invite_failed"); }
+        const ref = db.ref(`couponRequests/${requestId}`);
+        const result = await ref.transaction(cur => {
+            if (!cur || cur.status !== "pending") return;
+            return { ...cur, status: approve ? "approved" : "rejected", ...(approve ? { couponCode: code, approvedBy: actor.uid, approvedAt: now } : { rejectedBy: actor.uid, rejectedAt: now }), updatedAt: now };
+        }, undefined, false);
+        if (!result.committed) return res.status(409).json({ ok: false, error: "coupon_request_not_pending", message: "This request is no longer pending. Refresh and try again." });
+        const key = db.ref("auditLog").push().key;
+        const entry = { adminUid: actor.uid, actionType: approve ? "coupon_request_approved" : "coupon_request_rejected", timestamp: now, summary: `Coupon request ${requestId} ${approve ? "approved" : "rejected"}${approve ? `; code ${code}` : ""}.` };
+        await db.ref().update({ [`auditLog/${key}`]: entry, [`adminActions/${key}`]: entry });
+        return res.set("Cache-Control", "no-store").json({ ok: true, request: result.snapshot.val(), couponCode: code || null });
+    } catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: "coupon_review_failed", message: String(err.message || "Coupon review failed.").slice(0, 220) }); }
 });
-
-// Discord OAuth is required for room admission so moderator powers are bound to a real Discord account,
-// rather than a user-supplied ID or an invite link. Client secret stays on the private Render service.
-function studioOAuthConfig() {
-    return {
-        clientId: String(process.env.LIVE_STUDIO_OAUTH_CLIENT_ID || "").trim(),
-        clientSecret: String(process.env.LIVE_STUDIO_OAUTH_CLIENT_SECRET || "").trim(),
-        redirectUri: String(process.env.LIVE_STUDIO_OAUTH_REDIRECT_URI || "").trim()
-    };
-}
-function studioCookie(name, value, maxAgeSeconds, path = "/") {
-    const encoded = encodeURIComponent(String(value || ""));
-    return `${name}=${encoded}; Path=${path}; HttpOnly; Secure; SameSite=Lax; Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`;
-}
-function studioSessionDigest(value) {
-    return crypto.createHash("sha256").update(String(value || "")).digest("hex");
-}
-function getLiveStudioOAuthSession(req) {
-    const raw = parseCookieHeader(req.headers.cookie || "")[LIVE_STUDIO_OAUTH_SESSION_COOKIE];
-    if (!raw || !/^[A-Za-z0-9_-]{40,60}$/.test(raw)) return null;
-    const key = studioSessionDigest(raw);
-    const session = liveStudioOAuthSessions.get(key);
-    if (!session || session.expiresAt <= Date.now() || session.guildId !== ALLOWED_GUILD_ID) {
-        liveStudioOAuthSessions.delete(key);
-        return null;
-    }
-    return { ...session, sessionKey: key };
-}
-function cleanupLiveStudioOAuthState() {
-    const now = Date.now();
-    for (const [state, value] of liveStudioOAuthStates) if (value.expiresAt <= now) liveStudioOAuthStates.delete(state);
-    for (const [digest, value] of liveStudioOAuthSessions) if (value.expiresAt <= now) liveStudioOAuthSessions.delete(digest);
-}
-async function fetchLiveStudioDiscordMember(userId) {
-    const guild = await getReadyAdminGuild();
-    const member = await guild.members.fetch({ user: String(userId), force: true }).catch(() => null);
-    if (!member) throw Object.assign(new Error("Discord account is no longer a member of the configured server"), { statusCode: 403, apiError: "live_studio_discord_guild_required" });
-    const roleIds = [...member.roles.cache.keys()].filter(roleId => String(roleId) !== String(guild.id));
-    const canManage = isLiveStudioModerator({
-        userId: member.id,
-        guildOwnerId: guild.ownerId,
-        isAdministrator: Boolean(member.permissions?.has(PermissionFlagsBits.Administrator)),
-        roleIds,
-        adminUserIds: parseDiscordIdSet(process.env.LIVE_STUDIO_ADMIN_USER_IDS),
-        adminRoleIds: parseDiscordIdSet(process.env.LIVE_STUDIO_ADMIN_ROLE_IDS)
-    });
-    return { guild, member, roleIds, canManage };
-}
-async function requireLiveStudioRoomModerator(req) {
-    const auth = getLiveStudioOAuthSession(req);
-    if (!auth) throw Object.assign(new Error("Sign in with Discord first"), { statusCode: 401, apiError: "live_studio_discord_login_required" });
-    const access = await fetchLiveStudioDiscordMember(auth.userId);
-    if (!access.canManage) throw Object.assign(new Error("Your Discord user ID or roles are not allowed to manage this Live Studio room"), { statusCode: 403, apiError: "live_studio_moderator_required" });
-    const session = studioSessionForGuild(access.guild.id);
-    if (!session || session.sessionId !== String(req.body?.sessionId || session.sessionId)) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
-    return { ...access, auth, session };
-}
-
-app.get("/api/live-studio/auth/config", (req, res) => {
-    return res.set("Cache-Control", "no-store").json({ ok: true, configured: isDiscordOAuthConfigured(process.env), loginPath: "/api/live-studio/auth/start" });
-});
-app.get("/api/live-studio/auth/start", (req, res) => {
-    if (!checkCppRateLimit(req, res, "live-studio-oauth-start", 12, 60_000)) return;
-    cleanupLiveStudioOAuthState();
-    const config = studioOAuthConfig();
-    if (!isDiscordOAuthConfigured(process.env)) return res.status(503).json({ ok: false, error: "live_studio_discord_oauth_not_configured", message: "Render-এ LIVE_STUDIO_OAUTH_CLIENT_ID, LIVE_STUDIO_OAUTH_CLIENT_SECRET এবং LIVE_STUDIO_OAUTH_REDIRECT_URI সেট করতে হবে।" });
-    const inviteCode = String(req.query.invite || "");
-    if (!isValidStudioInviteCode(inviteCode)) return res.status(400).json({ ok: false, error: "live_studio_invite_invalid" });
-    const digest = studioInviteDigest(inviteCode);
-    const invite = liveStudioInvites.get(digest);
-    if (!invite || invite.expiresAt <= Date.now()) return res.status(410).json({ ok: false, error: "live_studio_invite_expired" });
-    const state = crypto.randomBytes(32).toString("base64url");
-    liveStudioOAuthStates.set(state, { expiresAt: Date.now() + LIVE_STUDIO_OAUTH_STATE_TTL_MS, inviteCode, returnTo: `/live-room?invite=${encodeURIComponent(inviteCode)}` });
-    res.setHeader("Set-Cookie", studioCookie(LIVE_STUDIO_OAUTH_STATE_COOKIE, state, Math.ceil(LIVE_STUDIO_OAUTH_STATE_TTL_MS / 1000), "/api/live-studio/auth"));
-    const authorizationUrl = buildDiscordOAuthAuthorizeUrl({ clientId: config.clientId, redirectUri: config.redirectUri, state });
-    return res.redirect(302, authorizationUrl);
-});
-app.get("/api/live-studio/auth/callback", async (req, res) => {
-    cleanupLiveStudioOAuthState();
-    const queryState = String(req.query.state || "");
-    const cookieState = parseCookieHeader(req.headers.cookie || "")[LIVE_STUDIO_OAUTH_STATE_COOKIE] || "";
-    const pending = liveStudioOAuthStates.get(queryState);
-    liveStudioOAuthStates.delete(queryState);
-    const clearStateCookie = studioCookie(LIVE_STUDIO_OAUTH_STATE_COOKIE, "", 0, "/api/live-studio/auth");
-    if (!queryState || !cookieState || cookieState !== queryState || !pending || pending.expiresAt <= Date.now()) {
-        res.setHeader("Set-Cookie", clearStateCookie);
-        return res.status(400).type("text/plain; charset=utf-8").send("Discord sign-in state expired or did not match. Return to the invitation and try again.");
-    }
-    if (req.query.error) {
-        res.setHeader("Set-Cookie", clearStateCookie);
-        return res.status(403).type("text/plain; charset=utf-8").send("Discord sign-in was cancelled. Return to the invitation and try again.");
-    }
-    const config = studioOAuthConfig();
-    try {
-        const tokenResponse = await fetch("https://discord.com/api/v10/oauth2/token", {
-            method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json" },
-            body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret, grant_type: "authorization_code", code: String(req.query.code || ""), redirect_uri: config.redirectUri }),
-            signal: AbortSignal.timeout(12000)
-        });
-        const tokenData = await tokenResponse.json().catch(() => ({}));
-        if (!tokenResponse.ok || !tokenData.access_token) throw Object.assign(new Error("Discord token exchange failed"), { apiError: "live_studio_discord_oauth_failed" });
-        const userResponse = await fetch("https://discord.com/api/v10/users/@me", { headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" }, signal: AbortSignal.timeout(12000) });
-        const user = await userResponse.json().catch(() => ({}));
-        if (!userResponse.ok || !/^\d{17,20}$/.test(String(user.id || ""))) throw Object.assign(new Error("Discord profile verification failed"), { apiError: "live_studio_discord_oauth_failed" });
-        const memberResponse = await fetch(`https://discord.com/api/v10/users/@me/guilds/${ALLOWED_GUILD_ID}/member`, { headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" }, signal: AbortSignal.timeout(12000) });
-        if (!memberResponse.ok) throw Object.assign(new Error("Join the configured Discord server before entering Live Studio"), { statusCode: 403, apiError: "live_studio_discord_guild_required" });
-        const rawSession = crypto.randomBytes(32).toString("base64url");
-        const digest = studioSessionDigest(rawSession);
-        liveStudioOAuthSessions.set(digest, { userId: String(user.id), username: String(user.username || "Discord user").slice(0, 80), globalName: String(user.global_name || "").slice(0, 80), guildId: ALLOWED_GUILD_ID, createdAt: Date.now(), expiresAt: Date.now() + LIVE_STUDIO_OAUTH_SESSION_TTL_MS });
-        res.setHeader("Set-Cookie", [clearStateCookie, studioCookie(LIVE_STUDIO_OAUTH_SESSION_COOKIE, rawSession, Math.ceil(LIVE_STUDIO_OAUTH_SESSION_TTL_MS / 1000), "/")]);
-        return res.redirect(302, pending.returnTo);
-    } catch (err) {
-        console.warn("Live Studio Discord OAuth failed:", String(err?.apiError || err?.message || "oauth_error").replace(/[\r\n\0]+/g, " ").slice(0, 180));
-        res.setHeader("Set-Cookie", clearStateCookie);
-        const statusCode = Number(err?.statusCode) || 502;
-        return res.status(statusCode).type("text/plain; charset=utf-8").send(statusCode === 403 ? "You must be a member of the configured Discord server before joining this room." : "Discord sign-in failed. Check the OAuth client and registered redirect URI in Render, then try again.");
-    }
-});
-app.get("/api/live-studio/auth/me", async (req, res) => {
-    res.set("Cache-Control", "no-store");
-    const auth = getLiveStudioOAuthSession(req);
-    if (!auth) return res.status(401).json({ ok: false, error: "live_studio_discord_login_required" });
-    try {
-        const access = await fetchLiveStudioDiscordMember(auth.userId);
-        return res.json({ ok: true, userId: access.member.id, username: access.member.user?.username || auth.username, displayName: access.member.displayName || access.member.user?.globalName || auth.globalName || auth.username, canManage: access.canManage, rolesCount: access.roleIds.length });
-    } catch (err) {
-        if (Number(err?.statusCode) === 403) {
-            liveStudioOAuthSessions.delete(auth.sessionKey);
-            res.setHeader("Set-Cookie", studioCookie(LIVE_STUDIO_OAUTH_SESSION_COOKIE, "", 0, "/"));
-        }
-        return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_discord_auth_failed" });
-    }
-});
-app.post("/api/live-studio/auth/logout", (req, res) => {
-    const auth = getLiveStudioOAuthSession(req);
-    if (auth) liveStudioOAuthSessions.delete(auth.sessionKey);
-    res.setHeader("Set-Cookie", studioCookie(LIVE_STUDIO_OAUTH_SESSION_COOKIE, "", 0, "/"));
-    return res.json({ ok: true });
-});
-
-app.post("/api/live-studio/redeem", async (req, res) => {
-    try {
-        if (!checkCppRateLimit(req, res, "live-studio-redeem", 12, 60_000)) return;
-        const auth = getLiveStudioOAuthSession(req);
-        if (!auth) throw Object.assign(new Error("Sign in with Discord before joining Live Studio"), { statusCode: 401, apiError: "live_studio_discord_login_required" });
-        const discordAccess = await fetchLiveStudioDiscordMember(auth.userId);
-        const code = String(req.body?.inviteCode || "");
-        if (!isValidStudioInviteCode(code)) throw Object.assign(new Error("Invalid invite code"), { statusCode: 400, apiError: "live_studio_invite_invalid" });
-        const digest = studioInviteDigest(code);
-        const invite = liveStudioInvites.get(digest);
-        if (!invite || invite.expiresAt <= Date.now()) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Invite expired or already used"), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
-        const session = studioSessionForGuild(invite.guildId);
-        if (!session || session.sessionId !== invite.sessionId) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Live Studio is no longer active"), { statusCode: 410, apiError: "live_studio_not_active" }); }
-        const useLimit = Math.max(1, Number(invite.useLimit) || 1);
-        const usedCount = Math.max(0, Number(invite.uses) || 0);
-        if (usedCount >= useLimit) { liveStudioInvites.delete(digest); throw Object.assign(new Error("Invite has reached its use limit"), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
-        const role = invite.role === "viewer" ? "viewer" : "guest";
-        // Capped participant links are multi-use; legacy direct invites remain single-use.
-        if (useLimit <= 1) liveStudioInvites.delete(digest); // consume single-use invitation before signing any token
-        else {
-            invite.uses = usedCount + 1; // increment synchronously before token signing to prevent concurrent overuse
-            if (invite.uses >= useLimit) liveStudioInvites.delete(digest);
-        }
-        const fallbackName = discordAccess.member.displayName || discordAccess.member.user?.globalName || discordAccess.member.user?.username || "Live guest";
-        const name = normalizeStudioName(req.body?.displayName, fallbackName);
-        const identity = `guest_${crypto.randomBytes(12).toString("hex")}`;
-        const discordIdentity = { userId: discordAccess.member.id, username: discordAccess.member.user?.username || auth.username };
-        const access = await studioAccessToken(session, identity, name, role, discordIdentity);
-        if (session.muteAllActive && role === "guest") session.mutedIdentities.add(identity);
-        return res.json({ ok: true, sessionId: session.sessionId, roomName: session.roomName, identity, name, role,
-            discordUserId: discordIdentity.userId, canManage: discordAccess.canManage, capabilities: role === "viewer" ? ["subscribe"] : ["microphone", "screen_share", "screen_share_audio"], ...access });
-    } catch (err) { return adminApiError(res, err, "live_studio_join_failed"); }
-});
-async function setLiveStudioParticipantMuted(session, participant, muted) {
-    const identity = String(participant?.identity || "");
-    if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited participants can be moderated"), { statusCode: 400, apiError: "invalid_studio_target" });
-    const runtime = getLiveKitRuntime();
-    const micTracks = (participant.tracks || []).filter(track => {
-        const source = String(track.source ?? "").toLowerCase();
-        return source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE;
-    });
-    if (muted) {
-        session.mutedIdentities.add(identity);
-        for (const track of micTracks) await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, true);
-        await session.roomService.updateParticipant(session.roomName, identity, { permission: {
-            canPublish: true, canPublishSources: [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
-            canPublishData: false, canSubscribe: true
-        } });
-    } else {
-        await session.roomService.updateParticipant(session.roomName, identity, { permission: {
-            canPublish: true, canPublishSources: [runtime.sdk.TrackSource.MICROPHONE, runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
-            canPublishData: false, canSubscribe: true
-        } });
-        session.mutedIdentities.delete(identity);
-        for (const track of micTracks) await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, false).catch(() => {});
-    }
-    return { identity, muted: Boolean(muted) };
-}
-app.get("/api/live-studio/admin/participants", async (req, res) => {
-    try {
-        const { session, auth } = await requireLiveStudioRoomModerator(req);
-        const participants = await session.roomService.listParticipants(session.roomName);
-        return res.set("Cache-Control", "no-store").json({ ok: true, muteAllActive: Boolean(session.muteAllActive), participants: (participants || []).map(p => ({ ...safeStudioParticipant(p, session), isHost: String(p.identity || "") === session.hostIdentity, canModerate: isGuestStudioIdentity(p.identity) })) });
-    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_participants_failed" }); }
-});
-app.post("/api/live-studio/admin/mute", async (req, res) => {
-    try {
-        const { session, auth } = await requireLiveStudioRoomModerator(req);
-        if (!checkCppRateLimit(req, res, "live-studio-discord-mute", 40, 60_000)) return;
-        const identity = String(req.body?.identity || "");
-        const participant = (await session.roomService.listParticipants(session.roomName)).find(p => String(p.identity) === identity);
-        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
-        const result = await setLiveStudioParticipantMuted(session, participant, true);
-        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_mute", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} muted participant ${identity}` }).catch(() => {});
-        return res.json({ ok: true, ...result });
-    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_mute_failed" }); }
-});
-app.post("/api/live-studio/admin/unmute", async (req, res) => {
-    try {
-        const { session, auth } = await requireLiveStudioRoomModerator(req);
-        if (!checkCppRateLimit(req, res, "live-studio-discord-unmute", 40, 60_000)) return;
-        const identity = String(req.body?.identity || "");
-        const participant = (await session.roomService.listParticipants(session.roomName)).find(p => String(p.identity) === identity);
-        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
-        const result = await setLiveStudioParticipantMuted(session, participant, false);
-        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_unmute", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} unmuted participant ${identity}` }).catch(() => {});
-        return res.json({ ok: true, ...result, mayNeedMicToggle: true });
-    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_unmute_failed" }); }
-});
-app.post("/api/live-studio/admin/mute-all", async (req, res) => {
-    try {
-        const { session, auth } = await requireLiveStudioRoomModerator(req);
-        if (!checkCppRateLimit(req, res, "live-studio-discord-mute-all", 12, 60_000)) return;
-        const muted = req.body?.muted !== false;
-        session.muteAllActive = muted;
-        const participants = await session.roomService.listParticipants(session.roomName);
-        const targets = (participants || []).filter(p => isGuestStudioIdentity(p.identity));
-        const results = await Promise.allSettled(targets.map(participant => setLiveStudioParticipantMuted(session, participant, muted)));
-        const succeeded = results.filter(item => item.status === "fulfilled").length;
-        const failed = results.length - succeeded;
-        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: muted ? "live_studio_discord_mute_all" : "live_studio_discord_unmute_all", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} ${muted ? "muted" : "unmuted"} all guest participants; succeeded=${succeeded}; failed=${failed}` }).catch(() => {});
-        return res.json({ ok: failed === 0, muted, muteAllActive: session.muteAllActive, total: targets.length, succeeded, failed });
-    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_mute_all_failed" }); }
-});
-app.post("/api/live-studio/admin/kick", async (req, res) => {
-    try {
-        const { session, auth } = await requireLiveStudioRoomModerator(req);
-        if (!checkCppRateLimit(req, res, "live-studio-discord-kick", 30, 60_000)) return;
-        const identity = String(req.body?.identity || "");
-        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be removed"), { statusCode: 400, apiError: "invalid_studio_target" });
-        const participant = (await session.roomService.listParticipants(session.roomName)).find(p => String(p.identity) === identity);
-        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
-        session.deniedIdentities.add(identity);
-        try { await session.roomService.removeParticipant(session.roomName, identity, { revokeTokenTs: BigInt(Math.floor(Date.now() / 1000)) }); }
-        catch (err) { session.deniedIdentities.delete(identity); throw err; }
-        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_kick", timestamp: Date.now(), summary: `Discord Live Studio moderator ${auth.userId} removed participant ${identity}` }).catch(() => {});
-        return res.json({ ok: true, identity, removed: true });
-    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_kick_failed" }); }
-});
-
-app.post("/api/live-studio/admin/invite", async (req, res) => {
-    try {
-        const { session, auth, guild } = await requireLiveStudioRoomModerator(req);
-        if (!checkCppRateLimit(req, res, "live-studio-discord-invite", 10, 60_000)) return;
-        const now = Date.now();
-        for (const [digest, item] of liveStudioInvites) if (item.expiresAt <= now || !liveStudioSessions.has(item.guildId)) liveStudioInvites.delete(digest);
-        if (liveStudioInvites.size >= 2000) throw Object.assign(new Error("Too many pending invitations"), { statusCode: 429, apiError: "live_studio_invite_limit" });
-        const code = crypto.randomBytes(32).toString("base64url");
-        const expiresAt = Math.min(Date.now() + LIVE_STUDIO_INVITE_TTL_MS, session.expiresAt);
-        const maxUses = Math.max(1, Math.min(20, LIVE_STUDIO_MAX_PARTICIPANTS - 1));
-        liveStudioInvites.set(studioInviteDigest(code), { sessionId: session.sessionId, guildId: guild.id, expiresAt, createdBy: `discord:${auth.userId}`, role: "guest", useLimit: maxUses, uses: 0, kind: "participant" });
-        await db.ref("auditLog").push({ adminUid: `discord:${auth.userId}`, actionType: "live_studio_discord_participant_link", timestamp: Date.now(), summary: `Discord room moderator ${auth.userId} created a participant invite; max uses ${maxUses}` }).catch(() => {});
-        return res.json({ ok: true, inviteCode: code, expiresAt, maxUses, role: "guest", capabilities: ["microphone", "screen_share", "screen_share_audio"] });
-    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_invite_failed" }); }
-});
-app.post("/api/live-studio/admin/end", async (req, res) => {
-    try {
-        const { session, auth, guild } = await requireLiveStudioRoomModerator(req);
-        await endLiveStudioForGuild(guild.id, `Ended by Discord Live Studio moderator ${auth.userId}`, `discord:${auth.userId}`);
-        return res.json({ ok: true, active: false, sessionId: session.sessionId });
-    } catch (err) { return res.status(Number(err?.statusCode) || 502).json({ ok: false, error: err?.apiError || "live_studio_admin_end_failed" }); }
-});
-
-app.post("/api/admin/live-studio/participants", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        const guild = await getReadyAdminGuild();
-        const session = studioSessionForGuild(guild.id);
-        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active for this Admin"), { statusCode: 409, apiError: "live_studio_not_active" });
-        const participants = await session.roomService.listParticipants(session.roomName);
-        return res.json({ ok: true, participants: (participants || []).map(participant => ({ ...safeStudioParticipant(participant, session), isHost: String(participant.identity || "") === session.hostIdentity })) });
-    } catch (err) { return adminApiError(res, err, "live_studio_participants_failed"); }
-});
-app.post("/api/admin/live-studio/mute", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-live-studio-mute", 30, 60_000)) return;
-        const guild = await getReadyAdminGuild();
-        const session = studioSessionForGuild(guild.id);
-        const identity = String(req.body?.identity || "");
-        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
-        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be moderated from this panel"), { statusCode: 400, apiError: "invalid_studio_target" });
-        const participant = (await session.roomService.listParticipants(session.roomName)).find(item => String(item.identity) === identity);
-        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
-        const runtime = getLiveKitRuntime();
-        const micTracks = (participant.tracks || []).filter(track => {
-            const source = String(track.source ?? "").toLowerCase();
-            return source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE;
-        });
-        // Mark first so reconnects are also muted by the watchdog. If the API fails, rollback the state.
-        session.mutedIdentities.add(identity);
-        try {
-            for (const track of micTracks) await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, true);
-            await session.roomService.updateParticipant(session.roomName, identity, { permission: {
-                canPublish: true, canPublishSources: [runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO],
-                canPublishData: false, canSubscribe: true
-            } });
-        } catch (err) {
-            session.mutedIdentities.delete(identity);
-            throw err;
-        }
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_mute", timestamp: Date.now(), summary: `Muted and revoked microphone publishing for Live Studio participant ${identity}` }).catch(err => console.error("Live Studio audit write failed:", err.message));
-        return res.json({ ok: true, identity, muted: true, adminMuted: true });
-    } catch (err) { return adminApiError(res, err, "live_studio_mute_failed"); }
-});
-app.post("/api/admin/live-studio/unmute", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-live-studio-unmute", 30, 60_000)) return;
-        const guild = await getReadyAdminGuild();
-        const session = studioSessionForGuild(guild.id);
-        const identity = String(req.body?.identity || "");
-        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
-        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be moderated from this panel"), { statusCode: 400, apiError: "invalid_studio_target" });
-        const participant = (await session.roomService.listParticipants(session.roomName)).find(item => String(item.identity) === identity);
-        if (!participant) throw Object.assign(new Error("Participant is no longer in the room"), { statusCode: 404, apiError: "studio_participant_not_found" });
-        const runtime = getLiveKitRuntime();
-        await session.roomService.updateParticipant(session.roomName, identity, { permission: {
-            canPublish: true, canPublishSources: [runtime.sdk.TrackSource.MICROPHONE, runtime.sdk.TrackSource.SCREEN_SHARE, runtime.sdk.TrackSource.SCREEN_SHARE_AUDIO], canPublishData: false, canSubscribe: true
-        }});
-        session.mutedIdentities.delete(identity);
-        // Remote unmute is disabled in some LiveKit configurations; allow publishing and let the guest toggle mic if needed.
-        let remotelyUnmuted = false;
-        const micTrack = (participant.tracks || []).find(track => {
-            const source = String(track.source ?? "").toLowerCase();
-            return source.includes("microphone") || source === "2" || track.source === runtime.sdk.TrackSource?.MICROPHONE;
-        });
-        if (micTrack) {
-            try { await session.roomService.mutePublishedTrack(session.roomName, identity, micTrack.sid, false); remotelyUnmuted = true; }
-            catch (_) { /* permission restored; participant may need to toggle mic locally */ }
-        }
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_unmute", timestamp: Date.now(), summary: `Restored microphone publishing permission for Live Studio participant ${identity}` }).catch(err => console.error("Live Studio audit write failed:", err.message));
-        return res.json({ ok: true, identity, muted: false, remotelyUnmuted, mayNeedMicToggle: !remotelyUnmuted });
-    } catch (err) { return adminApiError(res, err, "live_studio_unmute_failed"); }
-});
-app.post("/api/admin/live-studio/kick", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        if (!checkCppRateLimit(req, res, "admin-live-studio-kick", 20, 60_000)) return;
-        const guild = await getReadyAdminGuild();
-        const session = studioSessionForGuild(guild.id);
-        const identity = String(req.body?.identity || "");
-        if (!session || session.ownerUid !== actor.uid) throw Object.assign(new Error("Live Studio is not active"), { statusCode: 409, apiError: "live_studio_not_active" });
-        if (!isGuestStudioIdentity(identity)) throw Object.assign(new Error("Only invited guests can be removed from the panel"), { statusCode: 400, apiError: "invalid_studio_target" });
-        session.deniedIdentities.add(identity);
-        try { await session.roomService.removeParticipant(session.roomName, identity, { revokeTokenTs: BigInt(Math.floor(Date.now() / 1000)) }); }
-        catch (err) { session.deniedIdentities.delete(identity); throw err; }
-        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_kick", timestamp: Date.now(), summary: `Removed Live Studio participant ${identity}; denied for remaining session` }).catch(err => console.error("Live Studio audit write failed:", err.message));
-        return res.json({ ok: true, identity, removed: true });
-    } catch (err) { return adminApiError(res, err, "live_studio_kick_failed"); }
-});
-app.post("/api/admin/live-studio/end", async (req, res) => {
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        const guild = await getReadyAdminGuild();
-        const session = liveStudioSessions.get(guild.id);
-        if (session && session.ownerUid !== actor.uid) throw Object.assign(new Error("Only the session owner can end Live Studio"), { statusCode: 403, apiError: "forbidden" });
-        await endLiveStudioForGuild(guild.id, "Admin ended Live Studio", actor.uid);
-        return res.json({ ok: true, active: false });
-    } catch (err) { return adminApiError(res, err, "live_studio_end_failed"); }
-});
-
 app.post("/api/admin/accounts/lookup", async (req, res) => {
     try {
         const actor = await verifyAdminApiRequest(req);
@@ -1962,11 +748,7 @@ app.post("/api/admin/accounts/lookup", async (req, res) => {
             activeSession: !!record.activeSessionId, lastActive: Number(record.lastActive) || 0, discordId: String(record.discordId || "") };
         await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "account_lookup", timestamp: Date.now(), summary: `Looked up C++ account ${username}` });
         return res.json({ ok: true, account: safe });
-    } catch (err) {
-        const status = Number(err.statusCode) || 500;
-        const error = status === 403 ? "forbidden" : status === 401 ? "unauthorized" : status === 503 ? "server_unavailable" : "lookup_failed";
-        return res.status(status).json({ ok: false, error });
-    }
+    } catch (err) { return res.status(Number(err.statusCode) || 401).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "unauthorized" }); }
 });
 app.post("/api/admin/accounts/create", async (req, res) => {
     if (!checkCppRateLimit(req, res, "admin-account-create", 20, 10 * 60 * 1000)) return;
@@ -2024,9 +806,7 @@ app.post("/api/admin/accounts/create", async (req, res) => {
         return res.status(201).json({ ok: true, username, package: packageName, category, status, lockType, expiresAt: account.expiresAt, paidAmount: 0, source: "admin_panel" });
     } catch (err) {
         console.error("Admin account create failed:", err.message);
-        const status = Number(err.statusCode) || 500;
-        const error = status === 403 ? "forbidden" : status === 401 ? "unauthorized" : status === 503 ? "server_unavailable" : "create_failed";
-        return res.status(status).json({ ok: false, error });
+        return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : Number(err.statusCode) === 401 ? "unauthorized" : "create_failed" });
     }
 });
 
@@ -2062,12 +842,7 @@ app.post("/api/admin/accounts/update", async (req, res) => {
         if (!tx.committed) return res.status(409).json({ ok: false, error: "username_conflict_or_changed" });
         await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "cpp_account_update", timestamp: Date.now(), summary: `Updated C++ account ${username} -> ${newUsername}; lock=${lockType}; status=${status}; hwid=${hwid ? "set" : "reset"}; password=${newPassword ? "changed" : "unchanged"}` });
         return res.json({ ok: true, username: newUsername, sessionInvalidated: true });
-    } catch (err) {
-        console.error("Admin account update failed:", err.message);
-        const status = Number(err.statusCode) || 500;
-        const error = status === 403 ? "forbidden" : status === 401 ? "unauthorized" : status === 503 ? "server_unavailable" : "update_failed";
-        return res.status(status).json({ ok: false, error });
-    }
+    } catch (err) { console.error("Admin account update failed:", err.message); return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "update_failed" }); }
 });
 async function verifyCppRequest(req) {
     const token = readBearerToken(req);
@@ -2162,7 +937,7 @@ app.post("/api/cpp/key-login", async (req, res) => {
         const keyRef = db.ref(`keys/${key}`);
         const sessionId = crypto.randomUUID();
         const claim = await keyRef.transaction(current => {
-            if (!isCppKeyUsable(current)) return;
+            if (!current || current.disabled === true || current.revoked === true) return;
             const savedHwid = String(current.hwid || "");
             if (current.used === true && savedHwid && savedHwid !== hwid) return;
             const expiry = Number(current.expiresAt) || 0;
@@ -2208,7 +983,7 @@ app.post("/api/cpp/heartbeat", async (req, res) => {
             if (!session || session.sessionId !== decoded.sessionId || !session.key) return cppApiError(res, 409, "session_replaced", "Developer key session শেষ হয়েছে।");
             const keySnap = await db.ref(`keys/${session.key}`).once("value");
             const keyData = keySnap.val();
-            if (!isCppKeyUsable(keyData, now) || String(keyData.hwid || "") !== String(session.hwid || "") || String(keyData.activeSessionId || "") !== decoded.sessionId) {
+            if (!keyData || keyData.revoked === true || keyData.disabled === true || String(keyData.hwid || "") !== String(session.hwid || "") || String(keyData.activeSessionId || "") !== decoded.sessionId) {
                 await db.ref(`cppProfiles/${decoded.uid}`).set(getSafeCppProfile(decoded.uid, keyData, "key", { usedKey: session.key }));
                 watchCppKeyProfile(session.key, decoded.uid);
                 return cppApiError(res, 403, "key_revoked", "Developer key বাতিল অথবা session invalid।");
@@ -2265,131 +1040,6 @@ app.post("/api/cpp/log", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-const server = http.createServer(app);
-const liveVoiceWss = new WebSocketServer({
-    noServer: true,
-    maxPayload: 256 * 1024,
-    perMessageDeflate: false,
-    handleProtocols: protocols => protocols.has("rkbackles-live-v1") ? "rkbackles-live-v1" : false
-});
-server.on("upgrade", (request, socket, head) => {
-    let parsed;
-    try { parsed = new URL(request.url || "/", "http://localhost"); } catch (_) { socket.destroy(); return; }
-    if (parsed.pathname === "/api/admin/live-console/stream") { server.emit("live-console-upgrade", request, socket, head); return; }
-    if (parsed.pathname !== "/api/admin/discord/voice/live") { socket.destroy(); return; }
-    const origin = String(request.headers.origin || "");
-    if (!origin || !ADMIN_PANEL_ORIGINS.has(origin)) { socket.write("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
-    const ticket = extractOneTimeTicketFromProtocols(request.headers["sec-websocket-protocol"]);
-    if (!ticket) { socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
-    const digest = crypto.createHash("sha256").update(ticket).digest("hex");
-    const record = liveVoiceTickets.get(digest);
-    if (!record || record.expiresAt <= Date.now()) { liveVoiceTickets.delete(digest); socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n"); socket.destroy(); return; }
-    liveVoiceTickets.delete(digest); // consume before any further checks so rejected tickets cannot be replayed
-    const session = adminVoiceSessions.get(record.guildId);
-    if (!session?.connection || (session.liveSocket && [WebSocket.OPEN, WebSocket.CONNECTING, WebSocket.CLOSING].includes(session.liveSocket.readyState))) {
-        socket.write("HTTP/1.1 409 Conflict\r\nConnection: close\r\n\r\n"); socket.destroy(); return;
-    }
-    liveVoiceWss.handleUpgrade(request, socket, head, ws => liveVoiceWss.emit("connection", ws, request, record, session));
-});
-liveVoiceWss.on("connection", (socket, request, ticketRecord, session) => {
-    const guild = client.guilds.cache.get(ticketRecord.guildId);
-    if (!guild || session.connection?.state?.status !== require("@discordjs/voice").VoiceConnectionStatus.Ready) {
-        socket.close(1011, "Discord voice connection unavailable");
-        return;
-    }
-    session.liveSocket = socket;
-    socket.liveStarted = false;
-    socket.liveByteWindowStartedAt = Date.now();
-    socket.liveBytesInWindow = 0;
-    const stopReceiver = startLiveDiscordAudioRelay(socket, session, guild);
-    const maxTimer = setTimeout(() => {
-        sendLiveVoiceJson(socket, { type: "error", error: "live_voice_duration_limit" });
-        closeLiveVoiceSocket(session, 1000, "live voice maximum duration reached");
-    }, LIVE_VOICE_MAX_DURATION_MS);
-    if (typeof maxTimer.unref === "function") maxTimer.unref();
-    const authCheckTimer = setInterval(async () => {
-        try {
-            const authSnapshot = await db.ref(`adminUids/${ticketRecord.uid}`).once("value");
-            if (authSnapshot.val() !== true) closeLiveVoiceSocket(session, 1008, "Admin permission revoked");
-        } catch (_) {
-            // Fail closed on repeated auth lookup errors rather than leaving a microphone open indefinitely.
-            closeLiveVoiceSocket(session, 1011, "Admin authorization could not be revalidated");
-        }
-    }, 30_000);
-    if (typeof authCheckTimer.unref === "function") authCheckTimer.unref();
-    socket.on("message", (data, isBinary) => {
-        if (isBinary) {
-            if (!socket.liveStarted || session.liveSocket !== socket || !session.liveProcess || !session.liveProcess.stdin || session.liveProcess.stdin.destroyed || !session.liveProcess.stdin.writable) {
-                // An inactive/dead audio pipeline must not leave the browser sending audio forever.
-                // Close once instead of replying for every subsequent PCM packet.
-                if (socket.readyState === WebSocket.OPEN) {
-                    if (!socket.liveFailureNotified) {
-                        socket.liveFailureNotified = true;
-                        sendLiveVoiceJson(socket, { type: "error", error: session.liveProcess?.rawPcm ? "live_voice_audio_pipeline_failed" : (session.liveProcess ? "live_voice_transcode_failed" : "live_voice_stream_ended") });
-                    }
-                    try { socket.close(1011, "microphone stream is not writable"); } catch (_) { try { socket.terminate(); } catch (_) {} }
-                }
-                return;
-            }
-            const activeProcess = session.liveProcess;
-            if (activeProcess.rawPcm && (data.length === 0 || data.length > 96 * 1024 || data.length % 4 !== 0)) {
-                sendLiveVoiceJson(socket, { type: "error", error: "live_voice_invalid_pcm_frame" });
-                try { socket.close(1003, "invalid PCM frame"); } catch (_) {}
-                return;
-            }
-            const now = Date.now();
-            if (now - socket.liveByteWindowStartedAt >= 1000) { socket.liveByteWindowStartedAt = now; socket.liveBytesInWindow = 0; }
-            socket.liveBytesInWindow += data.length;
-            if (socket.liveBytesInWindow > LIVE_VOICE_MAX_BYTES_PER_SECOND) { socket.close(1008, "microphone bitrate limit exceeded"); return; }
-            try {
-                // The in-process PCM adapter counts its own writes. Count here only for the
-                // legacy child-process transcoder so diagnostic inputBytes is never doubled.
-                if (!session.liveProcess.rawPcm) session.liveProcess.liveInputBytes = (session.liveProcess.liveInputBytes || 0) + data.length;
-                session.liveProcess.stdin.write(data);
-            }
-            catch (err) {
-                console.error("Live voice audio write failed:", err?.message || err);
-                sendLiveVoiceJson(socket, { type: "error", error: "live_voice_transcode_failed" });
-                try { socket.close(1011, "microphone stream write failed"); } catch (_) { try { socket.terminate(); } catch (_) {} }
-            }
-            return;
-        }
-        let payload;
-        try { payload = JSON.parse(Buffer.from(data).toString("utf8")); } catch (_) { socket.close(1003, "invalid control message"); return; }
-        if (!payload || typeof payload !== "object") { socket.close(1003, "invalid control message"); return; }
-        if (payload.type === "start") {
-            if (socket.liveStarted) { sendLiveVoiceJson(socket, { type: "error", error: "live_voice_already_started" }); return; }
-            socket.liveStarted = true;
-            beginLiveMicStream(socket, session, ticketRecord.uid, payload.mimeType).catch(err => {
-                socket.liveStarted = false;
-                sendLiveVoiceJson(socket, { type: "error", error: String(err.apiError || "live_voice_start_failed") });
-            });
-        } else if (payload.type === "stop") {
-            socket.liveStarted = false;
-            stopLiveMicProcess(session);
-        } else {
-            socket.close(1003, "unknown control message");
-        }
-    });
-    socket.once("close", () => {
-        clearTimeout(maxTimer);
-        clearInterval(authCheckTimer);
-        stopReceiver();
-        if (session.liveSocket === socket) session.liveSocket = null;
-        stopLiveMicProcess(session);
-        if (session.liveResource && session.player?.state?.resource === session.liveResource) session.player.stop(true);
-        session.liveResource = null;
-        session.liveStartedAt = 0;
-        db.ref("auditLog").push({ adminUid: ticketRecord.uid, actionType: "discord_live_voice_end", timestamp: Date.now(), summary: `Admin live microphone session ended in ${session.channelName || session.channelId}; audio not stored` }).catch(err => console.error("Live voice audit write failed:", err.message));
-    });
-    socket.once("error", err => console.error("Admin live voice websocket error:", err.message));
-    db.ref("auditLog").push({ adminUid: ticketRecord.uid, actionType: "discord_live_voice_start", timestamp: Date.now(), summary: `Admin opened two-way live voice relay in ${session.channelName || session.channelId}; audio not stored` }).catch(err => console.error("Live voice audit write failed:", err.message));
-    sendLiveVoiceJson(socket, { type: "connected", channelName: session.channelName || "voice channel", audioIsNotStored: true });
-});
-server.listen(PORT, () => {
-    console.log(`🌐 Web server running on port ${PORT}`);
-    logLiveKitConfigurationStatus();
-});
 
 // ================================
 // 📱 Dynamic Realtime Settings (Firebase Sync)
@@ -2559,8 +1209,7 @@ function getConfiguredChannelId(key) {
         paymentPanel: CHANNELS.PAYMENT_PANEL, giveaway: GIVEAWAY_CHANNEL_ID,
         weeklyReport: WEEKLY_REPORT_CHANNEL_ID, voiceStats: STATS_VC_CHANNEL_ID,
         transcriptLog: TRANSCRIPT_LOG_CHANNEL_ID, staffAdminLog: STAFF_ADMIN_LOG_ID,
-        embedNotice: EMBED_NOTICE_CHANNEL_ID, socialFeed: SOCIAL_FEED_CHANNEL_ID,
-        announcement: String(process.env.ANNOUNCEMENT_CHANNEL_ID || "").trim()
+        embedNotice: EMBED_NOTICE_CHANNEL_ID, socialFeed: SOCIAL_FEED_CHANNEL_ID
     };
     return fallback[key] || "";
 }
@@ -2582,37 +1231,6 @@ function getConfiguredRoleId(key) {
     };
     return fallback[key] || "";
 }
-// Automatic Bengali announcements use an explicit channel configured in Automation & routing.
-const suppressedDiscordRoleAnnouncements = new Map();
-const recentDiscordRoleAnnouncements = new Map();
-function discordRoleAnnouncementKey(memberId, roleId, action) { return `${memberId}:${roleId}:${action}`; }
-function suppressNextDiscordRoleAnnouncement(memberId, roleId, action, ttlMs = 10000) {
-    suppressedDiscordRoleAnnouncements.set(discordRoleAnnouncementKey(memberId, roleId, action), Date.now() + ttlMs);
-}
-function consumeSuppressedDiscordRoleAnnouncement(memberId, roleId, action) {
-    const key = discordRoleAnnouncementKey(memberId, roleId, action);
-    const expiresAt = suppressedDiscordRoleAnnouncements.get(key) || 0;
-    suppressedDiscordRoleAnnouncements.delete(key);
-    return expiresAt >= Date.now();
-}
-async function sendBengaliAnnouncement(guild, content, userId = "") {
-    const channelId = getConfiguredChannelId("announcement");
-    if (!channelId || !guild) return { sent: false, reason: "announcement_channel_not_configured" };
-    let channel = guild.channels.cache.get(channelId);
-    if (!channel) channel = await guild.channels.fetch(channelId).catch(() => null);
-    if (!channel?.isTextBased?.() || typeof channel.send !== "function") {
-        console.warn("Bengali announcement skipped: configured channel is missing or not text-based.");
-        return { sent: false, reason: "invalid_announcement_channel" };
-    }
-    try {
-        await channel.send({ content: String(content || "").slice(0, 1900), allowedMentions: userId ? { parse: [], users: [String(userId)] } : { parse: [] } });
-        return { sent: true };
-    } catch (err) {
-        console.error("Bengali announcement send failed:", err.message);
-        return { sent: false, reason: "send_failed" };
-    }
-}
-
 function getAutomodSettings() {
     const cfg = ADMIN_BOT_CONFIG.automod || {};
     const num = (value, fallback, min, max) => Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : fallback));
@@ -2651,36 +1269,10 @@ const client = new Client({
     partials: [Partials.Channel, Partials.GuildMember, Partials.Message, Partials.Reaction]
 });
 
-// Prefer the event name exported by the installed discord.js version. Older releases
-// that predate Events.ClientReady fall back to "ready" without registering a deprecated alias.
-const CLIENT_READY_EVENT = Events?.ClientReady || "ready";
-function onClientReadyOnce(handler) {
-    let handled = false;
-    const invoke = (...args) => {
-        if (handled) return;
-        handled = true;
-        try {
-            const result = handler(...args);
-            if (result && typeof result.catch === "function") {
-                result.catch(err => console.error("Discord client-ready initialization failed:", err?.message || err));
-            }
-        } catch (err) {
-            console.error("Discord client-ready initialization failed:", err?.message || err);
-        }
-    };
-    client.once(CLIENT_READY_EVENT, invoke);
-}
-
-// Register this handler only after the Discord client has been initialized.
-onClientReadyOnce(() => {
-    if (!inspectLiveKitConfiguration().configured) return;
-    try {
-        const runtime = getLiveKitRuntime();
-        runtime.roomService.listRooms().then(rooms => Promise.all((rooms || []).filter(room => String(room.name || "").startsWith(`rkbs_${ALLOWED_GUILD_ID}_`)).map(room =>
-            runtime.roomService.deleteRoom(room.name).then(() => console.log(`Removed stale Live Studio room after Bot restart: ${room.name}`)).catch(err => console.warn("Stale Live Studio room cleanup failed:", err.message))
-        ))).catch(err => console.warn("Live Studio startup cleanup failed:", err.message));
-    } catch (err) { console.warn("Live Studio disabled until credentials are configured:", err.apiError || err.message); }
-});
+// Live Studio + realtime Discord voice directory. Guests use invite links without Discord role checks;
+// all room management actions still require the existing Firebase Admin API identity.
+const { attachLiveStudioServer } = require("./live-studio-server");
+attachLiveStudioServer({ app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit, ChannelType });
 
 process.on("unhandledRejection", (err) => {
     console.error("[Unhandled Rejection]", err);
@@ -3042,13 +1634,7 @@ async function awardMessageXp(message) {
         await message.channel.send(formatBotMessage("levelUp", "🎉 অভিনন্দন <@{user}>! আপনি লেভেল **{level}** এ উন্নীত হয়েছেন।", { user: message.author.id, level: finalLevel }).slice(0, 1900))
             .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
             .catch(() => {});
-        await sendBengaliAnnouncement(message.guild, formatLevelUpAnnouncement(message.author.id, finalLevel), message.author.id);
-        const levelRoleId = getConfiguredRoleId("level");
-        const levelRole = levelRoleId ? message.guild.roles.cache.get(levelRoleId) : null;
-        if (levelRole && !message.member.roles.cache.has(levelRole.id)) {
-            suppressNextDiscordRoleAnnouncement(message.author.id, levelRole.id, "add");
-            await message.member.roles.add(levelRole).catch(err => console.error("Level reward role assignment failed:", err.message));
-        }
+        await message.member.roles.add(getConfiguredRoleId("level")).catch(() => {});
     }
 }
 
@@ -3223,10 +1809,8 @@ client.on("interactionCreate", async (interaction) => {
             const role = interaction.guild.roles.cache.get(getConfiguredRoleId("verified"));
             if (!role) return interaction.editReply("❌ Role not found!");
             if (interaction.member.roles.cache.has(getConfiguredRoleId("verified"))) return interaction.editReply("⚠️ আপনি ইতোমধ্যে ভেরিফাই হয়েছেন।");
-            suppressNextDiscordRoleAnnouncement(interaction.user.id, role.id, "add");
-            await interaction.member.roles.add(role);
-            await interaction.editReply(formatBotMessage("verificationSuccess", "✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!", { user: interaction.user.id }).slice(0, 1800));
-            await sendBengaliAnnouncement(interaction.guild, formatVerifiedAnnouncement(interaction.user.id), interaction.user.id);
+            await interaction.member.roles.add(role); await interaction.editReply(formatBotMessage("verificationSuccess", "✅ সফলভাবে ভেরিফাই সম্পন্ন হয়েছে!", { user: interaction.user.id }).slice(0, 1800));
+            
             db.ref(`analytics/joins/${Date.now()}`).set(interaction.user.id);
 
             const logs = getWelcomeLogs(); const userLog = logs[interaction.user.id]; const welcomeChannel = interaction.guild.channels.cache.get(getConfiguredChannelId("welcome"));
@@ -3847,12 +2431,6 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             return interaction.editReply("❌ Transaction ID-তে অবৈধ অক্ষর আছে। শুধু ইংরেজি অক্ষর, সংখ্যা, _ বা - ব্যবহার করুন (৩–৬৪ অক্ষর)।");
         }
         const txnLockKey = `${userId}:${category}`;
-        if (paymentTxnLastAt.size > 5000) {
-            const staleBefore = Date.now() - PAYMENT_TXN_SUBMIT_COOLDOWN_MS;
-            for (const [key, timestamp] of paymentTxnLastAt) {
-                if (timestamp <= staleBefore) paymentTxnLastAt.delete(key);
-            }
-        }
         if (paymentTxnLocks.has(txnLockKey)) {
             return interaction.editReply("⏳ আপনার TxnID ইতোমধ্যে যাচাই হচ্ছে। একই সময়ে আবার submit করার প্রয়োজন নেই।");
         }
@@ -4824,34 +3402,6 @@ async function countWeeklyMessage(message) {
 }
 client.on("messageCreate", message => { countWeeklyMessage(message).catch(err => console.error(err.message)); });
 
-client.on("guildMemberUpdate", async (oldMember, newMember) => {
-    try {
-        if (!newMember.guild || newMember.guild.id !== ALLOWED_GUILD_ID || newMember.user?.bot) return;
-        const before = oldMember.roles.cache, after = newMember.roles.cache, changes = [];
-        for (const [roleId, role] of after) {
-            if (roleId === newMember.guild.id || before.has(roleId)) continue;
-            if (consumeSuppressedDiscordRoleAnnouncement(newMember.id, roleId, "add")) continue;
-            changes.push({roleId,roleName:role.name,action:"add"});
-        }
-        for (const [roleId, role] of before) {
-            if (roleId === newMember.guild.id || after.has(roleId)) continue;
-            if (consumeSuppressedDiscordRoleAnnouncement(newMember.id, roleId, "remove")) continue;
-            changes.push({roleId,roleName:role.name,action:"remove"});
-        }
-        for (const change of changes.slice(0,10)) {
-            const key = discordRoleAnnouncementKey(newMember.id,change.roleId,change.action), now = Date.now();
-            if (now - (recentDiscordRoleAnnouncements.get(key)||0) < 8000) continue;
-            recentDiscordRoleAnnouncements.set(key,now);
-            await sendBengaliAnnouncement(newMember.guild,formatRoleChangeAnnouncement({memberId:newMember.id,displayName:newMember.displayName||newMember.user.username,roleName:change.roleName,action:change.action}),newMember.id);
-        }
-        if (suppressedDiscordRoleAnnouncements.size > 1000 || recentDiscordRoleAnnouncements.size > 2000) {
-            for (const [key, expiry] of suppressedDiscordRoleAnnouncements) if (expiry < Date.now()) suppressedDiscordRoleAnnouncements.delete(key);
-            const cutoff=Date.now()-60000;
-            for (const [key, seenAt] of recentDiscordRoleAnnouncements) if (seenAt < cutoff) recentDiscordRoleAnnouncements.delete(key);
-        }
-    } catch (err) { console.error("Automatic Bengali role announcement failed:",err.message); }
-});
-
 client.on("voiceStateUpdate", async (oldState, newState) => {
     if (!isFeatureEnabled("voiceStatsEnabled")) return;
     if (!newState.guild || newState.guild.id !== ALLOWED_GUILD_ID || newState.member?.user?.bot) return;
@@ -5038,7 +3588,7 @@ async function refreshPaymentPanel() {
     return syncAllManagedPanels();
 }
 
-onClientReadyOnce(async () => {
+client.on("ready", async () => {
     console.log(`🤖 Logged in as ${client.user.tag}!`);
     setBotPresence();
     registerCouponRequestListener();
@@ -5136,14 +3686,7 @@ function setBotPresence() {
     client.user.setPresence({ activities: [{ name: activityText, type: activityType }], status });
 }
 
-attachLiveConsoleServer({
-    app, server, client, db, admin,
-    allowedGuildId: ALLOWED_GUILD_ID,
-    adminPanelOrigins: ADMIN_PANEL_ORIGINS,
-    verifyAdminApiRequest, getReadyAdminGuild, adminApiError, checkCppRateLimit,
-    getBotGuildMember, getConfiguredRoleId, PermissionFlagsBits, isProtectedDiscordTarget,
-    adminVoiceSessions, liveStudioSessions, inspectLiveKitConfiguration, normalizeStudioName
-});
+app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
 function startBot() {
     if (!TOKEN) {

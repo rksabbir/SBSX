@@ -1,0 +1,104 @@
+
+> payment-reader-discord-bot@1.5.28 test
+> node --test
+
+TAP version 13
+# Subtest: invite redemption has no Discord OAuth or role-verification requirement
+ok 1 - invite redemption has no Discord OAuth or role-verification requirement
+  ---
+  duration_ms: 0.994453
+  type: 'test'
+  ...
+# Subtest: all moderation routes remain protected by Firebase Admin verification
+ok 2 - all moderation routes remain protected by Firebase Admin verification
+  ---
+  duration_ms: 0.207281
+  type: 'test'
+  ...
+# Subtest: LIVE STREAM RADAR is Firebase live-synced and one pinned message is edited in eligible channels
+ok 3 - LIVE STREAM RADAR is Firebase live-synced and one pinned message is edited in eligible channels
+  ---
+  duration_ms: 0.184537
+  type: 'test'
+  ...
+# Subtest: room auto-joins invite without an agreement checkbox and offers mic, screen sharing, HD and fullscreen
+ok 4 - room auto-joins invite without an agreement checkbox and offers mic, screen sharing, HD and fullscreen
+  ---
+  duration_ms: 0.240641
+  type: 'test'
+  ...
+# Subtest: existing payment/transaction overview remains in Admin Panel
+ok 5 - existing payment/transaction overview remains in Admin Panel
+  ---
+  duration_ms: 0.15952
+  type: 'test'
+  ...
+# Subtest: participant invite codes are random-url-safe sized bearer credentials
+ok 6 - participant invite codes are random-url-safe sized bearer credentials
+  ---
+  duration_ms: 2.01727
+  type: 'test'
+  ...
+# Subtest: display names are normalized and bounded
+ok 7 - display names are normalized and bounded
+  ---
+  duration_ms: 0.435945
+  type: 'test'
+  ...
+# Subtest: microphone track detection and HD presets expose expected constraints
+ok 8 - microphone track detection and HD presets expose expected constraints
+  ---
+  duration_ms: 0.328303
+  type: 'test'
+  ...
+# Subtest: radar includes live state and invite without mention parsing
+ok 9 - radar includes live state and invite without mention parsing
+  ---
+  duration_ms: 0.270556
+  type: 'test'
+  ...
+# Subtest: radar chooses sendable text-based guild channels only
+ok 10 - radar chooses sendable text-based guild channels only
+  ---
+  duration_ms: 0.245679
+  type: 'test'
+  ...
+# Subtest: only one fresh select_provider session can be claimed
+ok 11 - only one fresh select_provider session can be claimed
+  ---
+  duration_ms: 0.701274
+  type: 'test'
+  ...
+# Subtest: stale or tokenless legacy checking_reader status can be recovered
+ok 12 - stale or tokenless legacy checking_reader status can be recovered
+  ---
+  duration_ms: 0.119339
+  type: 'test'
+  ...
+# Subtest: fresh concurrent check cannot be reclaimed
+ok 13 - fresh concurrent check cannot be reclaimed
+  ---
+  duration_ms: 0.089965
+  type: 'test'
+  ...
+# Subtest: only the owner token can commit the result
+ok 14 - only the owner token can commit the result
+  ---
+  duration_ms: 0.132018
+  type: 'test'
+  ...
+# Subtest: failed owner releases the session to select_provider
+ok 15 - failed owner releases the session to select_provider
+  ---
+  duration_ms: 0.170917
+  type: 'test'
+  ...
+1..15
+# tests 15
+# suites 0
+# pass 15
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 141.376028

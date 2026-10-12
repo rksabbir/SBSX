@@ -1,13 +1,14 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.27",
+  "version": "1.5.32",
   "private": true,
-  "description": "Discord admin bot with role-aware LiveKit voice/screen-sharing guest rooms",
+  "description": "RKBACKLES Discord automation, admin-protected APIs, hardened Firebase rules, continuous Live Stream Radar and invite-based LiveKit voice/screen sharing",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "check": "node --check index.js",
-    "test": "node --test test/*.test.js"
+    "test": "node --test",
+    "security:check": "node --test test/security-rules.test.js"
   },
   "engines": {
     "node": ">=22.12.0"
@@ -18,11 +19,6 @@
     "express": "^4.21.2",
     "firebase-admin": "^13.0.2",
     "dotenv": "^16.4.7",
-    "@discordjs/voice": "0.19.2",
-    "opusscript": "^0.1.1",
-    "ws": "^8.18.3",
-    "ffmpeg-static": "5.3.0",
-    "google-tts-api": "2.0.2",
     "livekit-server-sdk": "^2.19.1"
   }
 }
