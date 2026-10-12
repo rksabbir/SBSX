@@ -11,9 +11,23 @@ function participantName(value, fallback = "Live guest") {
   const cleaned = String(value || "").replace(/[\r\n\0]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 48);
   return cleaned || String(fallback || "Live guest").replace(/[\r\n\0]+/g, " ").slice(0, 48);
 }
+function normalizeTrackSource(source) {
+  // LiveKit TrackSource may be an enum-like object in some SDK/API responses.
+  // Never coerce unknown objects with String(), which can throw for custom enums.
+  if (typeof source === "number") return source;
+  if (typeof source === "string") return source.trim().toLowerCase();
+  if (source && typeof source === "object") {
+    for (const key of ["value", "name", "source", "kind"]) {
+      const v = source[key];
+      if (typeof v === "number" || typeof v === "string") return typeof v === "string" ? v.trim().toLowerCase() : v;
+    }
+    try { return JSON.stringify(source).toLowerCase(); } catch (_) { return "unknown"; }
+  }
+  return "";
+}
 function isMicrophoneTrack(track) {
-  const source = track?.source;
-  return source === 2 || String(source ?? "").toLowerCase().includes("microphone");
+  const source = normalizeTrackSource(track?.source);
+  return source === 2 || source === "microphone" || (typeof source === "string" && source.includes("microphone"));
 }
 function screenShareQuality(value) {
   const presets = {

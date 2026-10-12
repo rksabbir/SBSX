@@ -47,3 +47,18 @@ Deploy-এর পরে `https://YOUR-RENDER-SERVICE.onrender.com/api/live-studi
 
 ## সীমা
 এই room LiveKit browser room—Discord-এর native Go Live নয়। Browser security-এর কারণে mic ও screen capture user-কে স্পষ্টভাবে button চাপতে এবং browser permission দিতে হবে. Invite link bearer access: link পেলে যে কেউ voice room-এ ঢুকে mic/screen publish করতে পারবে. Admin controls invite guest-এর কাছে খোলা নয়. এই package তৈরি/টেস্ট হয়েছে, কিন্তু GitHub/Render-এ deploy করা হয়নি.
+
+## v1.5.32 Firebase Security Rules deployment
+
+1. Firebase Console → Realtime Database → Rules খুলে current rules export/copy করে নিরাপদে ব্যাকআপ রাখুন।
+2. `firebase/database.rules.json` deployable rules; আগে দেখে নিশ্চিত করুন অন্য app বা legacy client-এর প্রয়োজনীয় path বাদ পড়ছে না।
+3. Project root-এ Firebase CLI ব্যবহার করলে চালান: `firebase deploy --only database --project rkbackles`। CLI ব্যবহার না করলে একই JSON Realtime Database → Rules editor-এ paste করে Publish করতে পারেন।
+4. Admin Panel-এ sign in, Bot heartbeat, Reader device heartbeat, Transactions এবং Live Stream Radar পরীক্ষা করুন। Incognito/logged-out browser থেকে `/transactions.json` খুললে data নয়, permission denied আসা উচিত।
+5. Tests: `cd discord-bot && npm test && npm run security:check`। Static tests deployment test-এর বিকল্প নয়।
+
+**সতর্কতা:** rules প্রকাশ করলে live database access policy বদলাবে। অন্য app-এর legitimate paths থাকলে merge না করে পুরো rules replace করবেন না।
+
+
+
+## v1.5.33 Admin Session Fix
+The current Blogger panel sends a Firebase ID token to protected Bot APIs. The Bot now verifies Firebase ID tokens server-side and checks `adminUids/{uid} = true` for every privileged request. Deploy the v1.5.33 Bot code, keep `ADMIN_PANEL_ORIGINS` set to the exact Blogger HTTPS origin, then sign in again.
