@@ -53,4 +53,4 @@ function buildRadarMessage({ guildName, active, inviteUrl, participantCount = 0,
   const line = active && inviteUrl ? `\n🎥 **Join Live Room:** ${inviteUrl}\n🎙️ Voice + screen share + fullscreen; HD quality selectable.` : "\nNo active Live Studio. Admin can start a session from the LIVE STREAM RADAR tab.";
   return `📡 **LIVE STREAM RADAR · ${title}**\nStatus: **${state}**\nRoom participants: **${Math.max(0, Number(participantCount) || 0)}** · Discord voice members: **${Math.max(0, Number(voiceMemberCount) || 0)}**\nLatest activity: ${String(latestActivity || "No recent activity").replace(/[\r\n\0]+/g, " ").slice(0, 160)}\nLast updated: <t:${stamp}:R>${line}\n\n_এই pinned message স্বয়ংক্রিয়ভাবে update হয়; duplicate message তৈরি করে না।_`.slice(0, 1900);
 }
-module.exports = { isValidInviteCode, inviteDigest, participantName, isMicrophoneTrack, screenShareQuality, shouldShowInRadar, buildRadarMessage };
+module.exports = { isValidInviteCode, inviteDigest, participantName, normalizeTrackSource, isMicrophoneTrack, screenShareQuality, shouldShowInRadar, buildRadarMessage };
