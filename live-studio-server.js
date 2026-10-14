@@ -1,161 +1,482 @@
 "use strict";
 const crypto = require("crypto");
-const path = require("path");
-const fs = require("fs");
-const { isValidInviteCode, inviteDigest, participantName, normalizeTrackSource, isMicrophoneTrack, shouldShowInRadar, buildRadarMessage } = require("./live-studio-core");
+const { TRACK_SOURCE, isValidInviteCode, inviteDigest, cleanName, safeTrackSource, trackFlags, normalizeDurationMinutes, safeOrigin, shouldUseTextChannel, buildRadarMessage } = require("./live-studio-core");
 
-function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiRequest, checkCppRateLimit, ChannelType }) {
-  const sessions = new Map(), invites = new Map(), activities = [];
-  const baseUrl = String(process.env.PUBLIC_BASE_URL || process.env.RENDER_EXTERNAL_URL || "https://sbsx.onrender.com").trim().replace(/\/+$/, "");
+function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiRequest, checkCppRateLimit, ChannelType, allowedOrigins, setLivePresence = () => {} }) {
+  const sessions = new Map();
+  const invites = new Map();
+  const activity = [];
+  const panelOriginFallback = String(process.env.LIVE_STUDIO_PUBLIC_BASE_URL || process.env.PUBLIC_BASE_URL || "https://admin-9x7v1.wuaze.com").trim().replace(/\/+$/, "");
   const maxParticipants = Math.max(2, Math.min(100, Number(process.env.LIVE_STUDIO_MAX_PARTICIPANTS || 20)));
-  const sessionTtl = Math.max(15 * 60_000, Math.min(8 * 60 * 60_000, Number(process.env.LIVE_STUDIO_MAX_DURATION_MS || 4 * 60 * 60_000)));
-  const inviteTtl = Math.min(sessionTtl, Math.max(5 * 60_000, Number(process.env.LIVE_STUDIO_INVITE_TTL_MS || sessionTtl)));
-  const maxInviteUses = Math.max(maxParticipants, Math.min(100_000, Number(process.env.LIVE_STUDIO_MAX_INVITE_USES || 10_000)));
-  const pinAll = String(process.env.LIVE_STREAM_RADAR_PIN_ALL_TEXT_CHANNELS ?? "true").toLowerCase() !== "false";
-  const radarPath = "runtime/liveStreamRadar", pinsPath = "runtime/liveStreamRadarPins";
-  let lk = null, radarBusy = false, pinBusy = false, lastFingerprint = "";
+  const defaultDurationMinutes = normalizeDurationMinutes(process.env.LIVE_STUDIO_DEFAULT_DURATION_MINUTES || 60);
+  const maxInviteUses = Math.max(maxParticipants, Math.min(100000, Number(process.env.LIVE_STUDIO_MAX_INVITE_USES || 10000)));
+  const radarRefPath = "runtime/liveStreamRadar";
+  const pinsRefPath = "runtime/liveStreamRadarPins";
+  const pinAllTextChannels = String(process.env.LIVE_STREAM_RADAR_PIN_ALL_TEXT_CHANNELS ?? "true").toLowerCase() !== "false";
+  const denyMentions = { parse: [] };
+  let liveKitRuntime = null, radarBusy = false, pinBusy = false, lastRadarFingerprint = "", cleanupRequested = true;
+  function setLivePresenceSafely(active) {
+    try { setLivePresence(Boolean(active)); }
+    catch (err) { console.warn("Live Studio profile activity update failed:", String(err?.message || err).slice(0, 160)); }
+  }
 
   function config() {
-    const url = String(process.env.LIVEKIT_URL || "wss://sabbir-ylq7x559.livekit.cloud").trim().replace(/\/+$/, "");
-    const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim(), apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
-    const missing = [];
-    if (!apiKey) missing.push("LIVEKIT_API_KEY"); if (!apiSecret) missing.push("LIVEKIT_API_SECRET");
+    const liveKitUrl = String(process.env.LIVEKIT_URL || "").trim().replace(/\/+$/, "");
+    const apiKey = String(process.env.LIVEKIT_API_KEY || "").trim();
+    const apiSecret = String(process.env.LIVEKIT_API_SECRET || "").trim();
+    const missingVariables = [];
+    if (!liveKitUrl) missingVariables.push("LIVEKIT_URL");
+    if (!apiKey) missingVariables.push("LIVEKIT_API_KEY");
+    if (!apiSecret) missingVariables.push("LIVEKIT_API_SECRET");
     let httpUrl = "";
-    try { const u = new URL(url); if (u.protocol === "wss:") u.protocol = "https:"; else if (u.protocol === "ws:") u.protocol = "http:"; if (!/^https?:$/.test(u.protocol)) throw Error(); httpUrl = u.toString().replace(/\/$/, ""); } catch (_) { missing.push("valid LIVEKIT_URL"); }
-    return { url, httpUrl, apiKey, apiSecret, missing, configured: missing.length === 0 };
+    try { const url = new URL(liveKitUrl); if (url.protocol === "wss:") url.protocol = "https:"; else if (url.protocol === "ws:") url.protocol = "http:"; if (!/^https?:$/.test(url.protocol)) throw new Error("invalid protocol"); httpUrl = url.toString().replace(/\/$/, ""); }
+    catch (_) { if (liveKitUrl) missingVariables.push("valid LIVEKIT_URL"); }
+    return { liveKitUrl, httpUrl, apiKey, apiSecret, missingVariables, configured: missingVariables.length === 0 };
   }
   function runtime() {
-    const c = config(); if (!c.configured) throw Object.assign(new Error("LiveKit credentials missing"), { statusCode: 503, apiError: "livekit_not_configured", missingVariables: c.missing });
-    if (!lk) { const { RoomServiceClient } = require("livekit-server-sdk"); lk = { ...c, service: new RoomServiceClient(c.httpUrl, c.apiKey, c.apiSecret) }; }
-    return lk;
+    const cfg = config();
+    if (!cfg.configured) throw Object.assign(new Error("LiveKit configuration is missing"), { statusCode: 503, apiError: "livekit_not_configured", missingVariables: cfg.missingVariables });
+    if (!liveKitRuntime) {
+      const { AccessToken, RoomServiceClient } = require("livekit-server-sdk");
+      liveKitRuntime = { ...cfg, AccessToken, roomService: new RoomServiceClient(cfg.httpUrl, cfg.apiKey, cfg.apiSecret) };
+    }
+    return liveKitRuntime;
   }
-  function addActivity(type, summary, extra = {}) { const item = { id: crypto.randomBytes(6).toString("hex"), type, summary: String(summary || "").replace(/[\r\n\0]+/g, " ").slice(0, 200), at: Date.now(), ...extra }; activities.unshift(item); if (activities.length > 30) activities.length = 30; return item; }
-  function active() { const s = sessions.get(guildId); return s && !s.endedAt && s.expiresAt > Date.now() ? s : null; }
-  function fail(res, err, fallback) { const status = Number(err?.statusCode) || 500; if (status >= 500) console.error("Live Studio API failed:", String(err?.apiError || fallback), String(err?.message || "").slice(0, 220)); return res.status(status).json({ ok: false, error: String(err?.apiError || fallback), message: String(err?.message || "Request failed").slice(0, 240), ...(Array.isArray(err?.missingVariables) ? { missingVariables: err.missingVariables } : {}) }); }
-  async function makeToken(session, identity, name, role, ttl = "4h") {
-    const { AccessToken } = require("livekit-server-sdk"), c = runtime();
-    const token = new AccessToken(c.apiKey, c.apiSecret, { identity, name: participantName(name), ttl, metadata: JSON.stringify({ app: "RKBACKLES", sessionId: session.sessionId, role }) });
-    const sources = role === "guest" && session.muteAllActive ? [3, 4] : [2, 3, 4];
-    token.addGrant({ roomJoin: true, room: session.roomName, canPublish: true, canSubscribe: true, canPublishData: true, canPublishSources: sources });
-    return { token: await token.toJwt(), serverUrl: c.url };
+  function addActivity(type, summary, extra = {}) {
+    const entry = { id: crypto.randomBytes(6).toString("hex"), type: String(type).slice(0, 40), summary: String(summary || "").replace(/[\r\n\0]+/g, " ").slice(0, 200), at: Date.now(), ...extra };
+    activity.unshift(entry); if (activity.length > 40) activity.length = 40; return entry;
   }
-  function createInvite(session) {
-    const code = crypto.randomBytes(32).toString("base64url"), expiresAt = Math.min(session.expiresAt, Date.now() + inviteTtl);
-    invites.set(inviteDigest(code), { sessionId: session.sessionId, guildId, expiresAt, uses: 0, maxUses: maxInviteUses });
-    session.inviteCode = code; session.inviteUrl = `${baseUrl}/live-room?invite=${encodeURIComponent(code)}`; session.inviteExpiresAt = expiresAt;
+  function activeSession() {
+    const session = sessions.get(guildId);
+    return session && !session.endedAt && session.expiresAt > Date.now() ? session : null;
+  }
+  function apiError(res, err, fallback = "live_studio_error") {
+    const status = Number(err?.statusCode) || 500;
+    if (status >= 500) console.error("Live Studio API error:", String(err?.apiError || fallback), String(err?.message || "unknown").replace(/[\r\n\0]+/g, " ").slice(0, 220));
+    return res.status(status).json({ ok: false, error: String(err?.apiError || fallback), message: String(err?.message || "Request failed").slice(0, 260), ...(Array.isArray(err?.missingVariables) ? { missingVariables: err.missingVariables } : {}) });
+  }
+  function allowedPanelOrigin(req, requestedOrigin) {
+    const origin = String(requestedOrigin || req.get("origin") || "");
+    const fallback = (() => { try { return new URL(panelOriginFallback).origin; } catch (_) { return "https://admin-9x7v1.wuaze.com"; } })();
+    return safeOrigin(origin, allowedOrigins, fallback);
+  }
+  async function createAccessToken(session, identity, name, role) {
+    const rt = runtime();
+    const token = new rt.AccessToken(rt.apiKey, rt.apiSecret, {
+      identity: String(identity).slice(0, 120), name: cleanName(name),
+      ttl: Math.max(60, Math.floor((session.expiresAt - Date.now()) / 1000)),
+      metadata: JSON.stringify({ app: "RKBACKLES", sessionId: session.sessionId, role })
+    });
+    // LiveKit's TrackSource is a numeric protobuf enum: microphone=2, screen_share=3,
+    // screen_share_audio=4. Do NOT pass the strings "microphone" etc. in grants.
+    const allowedSources = role === "guest" && session.muteAllActive
+      ? [TRACK_SOURCE.SCREEN_SHARE, TRACK_SOURCE.SCREEN_SHARE_AUDIO]
+      : [TRACK_SOURCE.MICROPHONE, TRACK_SOURCE.SCREEN_SHARE, TRACK_SOURCE.SCREEN_SHARE_AUDIO];
+    token.addGrant({ roomJoin: true, room: session.roomName, canPublish: true, canSubscribe: true, canPublishData: true, canPublishSources: allowedSources });
+    return { token: await token.toJwt(), serverUrl: rt.liveKitUrl };
+  }
+  function makeInvite(session) {
+    const code = crypto.randomBytes(32).toString("base64url");
+    const expiresAt = session.expiresAt;
+    invites.set(inviteDigest(code), { sessionId: session.sessionId, expiresAt, uses: 0, maxUses: maxInviteUses, createdAt: Date.now() });
+    session.inviteCode = code;
+    session.inviteUrl = `${session.publicOrigin}/live-room.html?invite=${encodeURIComponent(code)}`;
+    session.inviteExpiresAt = expiresAt;
     return { inviteCode: code, inviteUrl: session.inviteUrl, expiresAt, maxUses: maxInviteUses };
   }
-  function hostUrl(session, token) { return `${baseUrl}/live-room#${new URLSearchParams({ token: token.token, serverUrl: token.serverUrl, room: session.roomName, role: "host", name: "RKBACKLES Host", sessionId: session.sessionId })}`; }
-  async function getParticipants(session) { if (!session) return []; try { return await session.service.listParticipants(session.roomName); } catch (e) { if (/not found|does not exist/i.test(String(e.message || ""))) return []; throw e; } }
-  function safeParticipant(p, session) { const tracks = Array.isArray(p.tracks) ? p.tracks : []; const mics = tracks.filter(isMicrophoneTrack); return { identity: String(p.identity || "").slice(0, 120), name: String(p.name || p.identity || "Guest").slice(0, 80), role: p.identity === session.hostIdentity ? "host" : "guest", micMuted: session.muted.has(String(p.identity)) || (mics.length > 0 && mics.every(t => t.muted)), micActive: mics.some(t => !t.muted), screenSharing: tracks.some(t => { const source = normalizeTrackSource(t.source); return [3,4].includes(source) || (typeof source === "string" && /screen_share|screenshare/.test(source)); }) }; }
-  async function enforceMutes(session, participants) { const service = runtime().service; for (const p of participants) { const id = String(p.identity || ""); if (id === session.hostIdentity || !(session.muteAll || session.muted.has(id))) continue; for (const t of p.tracks || []) if (isMicrophoneTrack(t) && !t.muted) await service.mutePublishedTrack(session.roomName, id, t.sid, true).catch(() => {}); } }
-  function voiceSnapshot() {
-    const guild = client.guilds.cache.get(guildId); if (!guild) return { guildName: "Discord server", channels: [], count: 0 };
-    const channels = []; let count = 0;
-    for (const ch of guild.channels.cache.values()) if ([ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(ch.type)) {
-      const members = [...(ch.members?.values?.() || [])].map(m => ({ id: m.id, name: String(m.displayName || m.user?.username || m.id).slice(0, 80), bot: Boolean(m.user?.bot), muted: Boolean(m.voice?.serverMute || m.voice?.selfMute), deafened: Boolean(m.voice?.serverDeaf || m.voice?.selfDeaf) }));
-      count += members.length; channels.push({ id: ch.id, name: String(ch.name || "Voice channel").slice(0, 100), type: ch.type === ChannelType.GuildStageVoice ? "stage" : "voice", memberCount: members.length, members });
-    }
-    channels.sort((a,b) => a.name.localeCompare(b.name)); return { guildName: String(guild.name || "Discord server").slice(0, 120), channels, count };
+  function hostUrl(session, token) {
+    return `${session.publicOrigin}/live-room.html#${new URLSearchParams({ token: token.token, serverUrl: token.serverUrl, room: session.roomName, role: "host", name: "RKBACKLES Host", sessionId: session.sessionId })}`;
   }
-  async function syncPinned(guild, text, fingerprint) {
-    if (!pinAll || pinBusy || !guild) return; pinBusy = true;
+  async function getParticipants(session) {
+    if (!session) return [];
+    try { return await session.roomService.listParticipants(session.roomName); }
+    catch (err) { if (/not found|does not exist/i.test(String(err?.message || ""))) return []; throw err; }
+  }
+  function participantSummary(p, session) {
+    const tracks = Array.isArray(p.tracks) ? p.tracks : [];
+    const sources = tracks.map(track => safeTrackSource(track?.source));
+    const microphoneTracks = tracks.filter(track => safeTrackSource(track?.source) === TRACK_SOURCE.MICROPHONE);
+    const id = String(p.identity || "");
+    return {
+      identity: id.slice(0, 120), name: String(p.name || id || "Guest").slice(0, 80), role: id === session.hostIdentity ? "host" : "guest",
+      joinedAt: Number(p.joinedAt) || 0, trackCount: tracks.length,
+      micMuted: session.mutedIdentities.has(id) || (microphoneTracks.length > 0 && microphoneTracks.every(track => track.muted)),
+      micActive: microphoneTracks.some(track => !track.muted), screenSharing: sources.includes(TRACK_SOURCE.SCREEN_SHARE),
+      screenShareAudio: sources.includes(TRACK_SOURCE.SCREEN_SHARE_AUDIO)
+    };
+  }
+  async function enforceMutePolicy(session, participants) {
+    for (const p of participants) {
+      const identity = String(p.identity || "");
+      if (!identity || identity === session.hostIdentity || !(session.muteAllActive || session.mutedIdentities.has(identity))) continue;
+      for (const track of (Array.isArray(p.tracks) ? p.tracks : [])) {
+        if (safeTrackSource(track?.source) === TRACK_SOURCE.MICROPHONE && !track.muted) {
+          await session.roomService.mutePublishedTrack(session.roomName, identity, track.sid, true).catch(() => {});
+        }
+      }
+    }
+  }
+  function getVoiceDirectory() {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) return { guildName: "Discord server", memberCount: 0, channels: [] };
+    const channels = [];
+    let memberCount = 0;
+    for (const channel of guild.channels.cache.values()) {
+      if (![ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(channel.type)) continue;
+      const members = [...(channel.members?.values?.() || [])].map(member => ({
+        id: member.id, name: String(member.displayName || member.user?.username || member.id).slice(0, 80), bot: Boolean(member.user?.bot),
+        muted: Boolean(member.voice?.serverMute || member.voice?.selfMute), deafened: Boolean(member.voice?.serverDeaf || member.voice?.selfDeaf)
+      }));
+      memberCount += members.length;
+      channels.push({ id: channel.id, name: String(channel.name || "Voice channel").slice(0, 100), type: channel.type === ChannelType.GuildStageVoice ? "stage" : "voice", memberCount: members.length, members });
+    }
+    channels.sort((a, b) => a.name.localeCompare(b.name));
+    return { guildName: String(guild.name || "Discord server").slice(0, 120), memberCount, channels };
+  }
+  async function syncLiveRadarMessages(guild, text, fingerprint) {
+    if (!pinAllTextChannels || pinBusy || !guild || !activeSession()) return;
+    pinBusy = true;
     try {
-      const ref = db.ref(pinsPath), saved = (await ref.once("value").catch(() => null))?.val() || {};
-      for (const ch of guild.channels.cache.values()) {
-        if (!shouldShowInRadar(ch)) continue;
-        let record = saved[ch.id], message = record?.messageId ? await ch.messages.fetch(String(record.messageId)).catch(() => null) : null;
-        // After a redeploy, the Firebase message index may be missing while the old pinned message still exists.
-        // Reuse that message rather than creating a duplicate radar post.
+      const ref = db.ref(pinsRefPath);
+      const saved = (await ref.once("value").catch(() => null))?.val() || {};
+      for (const channel of guild.channels.cache.values()) {
+        if (!shouldUseTextChannel(channel, ChannelType)) continue;
+        let record = saved[channel.id];
+        let message = record?.messageId ? await channel.messages.fetch(String(record.messageId)).catch(() => null) : null;
+        // Recover a previous bot-owned live radar after a process restart, avoiding duplicates.
         if (!message && !record) {
-          const pinned = typeof ch.messages.fetchPinned === "function" ? await ch.messages.fetchPinned().catch(() => null) : null;
+          let pinned = null;
+          if (typeof channel.messages.fetchPinned === "function") pinned = await channel.messages.fetchPinned().catch(() => null);
           message = pinned?.find?.(m => m.author?.id === client.user?.id && /LIVE STREAM RADAR/.test(String(m.content || ""))) || null;
           if (!message) {
-            const recent = await ch.messages.fetch({ limit: 50 }).catch(() => null);
+            const recent = await channel.messages.fetch({ limit: 50 }).catch(() => null);
             message = recent?.find?.(m => m.author?.id === client.user?.id && /LIVE STREAM RADAR/.test(String(m.content || ""))) || null;
           }
-          if (message) record = { messageId: message.id, pinned: Boolean(message.pinned), channelName: String(ch.name || "").slice(0,100), fingerprint: "", createdAt: message.createdTimestamp || Date.now() };
+          if (message) record = { messageId: message.id, pinned: Boolean(message.pinned), fingerprint: "", createdAt: message.createdTimestamp || Date.now() };
         }
         if (message) {
-          if (record?.fingerprint !== fingerprint) await message.edit({ content: text, allowedMentions: { parse: [] } }).catch(e => console.warn("Radar edit failed", ch.id, e.message));
-          if (record?.pinned === false) await message.pin("RKBACKLES LIVE STREAM RADAR — persistent status").then(() => { record.pinned = true; }).catch(e => console.warn("Radar repin denied", ch.id, e.message));
+          try { if (record?.fingerprint !== fingerprint) await message.edit({ content: text, allowedMentions: denyMentions }); }
+          catch (err) { console.warn("Live Stream Radar edit failed:", channel.id, String(err?.message || err).slice(0, 160)); continue; }
+          if (!record) record = { messageId: message.id, pinned: Boolean(message.pinned), createdAt: message.createdTimestamp || Date.now(), fingerprint: "" };
+          if (!record.pinned) {
+            try { await message.pin("RKBACKLES LIVE STREAM RADAR · live status"); record.pinned = true; }
+            catch (err) { console.warn("Live Stream Radar pin denied:", channel.id, String(err?.message || err).slice(0, 160)); }
+          }
         } else {
-          try { message = await ch.send({ content: text, allowedMentions: { parse: [] } }); let pinned = false; try { await message.pin("RKBACKLES LIVE STREAM RADAR — persistent status"); pinned = true; } catch (e) { console.warn("Radar pin denied", ch.id, e.message); } record = { messageId: message.id, pinned, channelName: String(ch.name || "").slice(0,100), fingerprint, createdAt: Date.now() }; await ref.child(ch.id).set(record).catch(() => {}); saved[ch.id] = record; await new Promise(r => setTimeout(r,250)); continue; } catch (e) { console.warn("Radar post denied", ch.id, e.message); continue; }
+          try { message = await channel.send({ content: text, allowedMentions: denyMentions }); }
+          catch (err) { console.warn("Live Stream Radar could not post in channel:", channel.id, String(err?.message || err).slice(0, 180)); continue; }
+          let pinned = false;
+          try { await message.pin("RKBACKLES LIVE STREAM RADAR · live status"); pinned = true; }
+          catch (err) { console.warn("Live Stream Radar pin denied:", channel.id, String(err?.message || err).slice(0, 160)); }
+          record = { messageId: message.id, pinned, createdAt: Date.now(), fingerprint: "" };
         }
-        if (record) { record = { ...record, channelName: String(ch.name || "").slice(0,100), fingerprint, lastSyncAt: Date.now() }; await ref.child(ch.id).update(record).catch(() => {}); saved[ch.id] = record; }
+        record = { ...record, messageId: message.id, channelName: String(channel.name || "").slice(0, 100), fingerprint, lastSyncAt: Date.now() };
+        await ref.child(channel.id).set(record).catch(err => console.warn("Radar pin index update failed:", err.message));
       }
     } finally { pinBusy = false; }
   }
-  async function endSession(reason = "ended", actor = "admin") {
-    const s = sessions.get(guildId); if (!s || s.endedAt) return { active: false };
-    s.endedAt = Date.now(); if (s.timer) clearTimeout(s.timer); sessions.delete(guildId);
-    for (const [digest, invite] of invites) if (invite.sessionId === s.sessionId) invites.delete(digest);
-    await s.service.deleteRoom(s.roomName).catch(e => console.warn("LiveKit room delete failed", e.message));
-    addActivity("room_end", `Live Studio ended: ${reason}`, { actor }); return { active: false, sessionId: s.sessionId };
+  async function cleanupLiveRadarMessages(guild) {
+    if (!guild || pinBusy) return;
+    pinBusy = true;
+    try {
+      const ref = db.ref(pinsRefPath);
+      const saved = (await ref.once("value").catch(() => null))?.val() || {};
+      for (const channel of guild.channels.cache.values()) {
+        if (!shouldUseTextChannel(channel, ChannelType)) continue;
+        let record = saved[channel.id];
+        let message = record?.messageId ? await channel.messages.fetch(String(record.messageId)).catch(() => null) : null;
+        if (!message && !record) {
+          const pinned = typeof channel.messages.fetchPinned === "function" ? await channel.messages.fetchPinned().catch(() => null) : null;
+          message = pinned?.find?.(m => m.author?.id === client.user?.id && /LIVE STREAM RADAR/.test(String(m.content || ""))) || null;
+        }
+        if (!message) continue;
+        if (message.pinned) await message.unpin("Live Studio ended; clean up live status").catch(err => console.warn("Radar unpin failed:", channel.id, String(err?.message || err).slice(0, 140)));
+        await message.delete().catch(err => console.warn("Live Stream Radar cleanup failed:", channel.id, String(err?.message || err).slice(0, 160)));
+      }
+      await ref.remove().catch(() => {});
+    } finally { pinBusy = false; }
   }
   async function publishRadar(forcePin = false) {
-    if (radarBusy) return; radarBusy = true;
+    if (radarBusy) return;
+    radarBusy = true;
     try {
-      const voice = voiceSnapshot(); let s = active(); const stored = sessions.get(guildId);
-      if (!s && stored && !stored.endedAt && stored.expiresAt <= Date.now()) { await endSession("session expired", "system"); s = null; }
-      let ps = s ? await getParticipants(s).catch(e => { console.warn("Radar participant poll failed", e.message); return []; }) : [];
-      if (s) await enforceMutes(s, ps).catch(e => console.warn("Live mute enforcement failed", e.message));
-      const nowParticipants = new Map(ps.map(p => [String(p.identity), p]));
-      if (s) {
-        const previous = s.lastParticipants || new Map();
-        const stateOf = p => { const safe = safeParticipant(p, s); return { micMuted: safe.micMuted, screenSharing: safe.screenSharing, trackCount: Array.isArray(p.tracks) ? p.tracks.length : 0 }; };
-        for (const [id, p] of nowParticipants) {
-          if (!previous.has(id)) addActivity("live_join", `${p.name || id} joined Live Studio`);
+      let session = activeSession();
+      const guild = client.guilds.cache.get(guildId);
+      const voice = getVoiceDirectory();
+      if (!session) {
+        const expired = sessions.get(guildId);
+        if (expired && !expired.endedAt && expired.expiresAt <= Date.now()) await endSession("configured duration elapsed", "system", false);
+        session = activeSession();
+      }
+      let participantInfos = [];
+      if (session) {
+        participantInfos = await getParticipants(session).catch(err => { console.warn("LiveKit participant poll failed:", String(err?.message || err).slice(0, 180)); return []; });
+        await enforceMutePolicy(session, participantInfos).catch(err => console.warn("LiveKit mute policy error:", err.message));
+        const current = new Map(participantInfos.map(p => [String(p.identity), { p, state: participantSummary(p, session) }]));
+        const previous = session.lastParticipantSnapshot || new Map();
+        for (const [id, value] of current) {
+          if (!previous.has(id)) addActivity("live_join", `${value.state.name} joined Live Studio`);
           else {
-            const before = stateOf(previous.get(id)), after = stateOf(p);
-            if (before.screenSharing !== after.screenSharing) addActivity(after.screenSharing ? "screen_share_start" : "screen_share_stop", `${p.name || id} ${after.screenSharing ? "started" : "stopped"} screen sharing`);
-            if (before.micMuted !== after.micMuted) addActivity(after.micMuted ? "mic_muted" : "mic_unmuted", `${p.name || id} microphone ${after.micMuted ? "muted" : "unmuted"}`);
-            else if (before.micActive !== after.micActive) addActivity(after.micActive ? "mic_publish_start" : "mic_publish_stop", `${p.name || id} microphone ${after.micActive ? "started" : "stopped"}`);
-            if (before.trackCount !== after.trackCount && before.screenSharing === after.screenSharing && before.micActive === after.micActive && before.micMuted === after.micMuted) addActivity("media_track_change", `${p.name || id} media tracks updated (${after.trackCount})`);
+            const before = previous.get(id).state, after = value.state;
+            if (before.screenSharing !== after.screenSharing) addActivity(after.screenSharing ? "screen_share_start" : "screen_share_stop", `${after.name} ${after.screenSharing ? "started" : "stopped"} screen sharing`);
+            if (before.micMuted !== after.micMuted) addActivity(after.micMuted ? "mic_muted" : "mic_unmuted", `${after.name} microphone ${after.micMuted ? "muted" : "unmuted"}`);
           }
         }
-        for (const [id, p] of previous) if (!nowParticipants.has(id)) addActivity("live_leave", `${p.name || id} left Live Studio`);
-        s.lastParticipants = nowParticipants;
+        for (const [id, value] of previous) if (!current.has(id)) addActivity("live_leave", `${value.state.name} left Live Studio`);
+        session.lastParticipantSnapshot = current;
       }
-      const latest = activities[0] || { id: "initial", summary: "Waiting for activity", at: Date.now() };
-      const pinSnap = await db.ref(pinsPath).once("value").catch(() => null); const pinRecords = Object.values(pinSnap?.val() || {}); const pinCount = pinRecords.filter(record => record?.pinned === true).length;
-      const data = { version: "1.5.28", guildId, guildName: voice.guildName, active: Boolean(s), updatedAt: Date.now(), latestActivityAt: latest.at,
-        session: s ? { sessionId: s.sessionId, roomName: s.roomName, startedAt: s.startedAt, expiresAt: s.expiresAt, inviteUrl: s.inviteUrl, inviteExpiresAt: s.inviteExpiresAt, participantCount: ps.length, muteAll: s.muteAll } : null,
-        discord: { voiceMemberCount: voice.count, channels: voice.channels }, liveParticipants: ps.map(p => safeParticipant(p,s)), activity: activities.slice(0,25), radar: { pinAllTextChannels: pinAll, pinnedMessageCount: pinCount } };
-      await db.ref(radarPath).set(data).catch(e => console.error("Radar Firebase update failed", e.message));
-      const fingerprint = crypto.createHash("sha256").update(JSON.stringify({ active: data.active, session: s?.sessionId || "", people: ps.map(p => { const st = safeParticipant(p, s || { muted: new Set(), muteAll: false, hostIdentity: "" }); return [p.identity, st.micMuted, st.micActive, st.screenSharing, (p.tracks || []).length]; }).sort((a,b) => String(a[0]).localeCompare(String(b[0]))), channels: voice.channels.map(c => [c.id,c.name,c.memberCount,c.members.map(m=>[m.id,m.muted,m.deafened])]), latest: latest.id || latest.at, invite: s?.inviteUrl || "" })).digest("hex");
-      if (forcePin || fingerprint !== lastFingerprint) { lastFingerprint = fingerprint; await syncPinned(client.guilds.cache.get(guildId), buildRadarMessage({ guildName: voice.guildName, active: Boolean(s), inviteUrl: s?.inviteUrl || "", participantCount: ps.length, voiceMemberCount: voice.count, updatedAt: latest.at || s?.startedAt || Date.now(), latestActivity: latest.summary }), fingerprint); }
-    } catch (e) { console.error("LIVE STREAM RADAR refresh failed:", String(e.message || e).slice(0,220)); }
+      const safeParticipants = session ? participantInfos.map(p => participantSummary(p, session)) : [];
+      const screenShareCount = safeParticipants.filter(p => p.screenSharing).length;
+      const latest = activity[0] || { id: "idle", type: "status", summary: "Waiting for live session", at: Date.now() };
+      const pinSnapshot = await db.ref(pinsRefPath).once("value").catch(() => null);
+      const pinRecords = Object.values(pinSnapshot?.val() || {});
+      const data = {
+        version: "1.5.39", guildId, guildName: voice.guildName, active: Boolean(session), updatedAt: Date.now(),
+        durationMinutes: session?.durationMinutes || 0, startedAt: session?.startedAt || 0, endsAt: session?.expiresAt || 0,
+        voiceChannelCount: voice.channels.length, discordVoiceMemberCount: voice.memberCount,
+        screenShareCount, participantCount: safeParticipants.length,
+        session: session ? { sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: session.inviteUrl, inviteExpiresAt: session.inviteExpiresAt, participantCount: safeParticipants.length, screenShareCount, muteAllActive: session.muteAllActive } : null,
+        discord: { voiceMemberCount: voice.memberCount, channels: voice.channels }, liveParticipants: safeParticipants, activity: activity.slice(0, 25),
+        radar: { pinAllTextChannels, pinnedMessageCount: pinRecords.filter(record => record?.pinned === true).length }
+      };
+      await db.ref(radarRefPath).set(data).catch(err => console.error("Live Stream Radar Firebase update failed:", err.message));
+      if (cleanupRequested && !session && guild) { await cleanupLiveRadarMessages(guild); cleanupRequested = false; }
+      if (session) {
+        const fingerprint = crypto.createHash("sha256").update(JSON.stringify({ session: session.sessionId, participantState: safeParticipants.map(p => [p.identity, p.micMuted, p.micActive, p.screenSharing, p.trackCount]).sort((a, b) => String(a[0]).localeCompare(String(b[0]))), channels: voice.channels.map(c => [c.id, c.name, c.memberCount, c.members.map(m => [m.id, m.muted, m.deafened])]), latest: latest.id, inviteUrl: session.inviteUrl, expiresAt: session.expiresAt })).digest("hex");
+        if (forcePin || fingerprint !== lastRadarFingerprint) {
+          lastRadarFingerprint = fingerprint;
+          const text = buildRadarMessage({ guildName: voice.guildName, active: true, inviteUrl: session.inviteUrl, durationMinutes: session.durationMinutes, endsAt: session.expiresAt, participantCount: safeParticipants.length, screenShareCount, voiceMemberCount: voice.memberCount, updatedAt: latest.at, latestActivity: latest.summary });
+          await syncLiveRadarMessages(guild, text, fingerprint);
+        }
+      } else if (forcePin) {
+        lastRadarFingerprint = "";
+        cleanupRequested = true;
+        if (guild) { await cleanupLiveRadarMessages(guild); cleanupRequested = false; }
+      }
+    } catch (err) { console.error("LIVE STREAM RADAR refresh failed:", String(err?.message || err).replace(/[\r\n\0]+/g, " ").slice(0, 220)); }
     finally { radarBusy = false; }
   }
-  async function startSession(actorUid) {
-    const old = sessions.get(guildId); if (old && !old.endedAt && old.expiresAt <= Date.now()) await endSession("expired before restart", "system");
-    if (active()) throw Object.assign(new Error("Live Studio is already active"), { statusCode: 409, apiError: "live_studio_already_active" });
-    const cfg = runtime(), sessionId = crypto.randomBytes(12).toString("base64url"), roomName = `rkbs_${guildId}_${crypto.randomBytes(7).toString("hex")}`;
-    await cfg.service.createRoom({ name: roomName, emptyTimeout: 90, maxParticipants, metadata: JSON.stringify({ app: "RKBACKLES", sessionId, guildId }) });
-    const s = { sessionId, guildId, roomName, service: cfg.service, ownerUid: actorUid, startedAt: Date.now(), expiresAt: Date.now()+sessionTtl,
-      hostIdentity: `host_${crypto.createHash("sha256").update(String(actorUid)).digest("hex").slice(0,12)}`, muted: new Set(), muteAll: false, denied: new Set(), lastParticipants: new Map(), endedAt: 0 };
-    try { sessions.set(guildId,s); const invite=createInvite(s), hostToken=await makeToken(s,s.hostIdentity,"RKBACKLES Host","host"); s.timer=setTimeout(()=>endSession("maximum duration reached","system").then(()=>publishRadar(true)).catch(()=>{}),sessionTtl); s.timer.unref?.(); addActivity("room_start",`Live Studio started by Firebase admin ${actorUid}`); return { session:s, invite, hostToken }; }
-    catch(e) { sessions.delete(guildId); for(const [d,i] of invites)if(i.sessionId===sessionId)invites.delete(d); await cfg.service.deleteRoom(roomName).catch(()=>{}); throw e; }
+  async function endSession(reason = "ended by Admin", actorUid = "admin", shouldPublish = true) {
+    const session = sessions.get(guildId);
+    if (!session || session.endedAt) return { active: false };
+    session.endedAt = Date.now(); if (session.expiryTimer) clearTimeout(session.expiryTimer);
+    sessions.delete(guildId);
+    setLivePresenceSafely(false);
+    for (const [digest, invite] of invites) if (invite.sessionId === session.sessionId) invites.delete(digest);
+    await session.roomService.deleteRoom(session.roomName).catch(err => console.warn("LiveKit room cleanup failed:", err.message));
+    addActivity("room_end", `Live Studio ended: ${String(reason).slice(0, 100)}`, { actor: String(actorUid).slice(0, 80) });
+    cleanupRequested = true;
+    if (shouldPublish) await publishRadar(true);
+    return { active: false, sessionId: session.sessionId };
   }
-  function hostUrl(s, access) { return `${baseUrl}/live-room#${new URLSearchParams({ token: access.token, serverUrl: access.serverUrl, room: s.roomName, role: "host", name: "RKBACKLES Host", sessionId: s.sessionId })}`; }
-  function statusPayload(s=active()) { const c=config(); return { ok:true, version:"1.5.33", configured:c.configured, missingVariables:c.missing, active:Boolean(s), session:s?{sessionId:s.sessionId,roomName:s.roomName,startedAt:s.startedAt,expiresAt:s.expiresAt,inviteUrl:s.inviteUrl,muteAll:s.muteAll}:null }; }
+  async function startSession(actorUid, options, req) {
+    const old = sessions.get(guildId);
+    if (old && !old.endedAt && old.expiresAt <= Date.now()) await endSession("session expired before restart", "system", false);
+    if (activeSession()) throw Object.assign(new Error("Live Studio is already active"), { statusCode: 409, apiError: "live_studio_already_active" });
+    const cfg = runtime();
+    const requestedOrigin = String(options?.publicOrigin || req?.get("origin") || panelOriginFallback);
+    const publicOrigin = allowedPanelOrigin(req, requestedOrigin);
+    if (!allowedOrigins.has(publicOrigin)) throw Object.assign(new Error("Admin Panel origin is not allowed. Add it to ADMIN_PANEL_ORIGINS."), { statusCode: 400, apiError: "live_studio_panel_origin_not_allowed" });
+    const durationMinutes = normalizeDurationMinutes(options?.durationMinutes, defaultDurationMinutes);
+    const startedAt = Date.now(), expiresAt = startedAt + durationMinutes * 60_000;
+    const sessionId = crypto.randomBytes(12).toString("base64url");
+    const roomName = `rkbs_${guildId}_${crypto.randomBytes(8).toString("hex")}`;
+    await cfg.roomService.createRoom({ name: roomName, emptyTimeout: 90, maxParticipants, metadata: JSON.stringify({ app: "RKBACKLES", sessionId, guildId }) });
+    const session = {
+      sessionId, guildId, roomName, roomService: cfg.roomService, ownerUid: actorUid, startedAt, expiresAt, durationMinutes, publicOrigin,
+      hostIdentity: `host_${crypto.createHash("sha256").update(String(actorUid)).digest("hex").slice(0, 12)}`,
+      mutedIdentities: new Set(), muteAllActive: false, lastParticipantSnapshot: new Map(), endedAt: 0
+    };
+    try {
+      sessions.set(guildId, session);
+      setLivePresenceSafely(true);
+      const invite = makeInvite(session);
+      const hostAccess = await createAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host");
+      session.expiryTimer = setTimeout(() => endSession("custom live duration ended", "system").catch(err => console.error("Live Studio auto-end failed:", err.message)), Math.max(1000, expiresAt - Date.now()));
+      session.expiryTimer.unref?.();
+      addActivity("room_start", `Live Studio started for ${durationMinutes} minutes by admin ${actorUid}`);
+      return { session, invite, hostAccess };
+    } catch (err) {
+      sessions.delete(guildId);
+      setLivePresenceSafely(false);
+      for (const [digest, invite] of invites) if (invite.sessionId === sessionId) invites.delete(digest);
+      await cfg.roomService.deleteRoom(roomName).catch(() => {});
+      throw err;
+    }
+  }
 
-  app.get("/api/live-studio/route-health",(req,res)=>{const c=config(),p=path.join(__dirname,"public");const pages={liveRoom:fs.existsSync(path.join(p,"live-room.html")),discordShareStudio:fs.existsSync(path.join(p,"discord-share-studio.html"))};return res.set("Cache-Control","no-store").json({ok:true,version:"1.5.33",configured:c.configured,missingVariables:c.missing,pages,ready:pages.liveRoom&&pages.discordShareStudio&&c.configured});});
-  for (const [route,file] of [["/live-room","live-room.html"],["/discord-share-studio","discord-share-studio.html"]]) app.get(route,(req,res)=>{const p=path.join(__dirname,"public",file);if(!fs.existsSync(p))return res.status(503).type("text/plain; charset=utf-8").send(`Missing public/${file}; deploy complete v1.5.28 public folder.`);res.set({"Cache-Control":"no-store","X-Content-Type-Options":"nosniff","Referrer-Policy":"no-referrer"});return res.sendFile(p);});
-  app.get("/api/admin/live-studio/status",async(req,res)=>{try{await verifyAdminApiRequest(req);const s=active(),ps=s?await getParticipants(s):[],radar=(await db.ref(radarPath).once("value").catch(()=>null))?.val()||null;const payload={...statusPayload(s),participants:s?ps.map(p=>safeParticipant(p,s)):[],radar};if(s){const hostToken=await makeToken(s,s.hostIdentity,"RKBACKLES Host","host");payload.hostJoinUrl=hostUrl(s,hostToken);}return res.set("Cache-Control","no-store").json(payload);}catch(e){return fail(res,e,"live_studio_status_failed");}});
-  app.post("/api/admin/live-studio/start",async(req,res)=>{try{const actor=await verifyAdminApiRequest(req);if(!checkCppRateLimit(req,res,"live-studio-start",6,60000))return;const {session,invite,hostToken}=await startSession(actor.uid);await db.ref("auditLog").push({adminUid:actor.uid,actionType:"live_studio_start",timestamp:Date.now(),summary:`Live Studio started; participant invite pinned in eligible Discord channels`}).catch(()=>{});await publishRadar(true);return res.json({ok:true,version:"1.5.33",active:true,sessionId:session.sessionId,roomName:session.roomName,startedAt:session.startedAt,expiresAt:session.expiresAt,inviteUrl:invite.inviteUrl,inviteCode:invite.inviteCode,maxUses:invite.maxUses,hostJoinUrl:hostUrl(session,hostToken),radarPinsEnabled:pinAll});}catch(e){return fail(res,e,"live_studio_start_failed");}});
-  app.post("/api/admin/live-studio/invite",async(req,res)=>{try{const actor=await verifyAdminApiRequest(req);if(!checkCppRateLimit(req,res,"live-studio-invite",12,60000))return;const s=active();if(!s)throw Object.assign(new Error("Start Live Studio first"),{statusCode:409,apiError:"live_studio_not_active"});const invite=createInvite(s);await db.ref("auditLog").push({adminUid:actor.uid,actionType:"live_studio_invite_create",timestamp:Date.now(),summary:`Created multi-use Live Studio participant invite`}).catch(()=>{});await publishRadar(true);return res.json({ok:true,...invite,sessionId:s.sessionId});}catch(e){return fail(res,e,"live_studio_invite_failed");}});
-  app.post("/api/admin/live-studio/end",async(req,res)=>{try{const actor=await verifyAdminApiRequest(req);if(!checkCppRateLimit(req,res,"live-studio-end",10,60000))return;const result=await endSession("ended by Firebase admin",actor.uid);await db.ref("auditLog").push({adminUid:actor.uid,actionType:"live_studio_end",timestamp:Date.now(),summary:`Live Studio ended`}).catch(()=>{});await publishRadar(true);return res.json({ok:true,...result});}catch(e){return fail(res,e,"live_studio_end_failed");}});
-  app.post("/api/live-studio/redeem",async(req,res)=>{try{if(!checkCppRateLimit(req,res,"live-studio-redeem",30,60000))return;const code=String(req.body?.inviteCode||"");if(!isValidInviteCode(code))throw Object.assign(new Error("Invite code is invalid"),{statusCode:400,apiError:"live_studio_invite_invalid"});const d=inviteDigest(code),inv=invites.get(d);if(!inv||inv.expiresAt<=Date.now()||inv.guildId!==guildId){invites.delete(d);throw Object.assign(new Error("Invite expired or invalid"),{statusCode:410,apiError:"live_studio_invite_expired"});}const s=active();if(!s||s.sessionId!==inv.sessionId)throw Object.assign(new Error("Live Studio is not active"),{statusCode:410,apiError:"live_studio_not_active"});if(inv.uses>=inv.maxUses)throw Object.assign(new Error("Invite has reached its admission limit"),{statusCode:410,apiError:"live_studio_invite_exhausted"});inv.uses+=1;const identity=`guest_${crypto.randomBytes(12).toString("hex")}`,name=participantName(req.body?.displayName,"Live guest"),access=await makeToken(s,identity,name,"guest");addActivity("invite_join",`${name} redeemed a participant invite`);await publishRadar(false);return res.json({ok:true,sessionId:s.sessionId,roomName:s.roomName,identity,name,role:"guest",...access});}catch(e){return res.status(Number(e.statusCode)||500).json({ok:false,error:String(e.apiError||"live_studio_redeem_failed"),message:String(e.message||"Could not join").slice(0,240)});}});
-  app.post("/api/admin/live-studio/mute",async(req,res)=>{try{const actor=await verifyAdminApiRequest(req);if(!checkCppRateLimit(req,res,"live-studio-mute",60,60000))return;const s=active();if(!s)throw Object.assign(new Error("No active Live Studio"),{statusCode:409,apiError:"live_studio_not_active"});const id=String(req.body?.identity||"");if(!id.startsWith("guest_"))throw Object.assign(new Error("Only guests can be muted"),{statusCode:400,apiError:"invalid_studio_target"});const ps=await getParticipants(s),p=ps.find(x=>String(x.identity)===id);if(!p)throw Object.assign(new Error("Participant not found"),{statusCode:404,apiError:"studio_participant_not_found"});const muted=req.body?.muted!==false;if(muted)s.muted.add(id);else s.muted.delete(id);const allowedSources=(muted||s.muteAll)?[3,4]:[2,3,4];await s.service.updateParticipant(s.roomName,id,{permission:{canPublish:true,canSubscribe:true,canPublishData:true,canPublishSources:allowedSources}});await enforceMutes(s,[p]);addActivity(muted?"participant_muted":"participant_unmuted",`${id} mic ${muted?"muted":"unmuted"}`);await db.ref("auditLog").push({adminUid:actor.uid,actionType:muted?"live_studio_mute":"live_studio_unmute",timestamp:Date.now(),summary:`${muted?"Muted":"Unmuted"} Live Studio participant ${id}`}).catch(()=>{});await publishRadar(true);return res.json({ok:true,identity:id,muted});}catch(e){return fail(res,e,"live_studio_mute_failed");}});
-  app.post("/api/admin/live-studio/mute-all",async(req,res)=>{try{const actor=await verifyAdminApiRequest(req);if(!checkCppRateLimit(req,res,"live-studio-mute-all",12,60000))return;const s=active();if(!s)throw Object.assign(new Error("No active Live Studio"),{statusCode:409,apiError:"live_studio_not_active"});s.muteAll=req.body?.muted!==false;const ps=(await getParticipants(s)).filter(p=>String(p.identity)!==s.hostIdentity);if(s.muteAll)for(const p of ps)s.muted.add(String(p.identity));else s.muted.clear();const allowedSources=s.muteAll?[3,4]:[2,3,4];const permissionResults=await Promise.allSettled(ps.map(p=>s.service.updateParticipant(s.roomName,String(p.identity),{permission:{canPublish:true,canSubscribe:true,canPublishData:true,canPublishSources:allowedSources}})));await enforceMutes(s,ps);addActivity(s.muteAll?"mute_all":"unmute_all",`${s.muteAll?"Mute everyone enabled":"Mute everyone disabled"} (${ps.length})`);await db.ref("auditLog").push({adminUid:actor.uid,actionType:s.muteAll?"live_studio_mute_all":"live_studio_unmute_all",timestamp:Date.now(),summary:`${s.muteAll?"Muted":"Unmuted"} all guests (${ps.length}); permissionUpdates=${permissionResults.filter(r=>r.status==="fulfilled").length}/${ps.length}`}).catch(()=>{});await publishRadar(true);return res.json({ok:permissionResults.every(r=>r.status==="fulfilled"),muted:s.muteAll,total:ps.length,permissionUpdates:permissionResults.filter(r=>r.status==="fulfilled").length});}catch(e){return fail(res,e,"live_studio_mute_all_failed");}});
-  app.post("/api/admin/live-studio/kick",async(req,res)=>{try{const actor=await verifyAdminApiRequest(req);if(!checkCppRateLimit(req,res,"live-studio-kick",40,60000))return;const s=active();if(!s)throw Object.assign(new Error("No active Live Studio"),{statusCode:409,apiError:"live_studio_not_active"});const id=String(req.body?.identity||"");if(!id.startsWith("guest_"))throw Object.assign(new Error("Cannot remove host"),{statusCode:400,apiError:"invalid_studio_target"});const ps=await getParticipants(s);if(!ps.some(p=>String(p.identity)===id))throw Object.assign(new Error("Participant not found"),{statusCode:404,apiError:"studio_participant_not_found"});await s.service.removeParticipant(s.roomName,id,{revokeTokenTs:BigInt(Math.floor(Date.now()/1000))});addActivity("participant_kicked",`${id} removed by Admin`);await db.ref("auditLog").push({adminUid:actor.uid,actionType:"live_studio_kick",timestamp:Date.now(),summary:`Removed Live Studio guest ${id}`}).catch(()=>{});await publishRadar(true);return res.json({ok:true,identity:id});}catch(e){return fail(res,e,"live_studio_kick_failed");}});
+  // A minimal public route health response; never include LiveKit secrets or credentials.
+  app.get("/api/live-studio/route-health", (req, res) => {
+    const cfg = config();
+    return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.39", configured: cfg.configured, missingVariables: cfg.missingVariables, panelOrigin: panelOriginFallback, pagesHostedOnPanel: ["/live-room.html"], publicStatusEndpoint: "/api/live-studio/public-status", ready: cfg.configured });
+  });
 
-  client.on("ready",()=>{addActivity("bot_ready","Discord Bot online; LIVE STREAM RADAR is running");publishRadar(true).catch(()=>{});});
-  client.on("voiceStateUpdate",(oldState,newState)=>{if(newState.guild?.id!==guildId)return;const m=newState.member||oldState.member,n=String(m?.displayName||m?.user?.username||m?.id||"Member").slice(0,80);if(!oldState.channelId&&newState.channelId)addActivity("voice_join",`${n} joined ${newState.channel?.name||"a voice channel"}`);else if(oldState.channelId&&!newState.channelId)addActivity("voice_leave",`${n} left ${oldState.channel?.name||"a voice channel"}`);else if(oldState.channelId!==newState.channelId)addActivity("voice_move",`${n} moved to ${newState.channel?.name||"another voice channel"}`);else if(Boolean(oldState.serverMute||oldState.selfMute)!==Boolean(newState.serverMute||newState.selfMute))addActivity("voice_mute",`${n} microphone ${newState.serverMute||newState.selfMute?"muted":"unmuted"}`);publishRadar(false).catch(()=>{});});
-  for(const event of ["channelCreate","channelDelete","channelUpdate"])client.on(event,(a,b)=>{const c=b||a;if(c?.guild?.id===guildId)publishRadar(false).catch(()=>{});});
-  const timer=setInterval(()=>publishRadar(false).catch(()=>{}),4000);timer.unref?.();
+  // Public, minimal read-only status for the Blogger live page. Do not expose participant
+  // identities, room names, host credentials, tokens, or any LiveKit secret here.
+  // The only public join URL is the deliberate, multi-use guest invite generated for this session.
+  app.get("/api/live-studio/public-status", (req, res) => {
+    const session = activeSession();
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
+    return res.json({
+      ok: true,
+      version: "1.5.39",
+      active: Boolean(session),
+      updatedAt: Date.now(),
+      session: session ? {
+        inviteUrl: session.inviteUrl,
+        startedAt: session.startedAt,
+        expiresAt: session.expiresAt,
+        durationMinutes: session.durationMinutes
+      } : null
+    });
+  });
+  app.get("/api/admin/live-studio/status", async (req, res) => {
+    try {
+      await verifyAdminApiRequest(req);
+      const session = activeSession();
+      const participants = session ? await getParticipants(session) : [];
+      const voice = getVoiceDirectory();
+      let hostJoinUrl = "";
+      if (session) hostJoinUrl = hostUrl(session, await createAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host"));
+      const radar = (await db.ref(radarRefPath).once("value").catch(() => null))?.val() || null;
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.39", configured: config().configured, active: Boolean(session), session: session ? { sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: session.inviteUrl, inviteExpiresAt: session.inviteExpiresAt, participantCount: participants.length, screenShareCount: participants.filter(p => trackFlags(p.tracks).screenSharing).length, muteAllActive: session.muteAllActive } : null, participants: session ? participants.map(p => participantSummary(p, session)) : [], voiceChannels: voice.channels, discordVoiceMemberCount: voice.memberCount, hostJoinUrl, radar });
+    } catch (err) { return apiError(res, err, "live_studio_status_failed"); }
+  });
+  app.post("/api/admin/live-studio/start", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "live-studio-start", 5, 60_000)) return;
+      const { session, invite, hostAccess } = await startSession(actor.uid, req.body || {}, req);
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_start", timestamp: Date.now(), summary: `Live Studio started for ${session.durationMinutes} minutes; invite ${session.inviteUrl}` }).catch(() => {});
+      cleanupRequested = false;
+      await publishRadar(true);
+      return res.json({ ok: true, version: "1.5.39", active: true, sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: invite.inviteUrl, inviteCode: invite.inviteCode, maxUses: invite.maxUses, hostJoinUrl: hostUrl(session, hostAccess), radarPinsEnabled: pinAllTextChannels, publicOrigin: session.publicOrigin });
+    } catch (err) { return apiError(res, err, "live_studio_start_failed"); }
+  });
+  app.post("/api/admin/live-studio/invite", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "live-studio-invite", 12, 60_000)) return;
+      const session = activeSession();
+      if (!session) throw Object.assign(new Error("Start Live Studio first"), { statusCode: 409, apiError: "live_studio_not_active" });
+      const invite = makeInvite(session);
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_invite_create", timestamp: Date.now(), summary: "Created multi-use invite for active Live Studio" }).catch(() => {});
+      await publishRadar(true);
+      return res.json({ ok: true, ...invite, sessionId: session.sessionId });
+    } catch (err) { return apiError(res, err, "live_studio_invite_failed"); }
+  });
+  app.post("/api/admin/live-studio/end", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "live-studio-end", 10, 60_000)) return;
+      const result = await endSession("ended by Firebase Admin", actor.uid);
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_end", timestamp: Date.now(), summary: "Live Studio ended; invites revoked and radar messages removed" }).catch(() => {});
+      return res.json({ ok: true, ...result });
+    } catch (err) { return apiError(res, err, "live_studio_end_failed"); }
+  });
+  app.post("/api/live-studio/redeem", async (req, res) => {
+    try {
+      if (!checkCppRateLimit(req, res, "live-studio-redeem", 30, 60_000)) return;
+      const code = String(req.body?.inviteCode || "");
+      if (!isValidInviteCode(code)) throw Object.assign(new Error("Invite link is invalid. Return to the Admin Panel for an active link."), { statusCode: 400, apiError: "live_studio_invite_invalid" });
+      const digest = inviteDigest(code), invite = invites.get(digest);
+      if (!invite || invite.expiresAt <= Date.now()) { invites.delete(digest); throw Object.assign(new Error("Invite link is invalid or expired. Return to the Admin Panel for a current link."), { statusCode: 410, apiError: "live_studio_invite_expired" }); }
+      const session = activeSession();
+      if (!session || session.sessionId !== invite.sessionId) throw Object.assign(new Error("This Live Studio has ended. Return to the Admin Panel for a new link."), { statusCode: 410, apiError: "live_studio_not_active" });
+      if (invite.uses >= invite.maxUses) throw Object.assign(new Error("This invite has reached its join limit."), { statusCode: 410, apiError: "live_studio_invite_exhausted" });
+      invite.uses += 1;
+      const identity = `guest_${crypto.randomBytes(12).toString("hex")}`;
+      const name = cleanName(req.body?.displayName, `Guest ${crypto.randomInt(1000, 9999)}`);
+      const access = await createAccessToken(session, identity, name, "guest");
+      addActivity("invite_join", `${name} joined through the room invite`);
+      await publishRadar(true);
+      return res.json({ ok: true, sessionId: session.sessionId, roomName: session.roomName, identity, name, role: "guest", ...access });
+    } catch (err) { return res.status(Number(err?.statusCode) || 500).json({ ok: false, error: String(err?.apiError || "live_studio_redeem_failed"), message: String(err?.message || "Could not join Live Studio").slice(0, 240) }); }
+  });
+  app.post("/api/admin/live-studio/mute", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "live-studio-mute", 60, 60_000)) return;
+      const session = activeSession(); if (!session) throw Object.assign(new Error("No active Live Studio"), { statusCode: 409, apiError: "live_studio_not_active" });
+      const identity = String(req.body?.identity || ""); if (!identity.startsWith("guest_")) throw Object.assign(new Error("Only guest participants can be muted"), { statusCode: 400, apiError: "invalid_studio_target" });
+      const participants = await getParticipants(session), participant = participants.find(p => String(p.identity) === identity);
+      if (!participant) throw Object.assign(new Error("Participant not found"), { statusCode: 404, apiError: "studio_participant_not_found" });
+      const muted = req.body?.muted !== false;
+      if (muted) session.mutedIdentities.add(identity); else session.mutedIdentities.delete(identity);
+      const allowedSources = (muted || session.muteAllActive) ? [TRACK_SOURCE.SCREEN_SHARE, TRACK_SOURCE.SCREEN_SHARE_AUDIO] : [TRACK_SOURCE.MICROPHONE, TRACK_SOURCE.SCREEN_SHARE, TRACK_SOURCE.SCREEN_SHARE_AUDIO];
+      await session.roomService.updateParticipant(session.roomName, identity, { permission: { canPublish: true, canSubscribe: true, canPublishData: true, canPublishSources: allowedSources } });
+      await enforceMutePolicy(session, [participant]);
+      addActivity(muted ? "participant_muted" : "participant_unmuted", `${identity} mic ${muted ? "muted" : "unmuted"}`);
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: muted ? "live_studio_mute" : "live_studio_unmute", timestamp: Date.now(), summary: `${muted ? "Muted" : "Unmuted"} Live Studio participant ${identity}` }).catch(() => {});
+      await publishRadar(true); return res.json({ ok: true, identity, muted });
+    } catch (err) { return apiError(res, err, "live_studio_mute_failed"); }
+  });
+  app.post("/api/admin/live-studio/mute-all", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "live-studio-mute-all", 12, 60_000)) return;
+      const session = activeSession(); if (!session) throw Object.assign(new Error("No active Live Studio"), { statusCode: 409, apiError: "live_studio_not_active" });
+      session.muteAllActive = req.body?.muted !== false;
+      const participants = (await getParticipants(session)).filter(p => String(p.identity) !== session.hostIdentity);
+      if (session.muteAllActive) for (const p of participants) session.mutedIdentities.add(String(p.identity)); else session.mutedIdentities.clear();
+      const allowedSources = session.muteAllActive ? [TRACK_SOURCE.SCREEN_SHARE, TRACK_SOURCE.SCREEN_SHARE_AUDIO] : [TRACK_SOURCE.MICROPHONE, TRACK_SOURCE.SCREEN_SHARE, TRACK_SOURCE.SCREEN_SHARE_AUDIO];
+      const results = await Promise.allSettled(participants.map(p => session.roomService.updateParticipant(session.roomName, String(p.identity), { permission: { canPublish: true, canSubscribe: true, canPublishData: true, canPublishSources: allowedSources } })));
+      await enforceMutePolicy(session, participants);
+      addActivity(session.muteAllActive ? "mute_all" : "unmute_all", `${session.muteAllActive ? "Mute everyone enabled" : "Mute everyone disabled"} (${participants.length})`);
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: session.muteAllActive ? "live_studio_mute_all" : "live_studio_unmute_all", timestamp: Date.now(), summary: `${session.muteAllActive ? "Muted" : "Unmuted"} all guests (${participants.length})` }).catch(() => {});
+      await publishRadar(true); return res.json({ ok: results.every(r => r.status === "fulfilled"), muted: session.muteAllActive, total: participants.length, permissionUpdates: results.filter(r => r.status === "fulfilled").length });
+    } catch (err) { return apiError(res, err, "live_studio_mute_all_failed"); }
+  });
+  app.post("/api/admin/live-studio/kick", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "live-studio-kick", 40, 60_000)) return;
+      const session = activeSession(); if (!session) throw Object.assign(new Error("No active Live Studio"), { statusCode: 409, apiError: "live_studio_not_active" });
+      const identity = String(req.body?.identity || ""); if (!identity.startsWith("guest_")) throw Object.assign(new Error("Cannot remove the room host"), { statusCode: 400, apiError: "invalid_studio_target" });
+      await session.roomService.removeParticipant(session.roomName, identity);
+      session.mutedIdentities.delete(identity); addActivity("participant_kicked", `${identity} removed by Admin`);
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_kick", timestamp: Date.now(), summary: `Removed Live Studio guest ${identity}` }).catch(() => {});
+      await publishRadar(true); return res.json({ ok: true, identity });
+    } catch (err) { return apiError(res, err, "live_studio_kick_failed"); }
+  });
+  app.post("/api/admin/live-studio/discord-voice-action", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "live-studio-discord-voice-action", 60, 60_000)) return;
+      const guild = client.guilds.cache.get(guildId); if (!guild) throw Object.assign(new Error("Configured Discord server is not available to the Bot"), { statusCode: 503, apiError: "discord_guild_unavailable" });
+      const channelId = String(req.body?.channelId || ""), userId = String(req.body?.userId || ""), action = String(req.body?.action || "");
+      const channel = guild.channels.cache.get(channelId); if (!channel || ![ChannelType.GuildVoice, ChannelType.GuildStageVoice].includes(channel.type)) throw Object.assign(new Error("Voice channel not found"), { statusCode: 404, apiError: "discord_voice_channel_not_found" });
+      const member = channel.members?.get(userId) || await guild.members.fetch(userId).catch(() => null);
+      if (!member || member.voice.channelId !== channelId) throw Object.assign(new Error("Member is not in the selected voice channel"), { statusCode: 404, apiError: "discord_voice_member_not_found" });
+      if (member.id === client.user?.id) throw Object.assign(new Error("The Bot cannot moderate itself"), { statusCode: 400, apiError: "invalid_discord_voice_target" });
+      if (action === "mute") await member.voice.setMute(true, "Admin Panel Live Stream Radar");
+      else if (action === "unmute") await member.voice.setMute(false, "Admin Panel Live Stream Radar");
+      else if (action === "deafen") await member.voice.setDeaf(true, "Admin Panel Live Stream Radar");
+      else if (action === "undeafen") await member.voice.setDeaf(false, "Admin Panel Live Stream Radar");
+      else if (action === "disconnect") await member.voice.disconnect("Admin Panel Live Stream Radar");
+      else throw Object.assign(new Error("Unsupported voice action"), { statusCode: 400, apiError: "invalid_discord_voice_action" });
+      addActivity(`discord_voice_${action}`, `${member.user.username} ${action} in #${channel.name}`);
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: `discord_voice_${action}`, timestamp: Date.now(), summary: `${action} Discord voice member ${userId} in ${channelId}` }).catch(() => {});
+      await publishRadar(true); return res.json({ ok: true, action, userId, channelId });
+    } catch (err) { return apiError(res, err, "discord_voice_action_failed"); }
+  });
+
+  client.on("ready", () => { addActivity("bot_ready", "Discord Bot online; Live Stream Radar is ready"); publishRadar(false).catch(() => {}); });
+  client.on("voiceStateUpdate", (oldState, newState) => {
+    if (newState.guild?.id !== guildId) return;
+    const member = newState.member || oldState.member;
+    const name = String(member?.displayName || member?.user?.username || member?.id || "Member").slice(0, 80);
+    if (!oldState.channelId && newState.channelId) addActivity("voice_join", `${name} joined ${newState.channel?.name || "a voice channel"}`);
+    else if (oldState.channelId && !newState.channelId) addActivity("voice_leave", `${name} left ${oldState.channel?.name || "a voice channel"}`);
+    else if (oldState.channelId !== newState.channelId) addActivity("voice_move", `${name} moved to ${newState.channel?.name || "another voice channel"}`);
+    else if (Boolean(oldState.serverMute || oldState.selfMute) !== Boolean(newState.serverMute || newState.selfMute)) addActivity("voice_mute", `${name} microphone ${newState.serverMute || newState.selfMute ? "muted" : "unmuted"}`);
+    publishRadar(true).catch(() => {});
+  });
+  for (const event of ["channelCreate", "channelDelete", "channelUpdate"]) client.on(event, (oldChannel, newChannel) => { const channel = newChannel || oldChannel; if (channel?.guild?.id === guildId) publishRadar(true).catch(() => {}); });
+  const radarTimer = setInterval(() => publishRadar(false).catch(() => {}), 5000);
+  radarTimer.unref?.();
   return { sessions, invites, publishRadar, endSession };
 }
 module.exports = { attachLiveStudioServer };

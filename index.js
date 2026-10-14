@@ -30,6 +30,7 @@ const {
 
 // html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
+const { evaluateCheckoutEligibility, checkoutFingerprint, resolveParentCategoryId } = require("./checkout-security");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -457,34 +458,6 @@ const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "32kb", type: "application/json" }));
 const ADMIN_PANEL_ORIGINS = new Set(String(process.env.ADMIN_PANEL_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean));
-// Server-side Admin Console session bridge. The Blogger page does not load Firebase Web SDK/config.
-const FIREBASE_WEB_API_KEY = String(process.env.FIREBASE_WEB_API_KEY || "").trim();
-const ADMIN_SESSION_TTL_MS = Math.min(12 * 60 * 60 * 1000, Math.max(5 * 60 * 1000, Number(process.env.ADMIN_SESSION_TTL_MS) || 2 * 60 * 60 * 1000));
-const adminSessions = new Map(); // Stores hashes of opaque random bearer tokens; restarting the Bot invalidates sessions.
-function isAdminPanelOriginAllowed(req) {
-    const origin = String(req.get("origin") || "");
-    return !!origin && ADMIN_PANEL_ORIGINS.has(origin);
-}
-function requireAdminPanelOrigin(req, res) {
-    if (isAdminPanelOriginAllowed(req)) return true;
-    res.status(403).json({ ok: false, error: "origin_not_allowed", message: "এই Admin Panel origin-টি Bot host-এর ADMIN_PANEL_ORIGINS-এ অনুমোদিত নয়।" });
-    return false;
-}
-function hashAdminSessionToken(token) { return crypto.createHash("sha256").update(String(token)).digest("hex"); }
-function cleanupAdminSessions() {
-    const now = Date.now();
-    for (const [key, value] of adminSessions) if (!value || value.expiresAt <= now) adminSessions.delete(key);
-}
-function mintAdminSession(uid, email) {
-    cleanupAdminSessions();
-    const existing = [...adminSessions.entries()].filter(([, value]) => value.uid === uid).sort((a, b) => a[1].createdAt - b[1].createdAt);
-    while (existing.length >= 4) { const [oldest] = existing.shift(); adminSessions.delete(oldest); }
-    const token = crypto.randomBytes(32).toString("base64url");
-    const now = Date.now();
-    adminSessions.set(hashAdminSessionToken(token), { uid, email: String(email || "").slice(0, 254), createdAt: now, lastUsedAt: now, expiresAt: now + ADMIN_SESSION_TTL_MS });
-    return { token, expiresAt: now + ADMIN_SESSION_TTL_MS };
-}
-
 app.use((req, res, next) => {
     const origin = String(req.get("origin") || "");
     // Public, non-sensitive health probe: allow the panel to read it even when its origin
@@ -543,220 +516,12 @@ function readBearerToken(req) {
 }
 async function verifyAdminApiRequest(req) {
     const token = readBearerToken(req);
-    if (!token) throw Object.assign(new Error("Missing Admin Console session"), { statusCode: 401 });
-    cleanupAdminSessions();
-    const sessionKey = hashAdminSessionToken(token);
-    const session = adminSessions.get(sessionKey);
-    let actor = null;
-
-    // Support the current Blogger Admin Panel, which sends a refreshed Firebase ID token
-    // (currentAdmin.getIdToken(true)). Verify signature, expiry and revocation server-side.
-    // Never treat a decoded-but-unverified JWT as proof of identity.
-    if (session && session.expiresAt > Date.now()) {
-        actor = { uid: session.uid, email: session.email, sessionExpiresAt: session.expiresAt, adminSession: true, authMode: "server_session" };
-        session.lastUsedAt = Date.now();
-    } else {
-        if (session) adminSessions.delete(sessionKey);
-        let decoded;
-        try {
-            decoded = await admin.auth().verifyIdToken(token, true);
-        } catch (_) {
-            throw Object.assign(new Error("Admin session expired. Sign in again."), { statusCode: 401 });
-        }
-        actor = {
-            uid: decoded.uid,
-            email: String(decoded.email || "").slice(0, 254),
-            sessionExpiresAt: Number(decoded.exp || 0) * 1000,
-            adminSession: true,
-            authMode: "firebase_id_token"
-        };
-    }
-
-    // Check the server-side allowlist on every request so access is revoked immediately
-    // when adminUids/{uid} is removed or changed to false.
-    const adminSnap = await db.ref(`adminUids/${actor.uid}`).once("value");
-    if (adminSnap.val() !== true) {
-        adminSessions.delete(sessionKey);
-        throw Object.assign(new Error("Admin access revoked"), { statusCode: 403 });
-    }
-    return actor;
+    if (!token) throw Object.assign(new Error("Missing admin bearer token"), { statusCode: 401 });
+    const decoded = await admin.auth().verifyIdToken(token, true);
+    const adminSnap = await db.ref(`adminUids/${decoded.uid}`).once("value");
+    if (adminSnap.val() !== true) throw Object.assign(new Error("Admin access denied"), { statusCode: 403 });
+    return decoded;
 }
-// The public Blogger panel talks only to this authenticated server API; no Firebase Web config is sent to the browser.
-const ADMIN_DB_READ_ROOTS = ["adminConfig", "panels", "runtime/bot", "runtime/liveStreamRadar", "runtime/botStats/weekly", "reader_devices", "pending_payments", "transactions", "coupons", "couponRequests", "auditLog", "adminActions"];
-function normalizeAdminDbPath(raw, allowRoot = false) {
-    if (typeof raw !== "string") return null;
-    const value = raw.replace(/^\/+|\/+$/g, "");
-    if (!value && allowRoot) return "";
-    if (!value || value.length > 512) return null;
-    if (value === ".info/connected") return value;
-    const parts = value.split("/");
-    if (parts.length > 10 || parts.some(part => !validRtdbSegment(part, 128))) return null;
-    return value;
-}
-function isSameOrChildPath(value, root) { return value === root || value.startsWith(`${root}/`); }
-function adminDbPathReadable(value) {
-    if (value === ".info/connected") return true;
-    return ADMIN_DB_READ_ROOTS.some(root => isSameOrChildPath(value, root));
-}
-function adminDbPathWritable(value) {
-    if (value === "adminConfig/bot" || value.startsWith("adminConfig/bot/")) return true;
-    if (value === "panels" || value.startsWith("panels/")) return true;
-    const parts = value.split("/");
-    return (parts[0] === "auditLog" || parts[0] === "adminActions") && parts.length === 2;
-}
-async function commitAdminDbUpdates(updates, actor) {
-    if (!updates || typeof updates !== "object" || Array.isArray(updates)) throw Object.assign(new Error("Invalid update payload"), { statusCode: 400 });
-    const entries = Object.entries(updates);
-    if (!entries.length || entries.length > 50) throw Object.assign(new Error("Update batch must contain 1–50 paths"), { statusCode: 400 });
-    const cleaned = {};
-    const auditPaths = [];
-    for (const [rawPath, value] of entries) {
-        const path = normalizeAdminDbPath(rawPath);
-        if (!path || !adminDbPathWritable(path) || path === ".info/connected") throw Object.assign(new Error(`Write not allowed for path: ${String(rawPath).slice(0, 100)}`), { statusCode: 403 });
-        if (path.startsWith("auditLog/") || path.startsWith("adminActions/")) {
-            const parts = path.split("/");
-            if (parts.length !== 2 || !value || typeof value !== "object" || Array.isArray(value) || value.adminUid !== actor.uid || typeof value.actionType !== "string" || typeof value.summary !== "string") {
-                throw Object.assign(new Error("Audit entries must be complete, actor-owned records"), { statusCode: 400 });
-            }
-            auditPaths.push(path);
-        }
-        cleaned[path] = value;
-    }
-    // Audit entries are append-only through the browser API; never allow replacing a prior record.
-    if (auditPaths.length) {
-        const existing = await Promise.all(auditPaths.map(path => db.ref(path).once("value")));
-        if (existing.some(snapshot => snapshot.exists())) throw Object.assign(new Error("Audit entry already exists"), { statusCode: 409 });
-    }
-    await db.ref().update(cleaned);
-    return { ok: true, updatedPaths: entries.length };
-}
-
-app.post("/api/admin/session/login", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    if (!checkCppRateLimit(req, res, "admin-session-login", 8, 15 * 60 * 1000)) return;
-    if (!FIREBASE_WEB_API_KEY) return res.status(503).json({ ok: false, error: "admin_auth_not_configured", message: "Bot host-এ FIREBASE_WEB_API_KEY Environment Variable সেট করা নেই।" });
-    const email = String(req.body?.email || "").trim().toLowerCase();
-    const password = String(req.body?.password || "");
-    if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !password || password.length > 1024) {
-        return res.status(400).json({ ok: false, error: "auth/invalid-credential", message: "ইমেইল বা পাসওয়ার্ড সঠিক নয়।" });
-    }
-    try {
-        const authResponse = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(FIREBASE_WEB_API_KEY)}`, {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ email, password, returnSecureToken: true }), signal: AbortSignal.timeout(12000)
-        });
-        const authPayload = await authResponse.json().catch(() => ({}));
-        if (!authResponse.ok || !authPayload.idToken) return res.status(401).json({ ok: false, error: "auth/invalid-credential", message: "ইমেইল বা পাসওয়ার্ড সঠিক নয়।" });
-        const decoded = await admin.auth().verifyIdToken(authPayload.idToken, true);
-        const [adminSnap, userRecord] = await Promise.all([
-            db.ref(`adminUids/${decoded.uid}`).once("value"),
-            admin.auth().getUser(decoded.uid)
-        ]);
-        if (userRecord.disabled) return res.status(403).json({ ok: false, error: "auth/user-disabled", message: "এই Admin account বন্ধ আছে।" });
-        if (adminSnap.val() !== true) return res.status(403).json({ ok: false, error: "admin_not_allowed", message: "এই account-এর Admin অনুমতি নেই।" });
-        const issued = mintAdminSession(decoded.uid, userRecord.email || authPayload.email || email);
-        return res.set("Cache-Control", "no-store").json({ ok: true, token: issued.token, expiresAt: issued.expiresAt, user: { uid: decoded.uid, email: String(userRecord.email || email).slice(0, 254) } });
-    } catch (err) {
-        console.error("Admin session login failed:", String(err?.message || err).slice(0, 220));
-        return res.status(503).json({ ok: false, error: "admin_login_unavailable", message: "Admin login service এখন পাওয়া যাচ্ছে না। Bot host Environment ও logs পরীক্ষা করুন।" });
-    }
-});
-app.get("/api/admin/session/me", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    try { const actor = await verifyAdminApiRequest(req); return res.set("Cache-Control", "no-store").json({ ok: true, user: { uid: actor.uid, email: actor.email }, expiresAt: actor.sessionExpiresAt }); }
-    catch (err) { return res.status(Number(err.statusCode) || 401).json({ ok: false, error: "admin_session_expired", message: "Admin session expired. Sign in again." }); }
-});
-app.post("/api/admin/session/logout", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    const token = readBearerToken(req);
-    try { await verifyAdminApiRequest(req); adminSessions.delete(hashAdminSessionToken(token)); return res.set("Cache-Control", "no-store").json({ ok: true }); }
-    catch (_) { if (token) adminSessions.delete(hashAdminSessionToken(token)); return res.json({ ok: true }); }
-});
-app.get("/api/admin/db", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    if (!checkCppRateLimit(req, res, "admin-db-read", 300, 60 * 1000)) return;
-    try {
-        await verifyAdminApiRequest(req);
-        const path = normalizeAdminDbPath(String(req.query.path || ""));
-        if (!path || !adminDbPathReadable(path)) return res.status(403).json({ ok: false, error: "db_path_forbidden" });
-        if (path === ".info/connected") return res.set("Cache-Control", "no-store").json({ ok: true, value: true });
-        const snap = await db.ref(path).once("value");
-        return res.set("Cache-Control", "no-store").json({ ok: true, value: snap.val() });
-    } catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "admin_db_read_failed", message: Number(err.statusCode) === 401 ? "Admin session expired. Sign in again." : "Admin data read failed." }); }
-});
-app.post("/api/admin/db/batch", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    if (!checkCppRateLimit(req, res, "admin-db-write", 80, 60 * 1000)) return;
-    try { const actor = await verifyAdminApiRequest(req); const result = await commitAdminDbUpdates(req.body?.updates, actor); return res.set("Cache-Control", "no-store").json(result); }
-    catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : Number(err.statusCode) === 409 ? "conflict" : "admin_db_write_failed", message: String(err.message || "Admin data write failed.").slice(0, 220) }); }
-});
-app.put("/api/admin/db", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    if (!checkCppRateLimit(req, res, "admin-db-write", 80, 60 * 1000)) return;
-    try { const actor = await verifyAdminApiRequest(req); const path = normalizeAdminDbPath(req.body?.path); if (!path || !adminDbPathWritable(path)) return res.status(403).json({ ok: false, error: "forbidden" }); const result = await commitAdminDbUpdates({ [path]: req.body?.value ?? null }, actor); return res.set("Cache-Control", "no-store").json(result); }
-    catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "admin_db_write_failed", message: String(err.message || "Admin data write failed.").slice(0, 220) }); }
-});
-app.post("/api/admin/review-transaction", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    if (!checkCppRateLimit(req, res, "admin-transaction-review", 40, 60 * 1000)) return;
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        const txnId = String(req.body?.txnId || "").trim();
-        const decision = String(req.body?.decision || "");
-        if (!validRtdbSegment(txnId, 80) || !["approve", "reject"].includes(decision)) return res.status(400).json({ ok: false, error: "invalid_review_request" });
-        const now = Date.now();
-        const ref = db.ref(`transactions/${txnId}`);
-        const result = await ref.transaction(cur => {
-            if (!cur || cur.used === true) return;
-            const status = String(cur.verificationStatus || "");
-            const source = String(cur.verificationSource || "");
-            if (decision === "approve") {
-                if (!["evidence_matched", "pending_review", "verified"].includes(status)) return;
-                if (!["reader_notification_evidence", "trusted_reader_notification", "", "manual_admin_review"].includes(source)) return;
-                return { ...cur, verificationStatus: "verified", verificationSource: "manual_admin_review", reviewedBy: actor.uid, reviewedAt: now, verifiedAt: now };
-            }
-            if (!["evidence_matched", "pending_review"].includes(status)) return;
-            return { ...cur, verificationStatus: "rejected", verificationSource: "manual_admin_review", reviewedBy: actor.uid, reviewedAt: now, reviewReason: "Admin rejected after external history review" };
-        }, undefined, false);
-        if (!result.committed) return res.status(409).json({ ok: false, error: "not_reviewable", message: "Record changed, was already used, or is not reviewable." });
-        const key = db.ref("auditLog").push().key;
-        const entry = { adminUid: actor.uid, actionType: decision === "approve" ? "payment_manual_review_approved" : "payment_manual_review_rejected", timestamp: now, summary: `TxnID ${txnId} ${decision === "approve" ? "manually verified" : "rejected"} after external provider-history review.` };
-        await db.ref().update({ [`auditLog/${key}`]: entry, [`adminActions/${key}`]: entry });
-        return res.set("Cache-Control", "no-store").json({ ok: true, transaction: result.snapshot.val() });
-    } catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: "transaction_review_failed", message: String(err.message || "Transaction review failed.").slice(0, 220) }); }
-});
-app.post("/api/admin/decide-coupon-request", async (req, res) => {
-    if (!requireAdminPanelOrigin(req, res)) return;
-    if (!checkCppRateLimit(req, res, "admin-coupon-review", 40, 60 * 1000)) return;
-    try {
-        const actor = await verifyAdminApiRequest(req);
-        const requestId = String(req.body?.requestId || "").trim();
-        const approve = req.body?.approve === true;
-        if (!validRtdbSegment(requestId, 128)) return res.status(400).json({ ok: false, error: "invalid_coupon_request" });
-        let code = "";
-        if (approve) {
-            const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-            for (let attempt = 0; attempt < 12; attempt++) {
-                code = "RK" + Array.from(crypto.randomBytes(5)).map(v => alphabet[v % alphabet.length]).join("");
-                const exists = await db.ref(`coupons/${code}`).once("value");
-                if (!exists.exists()) break;
-                code = "";
-            }
-            if (!code) return res.status(503).json({ ok: false, error: "coupon_code_unavailable" });
-        }
-        const now = Date.now();
-        const ref = db.ref(`couponRequests/${requestId}`);
-        const result = await ref.transaction(cur => {
-            if (!cur || cur.status !== "pending") return;
-            return { ...cur, status: approve ? "approved" : "rejected", ...(approve ? { couponCode: code, approvedBy: actor.uid, approvedAt: now } : { rejectedBy: actor.uid, rejectedAt: now }), updatedAt: now };
-        }, undefined, false);
-        if (!result.committed) return res.status(409).json({ ok: false, error: "coupon_request_not_pending", message: "This request is no longer pending. Refresh and try again." });
-        const key = db.ref("auditLog").push().key;
-        const entry = { adminUid: actor.uid, actionType: approve ? "coupon_request_approved" : "coupon_request_rejected", timestamp: now, summary: `Coupon request ${requestId} ${approve ? "approved" : "rejected"}${approve ? `; code ${code}` : ""}.` };
-        await db.ref().update({ [`auditLog/${key}`]: entry, [`adminActions/${key}`]: entry });
-        return res.set("Cache-Control", "no-store").json({ ok: true, request: result.snapshot.val(), couponCode: code || null });
-    } catch (err) { return res.status(Number(err.statusCode) || 500).json({ ok: false, error: "coupon_review_failed", message: String(err.message || "Coupon review failed.").slice(0, 220) }); }
-});
 app.post("/api/admin/accounts/lookup", async (req, res) => {
     try {
         const actor = await verifyAdminApiRequest(req);
@@ -845,26 +610,51 @@ app.post("/api/admin/accounts/update", async (req, res) => {
         if (newPassword && (newPassword.length < 8 || newPassword.length > 128)) return res.status(400).json({ ok: false, error: "invalid_password" });
         if (hwid && !/^[A-Za-z0-9_-]{1,80}$/.test(hwid)) return res.status(400).json({ ok: false, error: "invalid_hwid" });
         if (!["HWID", "ONLINE"].includes(lockType) || !["active", "suspended", "disabled"].includes(status)) return res.status(400).json({ ok: false, error: "invalid_settings" });
+
         const usersRef = db.ref("users");
         const existing = await usersRef.child(username).once("value");
         if (!existing.exists()) return res.status(404).json({ ok: false, error: "not_found" });
         const passwordHash = newPassword ? await hashCppPassword(newPassword) : null;
-        const tx = await usersRef.transaction(allUsers => {
-            if (!allUsers || !allUsers[username]) return;
-            if (newUsername !== username && allUsers[newUsername]) return;
-            const current = { ...allUsers[username] };
+        const makeNext = (current) => {
             const next = { ...current, username: newUsername, lockType, status, activeSessionId: null, isLoggedIn: false,
                 adminUpdatedAt: Date.now(), adminUpdatedBy: actor.uid };
             if (hwid) next.hwid = hwid; else delete next.hwid;
             if (passwordHash) { next.passwordHash = passwordHash; delete next.password; }
-            allUsers[newUsername] = next;
-            if (newUsername !== username) delete allUsers[username];
-            return allUsers;
-        }, undefined, false);
-        if (!tx.committed) return res.status(409).json({ ok: false, error: "username_conflict_or_changed" });
+            return next;
+        };
+        let committed = false;
+        if (newUsername === username) {
+            // Same-username edits only transact the specific account node. A transaction on the
+            // entire /users tree could fail because an unrelated user's record changed concurrently.
+            const tx = await usersRef.child(username).transaction(current => current ? makeNext(current) : undefined, undefined, false);
+            committed = tx.committed;
+            if (!committed) {
+                const fresh = await usersRef.child(username).once("value");
+                if (!fresh.exists()) return res.status(404).json({ ok: false, error: "not_found" });
+                return res.status(409).json({ ok: false, error: "record_changed" });
+            }
+        } else {
+            // A rename must atomically verify the destination and move the source record.
+            const tx = await usersRef.transaction(allUsers => {
+                if (!allUsers || typeof allUsers !== "object" || !allUsers[username]) return;
+                if (Object.prototype.hasOwnProperty.call(allUsers, newUsername)) return;
+                allUsers[newUsername] = makeNext(allUsers[username]);
+                delete allUsers[username];
+                return allUsers;
+            }, undefined, false);
+            committed = tx.committed;
+            if (!committed) {
+                const [sourceNow, destinationNow] = await Promise.all([
+                    usersRef.child(username).once("value"), usersRef.child(newUsername).once("value")
+                ]);
+                if (!sourceNow.exists()) return res.status(404).json({ ok: false, error: "not_found" });
+                if (destinationNow.exists()) return res.status(409).json({ ok: false, error: "username_conflict" });
+                return res.status(409).json({ ok: false, error: "record_changed" });
+            }
+        }
         await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "cpp_account_update", timestamp: Date.now(), summary: `Updated C++ account ${username} -> ${newUsername}; lock=${lockType}; status=${status}; hwid=${hwid ? "set" : "reset"}; password=${newPassword ? "changed" : "unchanged"}` });
-        return res.json({ ok: true, username: newUsername, sessionInvalidated: true });
-    } catch (err) { console.error("Admin account update failed:", err.message); return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : "update_failed" }); }
+        return res.json({ ok: true, username: newUsername, sessionInvalidated: true, passwordChanged: Boolean(newPassword) });
+    } catch (err) { console.error("Admin account update failed:", err.message); return res.status(Number(err.statusCode) || 500).json({ ok: false, error: Number(err.statusCode) === 403 ? "forbidden" : Number(err.statusCode) === 401 ? "unauthorized" : "update_failed" }); }
 });
 async function verifyCppRequest(req) {
     const token = readBearerToken(req);
@@ -1062,6 +852,7 @@ app.post("/api/cpp/log", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// HTTP listener is started after all API routes, including Live Studio routes, are registered.
 
 // ================================
 // 📱 Dynamic Realtime Settings (Firebase Sync)
@@ -1291,10 +1082,15 @@ const client = new Client({
     partials: [Partials.Channel, Partials.GuildMember, Partials.Message, Partials.Reaction]
 });
 
-// Live Studio + realtime Discord voice directory. Guests use invite links without Discord role checks;
-// all room management actions still require the existing Firebase Admin API identity.
+// Invite-based LiveKit room, channel-wide persistent live pins, realtime Radar and secure moderation.
+// Live Studio temporarily overrides only the Bot's profile activity; the configured status returns when it ends.
+let liveStudioPresenceActive = false;
 const { attachLiveStudioServer } = require("./live-studio-server");
-attachLiveStudioServer({ app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit, ChannelType });
+attachLiveStudioServer({
+    app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit,
+    ChannelType, allowedOrigins: ADMIN_PANEL_ORIGINS,
+    setLivePresence: (active) => { liveStudioPresenceActive = Boolean(active); setBotPresence(); }
+});
 
 process.on("unhandledRejection", (err) => {
     console.error("[Unhandled Rejection]", err);
@@ -1770,6 +1566,71 @@ function createVerificationEmbed() {
         .setDescription(formatBotMessage("verifyDescription", "👇 নিচের বাটনে ক্লিক করে ভেরিফাই করুন").slice(0, 4000))
         .setColor("Blue").setImage(COVER_IMAGES.VERIFY).setTimestamp();
 }
+async function validateCheckoutPayment(session, userId, category) {
+    const transactionIds = (Array.isArray(session?.usedTxns) ? session.usedTxns : [])
+        .map(String)
+        .filter(id => id && !["AUTO_COUPON_100_PERCENT_OFF", "COUPON_100_PERCENT_OFF"].includes(id) && !id.startsWith("OFFLINE_ADMIN_APPROVED:"));
+    const [transactionEntries, offlineRequestSnap] = await Promise.all([
+        Promise.all(transactionIds.map(async txnId => {
+            const snap = await db.ref(`transactions/${txnId}`).once("value");
+            return [txnId, snap.val() || null];
+        })),
+        session?.offlinePaymentRequestId
+            ? db.ref(`offline_payment_requests/${session.offlinePaymentRequestId}`).once("value")
+            : Promise.resolve(null)
+    ]);
+    return evaluateCheckoutEligibility({
+        session,
+        userId,
+        category,
+        transactions: Object.fromEntries(transactionEntries),
+        offlineRequest: offlineRequestSnap?.val?.() || null
+    });
+}
+
+function getSourceParentCategoryId(interaction) {
+    const sourceChannel = interaction?.channel;
+    const parentId = sourceChannel?.parentId;
+    if (!parentId) return undefined;
+    const parent = interaction.guild?.channels?.cache?.get(parentId);
+    return resolveParentCategoryId({ ...sourceChannel, parentType: parent?.type }, ChannelType.GuildCategory);
+}
+
+function messageHasPanelIdentifier(message, { customId = null, footerText = null } = {}) {
+    const componentMatch = customId && (message.components || []).some(row =>
+        (row.components || []).some(component => component.customId === customId)
+    );
+    const footerMatch = footerText && (message.embeds || []).some(embed => embed.footer?.text === footerText);
+    return Boolean(componentMatch || footerMatch);
+}
+
+async function sendReplacingBotPanel(channel, payload, identifier) {
+    const history = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+    const previousPanels = history
+        ? [...history.values()].filter(message => message.author?.id === client.user?.id && messageHasPanelIdentifier(message, identifier))
+        : [];
+    const failedDeletes = [];
+    for (const oldMessage of previousPanels) {
+        try {
+            await oldMessage.delete();
+        } catch (err) {
+            failedDeletes.push(oldMessage);
+            console.warn(`Could not delete old ${identifier.customId || identifier.footerText || "panel"} message ${oldMessage.id}:`, err.message);
+        }
+    }
+    if (failedDeletes.length) {
+        // If Discord refuses a delete, edit one old message into the new panel and disable other leftovers.
+        const keep = failedDeletes[0];
+        await keep.edit(payload).catch(err => console.error("Could not refresh prior bot panel message:", err.message));
+        for (const stale of failedDeletes.slice(1)) {
+            await stale.edit({ content: "ℹ️ এই প্যানেলটি প্রতিস্থাপন করা হয়েছে। সর্বশেষ প্যানেলটি ব্যবহার করুন।", embeds: [], components: [] })
+                .catch(err => console.warn("Could not disable stale bot panel:", err.message));
+        }
+        return keep;
+    }
+    return channel.send(payload);
+}
+
 function getDisabledFeatureMessage(interaction) {
     const id = String(interaction.customId || "");
     if (["select_buy_category"].includes(id) || /^(pay_gateway_|pay_provider_|check_reader_|submit_txn_|modal_txn_|open_cred_modal_|modal_create_account_|apply_coupon_|modal_coupon_)/.test(id)) {
@@ -1980,21 +1841,47 @@ client.on("interactionCreate", async (interaction) => {
                     await sessionRef.update(checkoutSession);
 
                     if (checkoutSession.targetPrice <= 0) {
-                        await consumeCouponBalance(autoCoupon.code, userId, category, autoCoupon.discount);
-                        checkoutSession = { ...checkoutSession, status: "pending", totalPaid: 0, usedTxns: ["AUTO_COUPON_100_PERCENT_OFF"] };
+                        const couponConsumption = await consumeCouponBalance(autoCoupon.code, userId, category, autoCoupon.discount);
+                        if (couponConsumption.committed) {
+                            const consumedAt = Date.now();
+                            checkoutSession = {
+                                ...checkoutSession,
+                                status: "pending",
+                                totalPaid: 0,
+                                usedTxns: ["AUTO_COUPON_100_PERCENT_OFF"],
+                                freeCheckoutProof: {
+                                    type: "coupon", couponCode: autoCoupon.code, userId, category,
+                                    basePrice, discount: autoCoupon.discount, consumedAt, couponConsumeCommitted: true
+                                }
+                            };
+                            await sessionRef.update(checkoutSession);
+                            const freeEmbed = new EmbedBuilder()
+                                .setTitle(`🎉 Auto Coupon Applied — ${category.toUpperCase()}`)
+                                .setDescription(
+                                    `🎟️ **কুপন:** \`${autoCoupon.code}\`\n` +
+                                    `💸 **ব্যবহৃত কুপন ব্যালেন্স:** \`${autoCoupon.discount}\` BDT\n` +
+                                    `💰 **এখন পরিশোধযোগ্য:** \`0 BDT\`\n\n` +
+                                    `আপনার কুপন দিয়ে প্যাকেজের পুরো মূল্য কভার হয়েছে। অ্যাকাউন্ট তৈরি করতে নিচের বাটনে চাপ দিন।`
+                                ).setColor("Green");
+                            const credentialRow = new ActionRowBuilder().addComponents(
+                                new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success)
+                            );
+                            return interaction.editReply({ embeds: [freeEmbed], components: [credentialRow] });
+                        }
+                        // Fail closed if atomic coupon consumption fails; ask for the normal package payment.
+                        await releaseCouponReservation(autoCoupon.code, userId, category).catch(() => {});
+                        checkoutSession = {
+                            ...checkoutSession,
+                            targetPrice: basePrice,
+                            appliedCoupon: null,
+                            appliedDiscount: 0,
+                            autoCouponApplied: false,
+                            status: "select_provider",
+                            totalPaid: 0,
+                            usedTxns: [],
+                            freeCheckoutProof: null
+                        };
                         await sessionRef.update(checkoutSession);
-                        const freeEmbed = new EmbedBuilder()
-                            .setTitle(`🎉 Auto Coupon Applied — ${category.toUpperCase()}`)
-                            .setDescription(
-                                `🎟️ **কুপন:** \`${autoCoupon.code}\`\n` +
-                                `💸 **ব্যবহৃত কুপন ব্যালেন্স:** \`${autoCoupon.discount}\` BDT\n` +
-                                `💰 **এখন পরিশোধযোগ্য:** \`0 BDT\`\n\n` +
-                                `আপনার কুপন দিয়ে প্যাকেজের পুরো মূল্য কভার হয়েছে। অ্যাকাউন্ট তৈরি করতে নিচের বাটনে চাপ দিন।`
-                            ).setColor("Green");
-                        const credentialRow = new ActionRowBuilder().addComponents(
-                            new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success)
-                        );
-                        return interaction.editReply({ embeds: [freeEmbed], components: [credentialRow] });
                     }
                 }
             }
@@ -2101,6 +1988,15 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         if (finalPrice <= 0) {
+            if (!appliedCouponCode || appliedDiscountValue < basePrice) {
+                return interaction.editReply("❌ বৈধ full-value coupon proof পাওয়া যায়নি। নিরাপত্তার জন্য free checkout বন্ধ করা হয়েছে; আবার package নির্বাচন করুন।");
+            }
+            const couponConsumption = await consumeCouponBalance(appliedCouponCode, userId, category, appliedDiscountValue);
+            if (!couponConsumption.committed) {
+                await releaseCouponReservation(appliedCouponCode, userId, category).catch(() => {});
+                return interaction.editReply("❌ কুপন ব্যালেন্স consume করা যায়নি বা ইতোমধ্যে পরিবর্তিত হয়েছে। পেমেন্ট bypass ঠেকাতে free checkout খোলা হয়নি; নতুন করে coupon apply করুন।");
+            }
+            const consumedAt = Date.now();
             await db.ref(`pending_payments/${userId}_${category}`).set({
                 targetPrice: 0,
                 basePrice: basePrice,
@@ -2108,12 +2004,15 @@ client.on("interactionCreate", async (interaction) => {
                 appliedDiscount: appliedDiscountValue,
                 totalPaid: 0,
                 usedTxns: ["COUPON_100_PERCENT_OFF"],
+                category,
+                createdAt: Date.now(),
+                createdByDiscordId: userId,
+                freeCheckoutProof: {
+                    type: "coupon", couponCode: appliedCouponCode, userId, category,
+                    basePrice, discount: appliedDiscountValue, consumedAt, couponConsumeCommitted: true
+                },
                 status: "pending"
             });
-
-            if (appliedCouponCode) {
-                await consumeCouponBalance(appliedCouponCode, userId, category, appliedDiscountValue);
-            }
 
             const zeroPriceEmbed = new EmbedBuilder()
                 .setTitle(`🎉 100% Discount Applied! (${category.toUpperCase()})`)
@@ -2802,22 +2701,24 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         try {
             const sessionSnap = await sessionRef.once("value");
             const initialSession = sessionSnap.val();
-            const manuallyApprovedOffline = initialSession?.status === "offline_payment_approved"
-                && !!initialSession.offlineApprovedBy && !!initialSession.offlinePaymentRequestId;
-            if (!initialSession || (!manuallyApprovedOffline && Number(initialSession.totalPaid) < Number(initialSession.targetPrice))) {
-                return interaction.editReply("❌ **পেমেন্ট অসম্পূর্ণ!** সম্পূর্ণ টাকা পরিশোধ করুন অথবা Admin/Staff-এর offline payment approval-এর অপেক্ষা করুন।");
+            if (!initialSession) {
+                return interaction.editReply("❌ **পেমেন্ট সেশন পাওয়া যায়নি।** Shop থেকে package নির্বাচন করে পেমেন্ট সম্পন্ন করুন।");
             }
             if (["creating", "completed"].includes(initialSession.status)) {
                 return interaction.editReply("⚠️ এই পেমেন্ট সেশন ইতোমধ্যে ব্যবহার করা হচ্ছে বা অ্যাকাউন্ট তৈরি হয়ে গেছে। একই পেমেন্ট দিয়ে দ্বিতীয় অ্যাকাউন্ট তৈরি করা যাবে না।");
             }
+            const eligibility = await validateCheckoutPayment(initialSession, userId, category);
+            if (!eligibility.ok) {
+                console.warn("Blocked unverified account-creation checkout:", { userId, category, reason: eligibility.reason });
+                return interaction.editReply("❌ **পেমেন্ট যাচাই সম্পন্ন হয়নি।** Account তৈরি করার আগে verified transaction অথবা সফল full-value coupon / approved offline payment প্রয়োজন। Shop থেকে checkout আবার খুলুন বা Support-এর সঙ্গে যোগাযোগ করুন।");
+            }
+            const validatedFingerprint = checkoutFingerprint(initialSession);
 
             // Atomically reserve this paid checkout so repeated button/modal submissions cannot create multiple accounts.
             const claimResult = await sessionRef.transaction((current) => {
                 if (!current || ["creating", "completed"].includes(current.status)) return;
-                const paid = Number(current.totalPaid) || 0;
-                const target = Number(current.targetPrice);
-                const approvedOffline = current.status === "offline_payment_approved" && !!current.offlineApprovedBy && !!current.offlinePaymentRequestId;
-                if (!Number.isFinite(target) || target < 0 || (!approvedOffline && paid < target)) return;
+                // Reject stale payment evidence if the session changed after validation.
+                if (checkoutFingerprint(current) !== validatedFingerprint) return;
                 return { ...current, status: "creating", creationOwner: userId, creationStartedAt: Date.now() };
             }, undefined, false);
 
@@ -2896,7 +2797,8 @@ Approve করার আগে official bKash/Nagad transaction history নি�
 
             const privateChannel = await interaction.guild.channels.create({
                 name: channelPrefix,
-                type: 0,
+                type: ChannelType.GuildText,
+                ...(getSourceParentCategoryId(interaction) ? { parent: getSourceParentCategoryId(interaction) } : {}),
                 permissionOverwrites
             });
 
@@ -2927,14 +2829,20 @@ Approve করার আগে official bKash/Nagad transaction history নি�
                         `👤 **Username:** \`${customUser}\`\n` +
                         `🔑 **Password:** \`${customPass}\`\n` +
                         `📦 **Package:** \`${packageName}\`\n` +
-                        `📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>`
+                        `📅 **মেয়াদ:** <t:${Math.floor(expiryTimestamp / 1000)}:R>\n\n` +
+                        `🎫 **Support ticket:** ${privateChannel}\n` +
+                        `🔐 নিজের password কারও সঙ্গে শেয়ার করবেন না।`
                     )
                     .setThumbnail(userAvatarUrl)
                     .setColor("Green")
                     .setTimestamp();
 
                 await interaction.user.send({ embeds: [dmEmbed] });
-            } catch (dmErr) {}
+                await privateChannel.send({ content: `✅ ${interaction.user} — account details DM-এ পাঠানো হয়েছে। এই ticket-এ আপনার order/reference রাখা হয়েছে; password public channel-এ দেবেন না.` }).catch(() => {});
+            } catch (dmErr) {
+                // Never silently swallow a failed credential DM; the user and support staff need a clear next step.
+                await privateChannel.send({ content: `⚠️ ${interaction.user} — Discord DM deliver করা যায়নি। Server DM/privacy settings খুলে নিন; নিরাপত্তার জন্য credentials শুধু এই private ticket-এ Admin/Staff-এর সঙ্গে যাচাই করুন।` }).catch(() => {});
+            }
 
             const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
             if (trackingChannel) {
@@ -3005,7 +2913,8 @@ Approve করার আগে official bKash/Nagad transaction history নি�
 
         const privateChannel = await interaction.guild.channels.create({
             name: channelPrefix,
-            type: 0,
+            type: ChannelType.GuildText,
+            ...(getSourceParentCategoryId(interaction) ? { parent: getSourceParentCategoryId(interaction) } : {}),
             permissionOverwrites
         });
 
@@ -3294,18 +3203,18 @@ client.on("messageCreate", async (message) => {
         if (!isFeatureEnabled("oneTimeKeyEnabled")) return message.reply("🔑 One-Time Key Generator বর্তমানে বন্ধ আছে।");
         const canOpenKeyPanel = isServerAdmin || message.member.roles.cache.has(getConfiguredRoleId("developer"));
         if (canOpenKeyPanel && (getConfiguredChannelIds("oneTimeKey").includes(message.channelId) || isServerAdmin)) {
-            return message.channel.send(await getDynamicOneTimeKeyPanel());
+            return sendReplacingBotPanel(message.channel, await getDynamicOneTimeKeyPanel(), { customId: "select_key_category" });
         }
         return;
     }
 
     if (!isServerAdmin) return;
 
-    if (message.content === "!setup") return message.channel.send({ embeds: [createVerificationEmbed()], components: [verificationRow] });
-    if (message.content === "!ticket" && message.channelId === getConfiguredChannelId("ticketPanel")) return message.channel.send(await getDynamicTicketPanel());
-    if (message.content === "!report" && message.channelId === getConfiguredChannelId("reportPanel")) return message.channel.send(await getDynamicReportPanel());
-    if (message.content === "!customer" && message.channelId === getConfiguredChannelId("customerPanel")) return message.channel.send(await getDynamicCustomerPanel());
-    if (message.content === "!orderguide" && message.channelId === getConfiguredChannelId("orderGuide")) return message.channel.send(await getDynamicOrderGuidePanel());
+    if (message.content === "!setup") return sendReplacingBotPanel(message.channel, { embeds: [createVerificationEmbed()], components: [verificationRow] }, { customId: "universal_verify_button" });
+    if (message.content === "!ticket" && message.channelId === getConfiguredChannelId("ticketPanel")) return sendReplacingBotPanel(message.channel, await getDynamicTicketPanel(), { customId: "select_product_ticket" });
+    if (message.content === "!report" && message.channelId === getConfiguredChannelId("reportPanel")) return sendReplacingBotPanel(message.channel, await getDynamicReportPanel(), { customId: "select_report_category" });
+    if (message.content === "!customer" && message.channelId === getConfiguredChannelId("customerPanel")) return sendReplacingBotPanel(message.channel, await getDynamicCustomerPanel(), { customId: "select_customer_category" });
+    if (message.content === "!orderguide" && message.channelId === getConfiguredChannelId("orderGuide")) return sendReplacingBotPanel(message.channel, await getDynamicOrderGuidePanel(), { footerText: "Order Guide System" });
     
 });
 
@@ -3699,6 +3608,11 @@ async function publishBotHeartbeat() {
 
 function setBotPresence() {
     if (!client.user) return;
+    if (liveStudioPresenceActive) {
+        // Discord bots can set a normal profile activity, but cannot publish a user's native local RPC.
+        client.user.setPresence({ activities: [{ name: "🔴 LIVE NOW · Live Studio", type: ActivityType.Watching }], status: "online" });
+        return;
+    }
     const cfg = ADMIN_BOT_CONFIG.presence || {};
     const statusCandidate = String(cfg.status || "online").toLowerCase();
     const status = ["online", "idle", "dnd", "invisible"].includes(statusCandidate) ? statusCandidate : "online";
