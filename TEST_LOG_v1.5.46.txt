@@ -1,0 +1,364 @@
+TAP version 13
+# Subtest: account creation validates database payment evidence before it claims the checkout
+ok 1 - account creation validates database payment evidence before it claims the checkout
+  ---
+  duration_ms: 1.020246
+  type: 'test'
+  ...
+# Subtest: free coupon sessions require successful coupon consumption before proof is written
+ok 2 - free coupon sessions require successful coupon consumption before proof is written
+  ---
+  duration_ms: 0.333562
+  type: 'test'
+  ...
+# Subtest: ticket and order channel creation applies the panel channel category as parent
+ok 3 - ticket and order channel creation applies the panel channel category as parent
+  ---
+  duration_ms: 0.188244
+  type: 'test'
+  ...
+# Subtest: panel commands replace existing bot-owned panels instead of making duplicates
+ok 4 - panel commands replace existing bot-owned panels instead of making duplicates
+  ---
+  duration_ms: 0.326412
+  type: 'test'
+  ...
+# Subtest: allows a checkout only when transaction record is verified, used, and owned by buyer
+ok 5 - allows a checkout only when transaction record is verified, used, and owned by buyer
+  ---
+  duration_ms: 1.109571
+  type: 'test'
+  ...
+# Subtest: blocks a splash/button-only attempt with no verified transaction record
+ok 6 - blocks a splash/button-only attempt with no verified transaction record
+  ---
+  duration_ms: 0.161543
+  type: 'test'
+  ...
+# Subtest: blocks transaction proof that belongs to another buyer
+ok 7 - blocks transaction proof that belongs to another buyer
+  ---
+  duration_ms: 0.122655
+  type: 'test'
+  ...
+# Subtest: blocks paid-total mismatch and tampered totals
+ok 8 - blocks paid-total mismatch and tampered totals
+  ---
+  duration_ms: 0.100732
+  type: 'test'
+  ...
+# Subtest: blocks zero-price checkout unless a full-value coupon was actually consumed
+ok 9 - blocks zero-price checkout unless a full-value coupon was actually consumed
+  ---
+  duration_ms: 0.155584
+  type: 'test'
+  ...
+# Subtest: allows free checkout with matching full-value coupon consumption proof
+ok 10 - allows free checkout with matching full-value coupon consumption proof
+  ---
+  duration_ms: 0.91029
+  type: 'test'
+  ...
+# Subtest: blocks changed checkout price/discount that do not add up
+ok 11 - blocks changed checkout price/discount that do not add up
+  ---
+  duration_ms: 0.222265
+  type: 'test'
+  ...
+# Subtest: blocks a verified transaction from the wrong payment provider
+ok 12 - blocks a verified transaction from the wrong payment provider
+  ---
+  duration_ms: 0.112519
+  type: 'test'
+  ...
+# Subtest: offline payment requires a matching approved staff request
+ok 13 - offline payment requires a matching approved staff request
+  ---
+  duration_ms: 0.353462
+  type: 'test'
+  ...
+# Subtest: payment fingerprint changes when the session value changes after validation
+ok 14 - payment fingerprint changes when the session value changes after validation
+  ---
+  duration_ms: 0.436868
+  type: 'test'
+  ...
+# Subtest: ticket channel uses only a real parent category
+ok 15 - ticket channel uses only a real parent category
+  ---
+  duration_ms: 0.169486
+  type: 'test'
+  ...
+# Subtest: invite codes are random-url-safe bearer credentials
+ok 16 - invite codes are random-url-safe bearer credentials
+  ---
+  duration_ms: 1.956626
+  type: 'test'
+  ...
+# Subtest: LiveKit source values are numeric and no custom enum needs String coercion
+ok 17 - LiveKit source values are numeric and no custom enum needs String coercion
+  ---
+  duration_ms: 0.660895
+  type: 'test'
+  ...
+# Subtest: names and durations are bounded
+ok 18 - names and durations are bounded
+  ---
+  duration_ms: 0.29833
+  type: 'test'
+  ...
+# Subtest: invite base origin only accepts HTTPS exact allowlisted origins
+ok 19 - invite base origin only accepts HTTPS exact allowlisted origins
+  ---
+  duration_ms: 0.222485
+  type: 'test'
+  ...
+# Subtest: Radar message includes invite, counts and duration
+ok 20 - Radar message includes invite, counts and duration
+  ---
+  duration_ms: 0.310388
+  type: 'test'
+  ...
+# Subtest: only sendable text and announcement channels are eligible for radar pins
+ok 21 - only sendable text and announcement channels are eligible for radar pins
+  ---
+  duration_ms: 0.182365
+  type: 'test'
+  ...
+# Subtest: ticket channel detection excludes explicit tickets and support categories, while ordinary channels remain eligible
+ok 22 - ticket channel detection excludes explicit tickets and support categories, while ordinary channels remain eligible
+  ---
+  duration_ms: 0.490018
+  type: 'test'
+  ...
+# Subtest: Admin Live Studio routes are protected by verified Firebase Admin sessions
+ok 23 - Admin Live Studio routes are protected by verified Firebase Admin sessions
+  ---
+  duration_ms: 1.406278
+  type: 'test'
+  ...
+# Subtest: LiveKit source grants are numeric values (avoids TrackSource enum string conversion error)
+ok 24 - LiveKit source grants are numeric values (avoids TrackSource enum string conversion error)
+  ---
+  duration_ms: 0.323437
+  type: 'test'
+  ...
+# Subtest: live invite and host URLs use the Blogger root while the Admin Panel origin is validated separately
+ok 25 - live invite and host URLs use the Blogger root while the Admin Panel origin is validated separately
+  ---
+  duration_ms: 0.167983
+  type: 'test'
+  ...
+# Subtest: custom duration is validated, persisted and auto-ends the room
+ok 26 - custom duration is validated, persisted and auto-ends the room
+  ---
+  duration_ms: 0.17268
+  type: 'test'
+  ...
+# Subtest: Radar posts without pinning and locks non-ticket text channels only during Live
+ok 27 - Radar posts without pinning and locks non-ticket text channels only during Live
+  ---
+  duration_ms: 0.370978
+  type: 'test'
+  ...
+# Subtest: invalid invite UI offers Admin Panel return and does not display a video watch-link
+ok 28 - invalid invite UI offers Admin Panel return and does not display a video watch-link
+  ---
+  duration_ms: 0.144147
+  type: 'test'
+  ...
+# Subtest: Admin Panel radar shows channel directory, participants, screen-share count and Discord controls
+ok 29 - Admin Panel radar shows channel directory, participants, screen-share count and Discord controls
+  ---
+  duration_ms: 0.223467
+  type: 'test'
+  ...
+# Subtest: existing transaction and payment panel features remain present
+ok 30 - existing transaction and payment panel features remain present
+  ---
+  duration_ms: 0.138409
+  type: 'test'
+  ...
+# Subtest: Blogger public status endpoint exposes only a minimal session payload and widget is no-refresh responsive
+ok 31 - Blogger public status endpoint exposes only a minimal session payload and widget is no-refresh responsive
+  ---
+  duration_ms: 0.560965
+  type: 'test'
+  ...
+# Subtest: Bot profile activity switches on for live sessions and restores configured presence on end
+ok 32 - Bot profile activity switches on for live sessions and restores configured presence on end
+  ---
+  duration_ms: 0.490749
+  type: 'test'
+  ...
+# Subtest: account updates use a narrow transaction for unchanged usernames and give distinct conflict errors
+ok 33 - account updates use a narrow transaction for unchanged usernames and give distinct conflict errors
+  ---
+  duration_ms: 0.17263
+  type: 'test'
+  ...
+# Subtest: looking up another account does not reuse stale form edits; password stays hidden unless replaced
+ok 34 - looking up another account does not reuse stale form edits; password stays hidden unless replaced
+  ---
+  duration_ms: 0.930311
+  type: 'test'
+  ...
+# Subtest: Admin Panel persists responsive dark/light theme toggle
+ok 35 - Admin Panel persists responsive dark/light theme toggle
+  ---
+  duration_ms: 0.124047
+  type: 'test'
+  ...
+# Subtest: membership account delivery references both DM and private support ticket and exposes DM failures
+ok 36 - membership account delivery references both DM and private support ticket and exposes DM failures
+  ---
+  duration_ms: 0.201684
+  type: 'test'
+  ...
+# Subtest: Blogger root theme embeds the Live Room app and reads root invite query
+ok 37 - Blogger root theme embeds the Live Room app and reads root invite query
+  ---
+  duration_ms: 0.176185
+  type: 'test'
+  ...
+# Subtest: live end cleanup retries when pin work is busy and does not clear pending cleanup early
+ok 38 - live end cleanup retries when pin work is busy and does not clear pending cleanup early
+  ---
+  duration_ms: 0.116495
+  type: 'test'
+  ...
+# Subtest: live end cleanup finds stale Radar pins, unpins then deletes the bot-owned message
+ok 39 - live end cleanup finds stale Radar pins, unpins then deletes the bot-owned message
+  ---
+  duration_ms: 0.097357
+  type: 'test'
+  ...
+# Subtest: Discord pin system notices are matched by CHANNEL_PINNED_MESSAGE type and exact Radar target ID
+ok 40 - Discord pin system notices are matched by CHANNEL_PINNED_MESSAGE type and exact Radar target ID
+  ---
+  duration_ms: 3.369114
+  type: 'test'
+  ...
+# Subtest: Live-end cleanup removes associated Discord pin notices and retries when deletion fails
+ok 41 - Live-end cleanup removes associated Discord pin notices and retries when deletion fails
+  ---
+  duration_ms: 0.236306
+  type: 'test'
+  ...
+# Subtest: closed-ticket messages are backed up for the Admin Panel and failed backups prevent channel deletion
+ok 42 - closed-ticket messages are backed up for the Admin Panel and failed backups prevent channel deletion
+  ---
+  duration_ms: 0.393973
+  type: 'test'
+  ...
+# Subtest: Admin Panel renders archived ticket content as escaped text and permits only HTTPS attachment/avatar links
+ok 43 - Admin Panel renders archived ticket content as escaped text and permits only HTTPS attachment/avatar links
+  ---
+  duration_ms: 0.170226
+  type: 'test'
+  ...
+# Subtest: Live session/invite state persists and recovers automatically when the Bot comes online
+ok 44 - Live session/invite state persists and recovers automatically when the Bot comes online
+  ---
+  duration_ms: 0.103786
+  type: 'test'
+  ...
+# Subtest: Existing explicit Send Messages deny overwrites are not temporary lock targets
+ok 45 - Existing explicit Send Messages deny overwrites are not temporary lock targets
+  ---
+  duration_ms: 0.095554
+  type: 'test'
+  ...
+# Subtest: During Live, pre-existing and newly pinned messages from any bot are unpinned, including in ticket channels
+ok 46 - During Live, pre-existing and newly pinned messages from any bot are unpinned, including in ticket channels
+  ---
+  duration_ms: 0.169415
+  type: 'test'
+  ...
+# Subtest: only one fresh select_provider session can be claimed
+ok 47 - only one fresh select_provider session can be claimed
+  ---
+  duration_ms: 1.103061
+  type: 'test'
+  ...
+# Subtest: stale or tokenless legacy checking_reader status can be recovered
+ok 48 - stale or tokenless legacy checking_reader status can be recovered
+  ---
+  duration_ms: 0.136516
+  type: 'test'
+  ...
+# Subtest: fresh concurrent check cannot be reclaimed
+ok 49 - fresh concurrent check cannot be reclaimed
+  ---
+  duration_ms: 0.156696
+  type: 'test'
+  ...
+# Subtest: only the owner token can commit the result
+ok 50 - only the owner token can commit the result
+  ---
+  duration_ms: 0.170777
+  type: 'test'
+  ...
+# Subtest: failed owner releases the session to select_provider
+ok 51 - failed owner releases the session to select_provider
+  ---
+  duration_ms: 0.181313
+  type: 'test'
+  ...
+# Subtest: role permission catalog, planning, apply and revert API routes require Firebase admin verification
+ok 52 - role permission catalog, planning, apply and revert API routes require Firebase admin verification
+  ---
+  duration_ms: 0.73016
+  type: 'test'
+  ...
+# Subtest: AI output is limited to channel permission allowlist and cannot immediately mutate Discord
+ok 53 - AI output is limited to channel permission allowlist and cannot immediately mutate Discord
+  ---
+  duration_ms: 0.207132
+  type: 'test'
+  ...
+# Subtest: Admin Panel exposes role/channel selectors, preview approval, and backup revert
+ok 54 - Admin Panel exposes role/channel selectors, preview approval, and backup revert
+  ---
+  duration_ms: 0.300352
+  type: 'test'
+  ...
+# Subtest: OpenAI API key is documented as private Bot-host configuration, not browser configuration
+ok 55 - OpenAI API key is documented as private Bot-host configuration, not browser configuration
+  ---
+  duration_ms: 0.104547
+  type: 'test'
+  ...
+# Subtest: normalizes AI output to the allowlisted permission names and defaults omissions to keep
+ok 56 - normalizes AI output to the allowlisted permission names and defaults omissions to keep
+  ---
+  duration_ms: 1.347449
+  type: 'test'
+  ...
+# Subtest: only explicit allow/deny changes are sent to Discord; keep leaves prior values alone
+ok 57 - only explicit allow/deny changes are sent to Discord; keep leaves prior values alone
+  ---
+  duration_ms: 0.153421
+  type: 'test'
+  ...
+# Subtest: restore payload reconstructs prior allow, deny, and unset states
+ok 58 - restore payload reconstructs prior allow, deny, and unset states
+  ---
+  duration_ms: 0.235965
+  type: 'test'
+  ...
+# Subtest: overwrite state reports inherit when there is no explicit role overwrite
+ok 59 - overwrite state reports inherit when there is no explicit role overwrite
+  ---
+  duration_ms: 0.136556
+  type: 'test'
+  ...
+1..59
+# tests 59
+# suites 0
+# pass 59
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 382.272909

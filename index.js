@@ -31,6 +31,7 @@ const {
 // html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
 const { evaluateCheckoutEligibility, checkoutFingerprint, resolveParentCategoryId } = require("./checkout-security");
+const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -239,7 +240,10 @@ let ADMIN_BOT_CONFIG = {
         capsProtectionEnabled: true, antiLinkEnabled: true, badWordsFilterEnabled: true,
         spamProtectionEnabled: true, linkResponseEnabled: true, ghostPingEnabled: true,
         welcomeSystemEnabled: true, leaveTrackingEnabled: true, oneTimeKeyEnabled: true,
-        profileSyncEnabled: true, orderTrackingEnabled: true, transcriptLogsEnabled: true
+        profileSyncEnabled: true, orderTrackingEnabled: true, transcriptLogsEnabled: true,
+        smartOnboardingEnabled: true, communityFaqEnabled: false, communitySuggestionsEnabled: true,
+        eventRemindersEnabled: true, communityRulesEnabled: true, ticketRoutingEnabled: true,
+        communityAnalyticsEnabled: true, raidAlertEnabled: true
     },
     checkout: { readerRequired: true, allowPartialPayments: true, sessionExpiryHours: 24 },
     coupons: { enabled: true, overpaymentMode: "auto", expiryDays: 90 },
@@ -261,7 +265,8 @@ let ADMIN_BOT_CONFIG = {
         levelUp: "🎉 অভিনন্দন <@{user}>! আপনি লেভেল **{level}** এ উন্নীত হয়েছেন।",
         checkoutUnavailable: "🛠️ Shop checkout বর্তমানে বন্ধ অথবা maintenance mode চালু আছে। পরে আবার চেষ্টা করুন।"
     },
-    discord: { channels: {}, roles: {} }
+    discord: { channels: {}, roles: {} },
+    communityAutomation: { enabled: true, faq: { enabled: false, entries: [], knowledgeBase: "", aiFallback: false }, onboarding: { enabled: true, dmEnabled: false, dmTemplate: "স্বাগতম {server}! Rules পড়ে নাও এবং প্রয়োজন হলে !faq বা !tickethelp ব্যবহার করো।", autoRoleIds: [] }, suggestions: { enabled: true, channelId: "" }, ticketRoutes: [], rules: [], events: {}, selfRoles: [], eventChannelId: "", raid: { enabled: true, joinThreshold: 8, windowSeconds: 30 } }
 };
 let adminConfigLoaded = false;
 function isFeatureEnabled(name) {
@@ -899,6 +904,13 @@ db.ref("adminConfig/bot").on("value", (snapshot) => {
             ...(ADMIN_BOT_CONFIG.discord || {}), ...(root.discord || {}),
             channels: { ...(ADMIN_BOT_CONFIG.discord?.channels || {}), ...((root.discord || {}).channels || {}) },
             roles: { ...(ADMIN_BOT_CONFIG.discord?.roles || {}), ...((root.discord || {}).roles || {}) }
+        },
+        communityAutomation: {
+            ...(ADMIN_BOT_CONFIG.communityAutomation || {}), ...(root.communityAutomation || {}),
+            faq: { ...(ADMIN_BOT_CONFIG.communityAutomation?.faq || {}), ...((root.communityAutomation || {}).faq || {}) },
+            onboarding: { ...(ADMIN_BOT_CONFIG.communityAutomation?.onboarding || {}), ...((root.communityAutomation || {}).onboarding || {}) },
+            suggestions: { ...(ADMIN_BOT_CONFIG.communityAutomation?.suggestions || {}), ...((root.communityAutomation || {}).suggestions || {}) },
+            raid: { ...(ADMIN_BOT_CONFIG.communityAutomation?.raid || {}), ...((root.communityAutomation || {}).raid || {}) }
         }
     };
     if (Object.prototype.hasOwnProperty.call(ADMIN_BOT_CONFIG.links || {}, "verificationLink")) {
@@ -1330,6 +1342,56 @@ function savePunishment(userId, status, durationMs = null) { const punishments =
 function getOrderLogs() { if (!fs.existsSync(ORDER_LOG_FILE)) fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify({}), "utf8"); return JSON.parse(fs.readFileSync(ORDER_LOG_FILE, "utf8")); }
 function saveOrderLog(channelId, trackingMessageId, orderDetails) { const logs = getOrderLogs(); logs[channelId] = { trackingMessageId, ...orderDetails }; fs.writeFileSync(ORDER_LOG_FILE, JSON.stringify(logs, null, 2), "utf8"); }
 
+function serializeTicketMessage(message) {
+    const author = message.author || {};
+    let avatarUrl = "";
+    try { avatarUrl = author.displayAvatarURL ? author.displayAvatarURL({ extension: "png", size: 128 }) : ""; } catch (_) {}
+    const embeds = (Array.isArray(message.embeds) ? message.embeds : []).slice(0, 10).map(embed => {
+        const data = typeof embed.toJSON === "function" ? embed.toJSON() : {};
+        return {
+            title: String(data.title || "").slice(0, 256), description: String(data.description || "").slice(0, 4000),
+            url: String(data.url || "").slice(0, 1000), timestamp: data.timestamp || null,
+            author: String(data.author?.name || "").slice(0, 256), footer: String(data.footer?.text || "").slice(0, 1000),
+            fields: (Array.isArray(data.fields) ? data.fields : []).slice(0, 25).map(field => ({ name: String(field.name || "").slice(0, 256), value: String(field.value || "").slice(0, 1024), inline: Boolean(field.inline) }))
+        };
+    });
+    return {
+        id: String(message.id), authorId: String(author.id || ""), username: String(message.member?.displayName || author.globalName || author.username || "Unknown user").slice(0, 100),
+        tag: String(author.tag || "").slice(0, 100), avatarUrl: String(avatarUrl).slice(0, 1000), authorIsBot: Boolean(author.bot),
+        content: String(message.content || "").slice(0, 4000), createdAt: Number(message.createdTimestamp) || Date.now(), editedAt: Number(message.editedTimestamp) || 0,
+        attachments: [...(message.attachments?.values?.() || [])].slice(0, 25).map(a => ({ name: String(a.name || "attachment").slice(0, 255), url: String(a.url || "").slice(0, 1500), contentType: String(a.contentType || "").slice(0, 150), size: Number(a.size) || 0 })),
+        embeds
+    };
+}
+
+async function createTicketArchive(channel, closedBy, ownerId, extra = {}) {
+    const fetched = [];
+    let before;
+    for (let page = 0; page < 10000; page++) {
+        const options = { limit: 100 };
+        if (before) options.before = before;
+        const batch = await channel.messages.fetch(options);
+        if (!batch?.size) break;
+        fetched.push(...batch.values());
+        const oldest = batch.reduce((value, msg) => !value || BigInt(msg.id) < BigInt(value.id) ? msg : value, null);
+        if (!oldest || batch.size < 100) break;
+        before = oldest.id;
+    }
+    fetched.sort((a, b) => (Number(a.createdTimestamp) || 0) - (Number(b.createdTimestamp) || 0));
+    const messages = {};
+    for (const message of fetched) messages[String(message.id)] = serializeTicketMessage(message);
+    const closedAt = Date.now();
+    const metadata = {
+        channelId: String(channel.id), channelName: String(channel.name || "closed-ticket").slice(0, 100),
+        guildId: String(channel.guildId || channel.guild?.id || ""), categoryId: String(channel.parentId || ""),
+        categoryName: String(channel.parent?.name || "").slice(0, 100), ticketType: String(channel.name || "ticket").split(/[-_]/)[0].slice(0, 30),
+        ownerId: String(ownerId || ""), closedById: String(closedBy?.id || ""), closedByName: String(closedBy?.tag || closedBy?.username || "Admin/Staff").slice(0, 100),
+        closedAt, messageCount: fetched.length, archiveVersion: 1, ...extra
+    };
+    recordCommunityMetric("ticketsArchived").catch(() => {});
+    return { ...metadata, messages };
+}
+
 // ================================
 // 🎉 Dynamic Welcome Embed Builder
 // ================================
@@ -1491,6 +1553,7 @@ client.on("messageCreate", async (message) => {
     const upperCount = message.content.replace(/[^A-Z]/g, "").length;
     const totalLetters = message.content.replace(/[^a-zA-Z]/g, "").length;
     if (isFeatureEnabled("capsProtectionEnabled") && totalLetters >= automodSettings.minCapsLetters && (upperCount / Math.max(1, totalLetters)) > automodSettings.maxUppercaseRatio) {
+        recordCommunityMetric("automodHits").catch(() => {});
         try { await message.delete().catch(() => {}); } catch(e){}
         const capsWarn = await message.channel.send(formatBotMessage("capsWarning", "⚠️ <@{user}>, মেসেজে অতিরিক্ত বড় হাতের অক্ষর (Caps Lock) ব্যবহার করবেন না।", { user: userId }).slice(0, 1900));
         setTimeout(() => capsWarn.delete().catch(() => {}), 5000);
@@ -1500,6 +1563,7 @@ client.on("messageCreate", async (message) => {
     // Anti-link protection is an independently controlled feature.
     const linkRegex = /(https?:\/\/[^\s]+)/g;
     if (isFeatureEnabled("antiLinkEnabled") && linkRegex.test(message.content)) {
+        recordCommunityMetric("automodHits").catch(() => {});
         try { await message.delete().catch(() => {}); } catch(e){}
         const linkWarn = await message.channel.send(formatBotMessage("linkWarning", "⚠️ <@{user}>, সার্ভারে বাইরের লিংক পোস্ট করা নিষিদ্ধ!", { user: userId }).slice(0, 1900));
         setTimeout(() => linkWarn.delete().catch(() => {}), 5000);
@@ -1521,6 +1585,7 @@ client.on("messageCreate", async (message) => {
         if (activeTimestamps.length >= automodSettings.spamCount) { triggerAutomod = true; reason = "অতিরিক্ত স্প্যামিং করা"; }
     }
     if (triggerAutomod) {
+        recordCommunityMetric("automodHits").catch(() => {});
         try { await message.delete().catch(() => {}); } catch(e){}
         const currentAutomodSettings = getAutomodSettings();
         let warns = (userWarns.get(userId) || 0) + 1; userWarns.set(userId, warns);
@@ -1700,6 +1765,31 @@ client.on("interactionCreate", async (interaction) => {
             if (userLog && welcomeChannel) { try { const msg = await welcomeChannel.messages.fetch(userLog.messageId); if (msg) { const updatedEmbed = buildDynamicWelcomeEmbed(interaction.member, "verified", userLog.isOffline, Date.now()); await msg.edit({ embeds: [updatedEmbed] }); } } catch (e) {} }
         } catch (err) { console.error(err); }
         return;
+    }
+
+    if (interaction.isStringSelectMenu() && interaction.customId === "community_self_roles") {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        try {
+            const cfg = getCommunityAutomationConfig();
+            const configured = rawCommunitySelfRoles(cfg);
+            const allowlist = new Set(configured.map(item => item.roleId));
+            const selected = new Set(interaction.values.filter(id => allowlist.has(String(id))).map(String));
+            const member = await interaction.guild.members.fetch(interaction.user.id);
+            const botMember = interaction.guild.members.me || await interaction.guild.members.fetchMe().catch(() => null);
+            if (!botMember?.permissions.has(PermissionFlagsBits.ManageRoles)) return interaction.editReply("❌ Bot-এর Manage Roles permission নেই। Admin-কে জানাও।");
+            const assigned = [], removed = [], skipped = [];
+            for (const item of configured) {
+                const role = interaction.guild.roles.cache.get(item.roleId) || await interaction.guild.roles.fetch(item.roleId).catch(() => null);
+                if (!role || role.managed || role.permissions.has(PermissionFlagsBits.Administrator) || role.position >= botMember.roles.highest.position) { skipped.push(item.label); continue; }
+                const hasRole = member.roles.cache.has(role.id), wantsRole = selected.has(role.id);
+                if (wantsRole && !hasRole) { await member.roles.add(role, "Member chose an approved self-service role"); assigned.push(role.name); }
+                else if (!wantsRole && hasRole) { await member.roles.remove(role, "Member updated approved self-service role selection"); removed.push(role.name); }
+            }
+            return interaction.editReply(`✅ Role selection saved.\nAdded: ${assigned.join(", ") || "None"}\nRemoved: ${removed.join(", ") || "None"}${skipped.length ? `\nSkipped unavailable/unsafe roles: ${skipped.join(", ")}` : ""}`.slice(0, 1800));
+        } catch (err) {
+            console.error("Self-role interaction failed:", err.message);
+            return interaction.editReply("❌ Role update ব্যর্থ হয়েছে। Bot-এর Manage Roles permission এবং role hierarchy পরীক্ষা করো।");
+        }
     }
 
     // 🔑 Button ভিত্তিক OneTime Key Handler
@@ -2971,6 +3061,19 @@ Approve করার আগে official bKash/Nagad transaction history নি�
 
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         let transcriptSaved = false;
+        let transcriptLogUploaded = false;
+        try {
+            const archive = await createTicketArchive(interaction.channel, interaction.user, currentOrder?.userId || "", { closedByMention: `<@${interaction.user.id}>` });
+            const updates = {};
+            updates[`ticketTranscripts/${interaction.channel.id}`] = archive;
+            const indexEntry = { ...archive };
+            delete indexEntry.messages;
+            updates[`ticketTranscriptIndex/${interaction.channel.id}`] = indexEntry;
+            await db.ref().update(updates);
+            transcriptSaved = true;
+        } catch (archiveErr) {
+            console.error("❌ Ticket Firebase archive failed:", archiveErr.message);
+        }
         try {
             const transcript = await discordTranscripts.createTranscript(interaction.channel, {
                 limit: -1,
@@ -2985,10 +3088,17 @@ Approve করার আগে official bKash/Nagad transaction history নি�
                     content: `📜 **Transcript Log:** #${interaction.channel.name} | Closed by ${interaction.user}`,
                     files: [transcript]
                 });
-                transcriptSaved = true;
+                transcriptLogUploaded = true;
             }
         } catch (tErr) {
-            console.error("❌ Transcript creation/upload failed:", tErr.message);
+            console.error("❌ Transcript HTML creation/upload failed:", tErr.message);
+        }
+        if (!transcriptSaved && !transcriptLogUploaded) console.error("❌ Ticket transcript could not be saved to Firebase or transcript log.");
+        // Never delete a ticket if the Admin Panel archive was not safely committed.
+        // The HTML log attachment is a secondary copy; Firebase is required for the in-panel chat viewer.
+        if (!transcriptSaved) {
+            await interaction.editReply("⚠️ টিকিটের chat backup Admin Panel-এ save করা যায়নি। নিরাপত্তার জন্য ticket channel delete করা হয়নি; পরে আবার Close চাপুন অথবা Admin-কে জানান।");
+            return;
         }
 
         if (currentOrder?.trackingMessageId) {
@@ -3322,6 +3432,344 @@ function findPanelMessage(messages, expectedCustomId) {
         message.components?.some(row => row.components?.some(component => component.customId === expectedCustomId))
     ) || null;
 }
+
+// ================================
+// 🌐 Community Automation Suite (v1.5.47)
+// ================================
+const COMMUNITY_ROOT = "runtime/community";
+const communityCommandCooldowns = new Map();
+const communityRuleCooldowns = new Map();
+const communityFaqAiCooldowns = new Map();
+const communityJoinTimes = [];
+const communityAlertCooldowns = new Map();
+const communityEventRuns = new Set();
+let communitySchedulerTimer = null;
+const communityMetricBuffer = new Map();
+let communityMetricFlushRunning = false;
+
+function getCommunityAutomationConfig() {
+    return normalizeAutomationConfig(ADMIN_BOT_CONFIG.communityAutomation || {});
+}
+function safeCommunityKey(value) {
+    return String(value || "unknown").replace(/[.#$\[\]\/]/g, "_").slice(0, 120);
+}
+async function recordCommunityMetric(metric, amount = 1) {
+    if (!isFeatureEnabled("communityAnalyticsEnabled")) return;
+    const allowed = new Set(["joins", "leaves", "messages", "faqReplies", "faqAiReplies", "suggestions", "automodHits", "ticketsArchived", "eventsSent", "keywordReplies", "raidAlerts"]);
+    if (!allowed.has(String(metric))) return;
+    const day = getDailyKey(Date.now());
+    const key = `${day}/${metric}`;
+    communityMetricBuffer.set(key, (communityMetricBuffer.get(key) || 0) + Math.max(0, Number(amount) || 0));
+    if (communityMetricBuffer.size >= 25) await flushCommunityMetrics();
+}
+async function flushCommunityMetrics() {
+    if (communityMetricFlushRunning || !communityMetricBuffer.size) return;
+    communityMetricFlushRunning = true;
+    const entries = [...communityMetricBuffer.entries()];
+    for (const [key, amount] of entries) communityMetricBuffer.delete(key);
+    try {
+        await Promise.all(entries.map(async ([key, amount]) => {
+            const ref = db.ref(`${COMMUNITY_ROOT}/analytics/${key}`);
+            await ref.transaction(current => (Number(current) || 0) + amount, undefined, false);
+        }));
+    } catch (err) {
+        for (const [key, amount] of entries) communityMetricBuffer.set(key, (communityMetricBuffer.get(key) || 0) + amount);
+        console.warn("Community analytics flush failed:", err.message);
+    } finally { communityMetricFlushRunning = false; }
+}
+async function recordCommunityAlert(type, summary, extra = {}) {
+    const safeType = safeCommunityKey(type);
+    const now = Date.now();
+    const last = communityAlertCooldowns.get(safeType) || 0;
+    if (now - last < 30_000) return null;
+    communityAlertCooldowns.set(safeType, now);
+    const ref = db.ref(`${COMMUNITY_ROOT}/alerts`).push();
+    const entry = {
+        id: ref.key, type: safeType, summary: String(summary || "").replace(/[\r\n\0]+/g, " ").slice(0, 500),
+        createdAt: now, status: "open", ...extra
+    };
+    try { await ref.set(entry); } catch (err) { console.error("Could not store community alert:", err.message); return null; }
+    try {
+        const channel = client.channels.cache.get(getConfiguredChannelId("staffAdminLog")) || client.channels.cache.get(getConfiguredChannelId("log"));
+        if (channel?.isTextBased?.()) {
+            const embed = new EmbedBuilder().setColor("Orange").setTitle(`RKBACKLES Alert · ${safeType.slice(0, 90)}`).setDescription(entry.summary.slice(0, 3500)).setTimestamp(now);
+            await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch(() => {});
+        }
+    } catch (_) {}
+    return entry;
+}
+function cooldownAllowed(map, key, intervalMs) {
+    const now = Date.now(), previous = Number(map.get(key)) || 0;
+    if (now - previous < intervalMs) return false;
+    map.set(key, now);
+    if (map.size > 4000) {
+        for (const [entry, value] of map) if (now - value > 60 * 60 * 1000) map.delete(entry);
+    }
+    return true;
+}
+async function askCommunityFaqAi(question, knowledgeBase) {
+    const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+    if (!apiKey) return null;
+    const model = String(process.env.OPENAI_FAQ_MODEL || process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini").trim().slice(0, 80);
+    const response = await fetch("https://api.openai.com/v1/responses", {
+        method: "POST", headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        signal: AbortSignal.timeout(18_000),
+        body: JSON.stringify({
+            model, max_output_tokens: 350,
+            instructions: "Answer as a concise and friendly Discord community helper. Use only the supplied server knowledge base. If the answer is not supported by it, say you cannot confirm and direct the user to open a support ticket or ask staff. Do not invent prices, policies, URLs, rules, staff names, or promises. Reply in the user's language when possible. No markdown tables.",
+            input: `Server knowledge base:\n${String(knowledgeBase || "").slice(0, 7000)}\n\nMember question:\n${String(question || "").slice(0, 500)}`
+        })
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new Error(`FAQ AI provider HTTP ${response.status}`);
+    const output = Array.isArray(data?.output) ? data.output.flatMap(item => Array.isArray(item?.content) ? item.content : []).filter(item => item?.type === "output_text").map(item => item.text || "").join("\n") : "";
+    return String(output || "").trim().slice(0, 1600) || null;
+}
+async function sendCommunityFaq(message, question, config) {
+    const faq = config.faq;
+    if (!isFeatureEnabled("communityFaqEnabled") || !faq.enabled) return message.reply("ℹ️ FAQ assistant বর্তমানে বন্ধ আছে। Support ticket খুলে Staff-এর সাহায্য নাও।");
+    if (faq.channelId && message.channelId !== faq.channelId) return message.reply(`ℹ️ FAQ প্রশ্নের জন্য <#${faq.channelId}> চ্যানেল ব্যবহার করো।`);
+    const match = findFaqAnswer(question, faq.entries);
+    if (match) {
+        await recordCommunityMetric("faqReplies");
+        return message.reply({ content: match.answer, allowedMentions: { parse: [] } });
+    }
+    if (faq.aiFallback && String(process.env.OPENAI_API_KEY || "").trim() && cooldownAllowed(communityFaqAiCooldowns, message.author.id, 15_000)) {
+        try {
+            const answer = await askCommunityFaqAi(question, faq.knowledgeBase);
+            if (answer) { await recordCommunityMetric("faqAiReplies"); return message.reply({ content: answer, allowedMentions: { parse: [] } }); }
+        } catch (err) {
+            console.warn("Community FAQ AI failed:", err.message);
+            await recordCommunityAlert("faq_ai_error", "AI FAQ request failed. Verify OPENAI_API_KEY, model availability and provider quota.");
+        }
+    }
+    return message.reply("এই প্রশ্নের নিশ্চিত উত্তর FAQ-তে পাইনি। ভুল তথ্য দেওয়ার বদলে একটি support ticket খোলো বা Staff-কে জিজ্ঞাসা করো।");
+}
+function rawCommunitySelfRoles(config) {
+    const source = config?.selfRoles;
+    const values = Array.isArray(source) ? source : Object.entries(source && typeof source === "object" ? source : {}).map(([roleId, value]) => ({ roleId, ...(value || {}) }));
+    return values.filter(item => /^\d{15,25}$/.test(String(item?.roleId || item?.id || ""))).map(item => ({ roleId: String(item.roleId || item.id), label: String(item.label || item.name || "Community role").slice(0, 100), description: String(item.description || "").slice(0, 100) })).slice(0, 25);
+}
+async function handleCommunityCommand(message) {
+    if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return false;
+    const config = getCommunityAutomationConfig();
+    const content = String(message.content || "").trim();
+    const lower = content.toLocaleLowerCase();
+    if (!content.startsWith("!")) return false;
+    const [commandRaw, ...args] = content.split(/\s+/);
+    const command = commandRaw.toLowerCase();
+    const rest = content.slice(commandRaw.length).trim();
+
+    if (["!help", "!rkhelp"].includes(command)) {
+        return message.reply({ content: "**RKBACKLES community commands**\n`!faq <question>` — FAQ / server helper\n`!tickethelp <problem>` — ticket category suggestion\n`!suggest <idea>` — submit an idea\n`!rank` — your XP and level\n`!leaderboard` — top levels\n`!notify on|off` — event reminder opt-in\n`!roles` — self-select approved roles\n`!poll Question | Option 1 | Option 2` — Admin poll\n`!profile` — your community profile\n`!help` — this list", allowedMentions: { parse: [] } }).then(() => true);
+    }
+    if (command === "!faq") {
+        if (!rest) return message.reply("ব্যবহার: `!faq <তোমার প্রশ্ন>`").then(() => true);
+        await sendCommunityFaq(message, rest, config); return true;
+    }
+    if (command === "!tickethelp") {
+        if (!isFeatureEnabled("ticketRoutingEnabled")) return message.reply("Ticket helper বর্তমানে বন্ধ আছে। Ticket panel ব্যবহার করো।").then(() => true);
+        if (!rest) return message.reply("ব্যবহার: `!tickethelp <তোমার সমস্যার বিবরণ>`").then(() => true);
+        const route = classifyTicketIntent(rest, config.ticketRoutes);
+        if (!route) return message.reply("সমস্যাটি কোন category-তে পড়ে তা নিশ্চিতভাবে বুঝতে পারিনি। Ticket panel থেকে উপযুক্ত category বেছে নাও; Staff সাহায্য করবে।").then(() => true);
+        const roleMention = route.supportRoleId ? `\nসংশ্লিষ্ট Support: <@&${route.supportRoleId}>` : "";
+        const hint = route.hint ? `\n${route.hint}` : "";
+        return message.reply({ content: `সম্ভাব্য ticket category: **${route.name}**.${hint}${roleMention}\nএটি একটি suggestion—final category ticket panel-এ বেছে নাও।`, allowedMentions: { parse: route.supportRoleId ? ["roles"] : [] } }).then(() => true);
+    }
+    if (command === "!suggest") {
+        if (!isFeatureEnabled("communitySuggestionsEnabled") || !config.suggestions.enabled) return message.reply("Suggestion system বর্তমানে বন্ধ আছে।").then(() => true);
+        if (!rest || rest.length < 8) return message.reply("আইডিয়াটি একটু বিস্তারিত লিখো। ব্যবহার: `!suggest <idea>`").then(() => true);
+        if (rest.length > 1500) return message.reply("Suggestion সর্বোচ্চ 1500 character হতে পারবে।").then(() => true);
+        if (!cooldownAllowed(communityCommandCooldowns, `suggest:${message.author.id}`, 60_000)) return message.reply("একটি suggestion দেওয়ার পর ১ মিনিট অপেক্ষা করো।").then(() => true);
+        const targetId = config.suggestions.channelId;
+        const target = targetId ? (client.channels.cache.get(targetId) || await client.channels.fetch(targetId).catch(() => null)) : message.channel;
+        if (!target?.isTextBased?.()) return message.reply("Suggestion channel ঠিকভাবে configure করা নেই। Admin-কে জানাও।").then(() => true);
+        const embed = new EmbedBuilder().setColor("Blue").setTitle("💡 Community Suggestion").setDescription(rest).addFields({ name: "Submitted by", value: `${message.author}`, inline: true }, { name: "Status", value: "🟡 Pending review", inline: true }).setFooter({ text: `Suggestion ID ${Date.now().toString(36).toUpperCase()}` }).setTimestamp();
+        try {
+            const posted = await target.send({ embeds: [embed], allowedMentions: { parse: [] } });
+            await Promise.all([posted.react("👍").catch(() => {}), posted.react("👎").catch(() => {})]);
+            const ref = db.ref(`${COMMUNITY_ROOT}/suggestions`).push();
+            await ref.set({ id: ref.key, authorId: message.author.id, channelId: target.id, messageId: posted.id, text: rest.slice(0, 1500), createdAt: Date.now(), status: "pending" });
+            await recordCommunityMetric("suggestions");
+            await message.reply("✅ তোমার suggestion জমা হয়েছে। Staff review করলে status update হবে।");
+        } catch (err) {
+            console.error("Suggestion submission failed:", err.message);
+            await recordCommunityAlert("suggestion_error", "A user suggestion could not be published. Check the configured channel and Bot Send Messages/Embed Links/Read Message History permissions.");
+            await message.reply("❌ Suggestion জমা দেওয়া যায়নি। পরে আবার চেষ্টা করো।");
+        }
+        return true;
+    }
+    if (command === "!rank") {
+        const snap = await db.ref(`leveling/${message.author.id}`).once("value").catch(() => null);
+        const state = calculateRankProgress(snap?.val() || {}, ADMIN_BOT_CONFIG.leveling?.xpPerLevelBase || 100);
+        const filled = Math.round(state.percent / 10);
+        const bar = "█".repeat(filled) + "░".repeat(10 - filled);
+        await message.reply({ content: `**${message.author.username} · Level ${state.level}**\nXP: ${state.xp}/${state.needed}\n${bar} ${state.percent}%`, allowedMentions: { parse: [] } });
+        return true;
+    }
+    if (command === "!leaderboard") {
+        const snap = await db.ref("leveling").orderByChild("level").limitToLast(10).once("value").catch(() => null);
+        const rows = [];
+        snap?.forEach(child => rows.push({ userId: child.key, ...((child.val() && typeof child.val() === "object") ? child.val() : {}) }));
+        rows.sort((a, b) => (Number(b.level) || 1) - (Number(a.level) || 1) || (Number(b.xp) || 0) - (Number(a.xp) || 0));
+        if (!rows.length) return message.reply("এখনও leaderboard data নেই।").then(() => true);
+        const description = rows.slice(0, 10).map((row, i) => `**${i + 1}.** <@${row.userId}> — Level ${Math.max(1, Number(row.level) || 1)} (${Math.max(0, Number(row.xp) || 0)} XP)`).join("\n");
+        await message.reply({ content: `🏆 **Server Level Leaderboard**\n${description}`, allowedMentions: { parse: [] } });
+        return true;
+    }
+    if (command === "!profile") {
+        const [levelSnap, notifySnap, suggestionSnap] = await Promise.all([
+            db.ref(`leveling/${message.author.id}`).once("value").catch(() => null),
+            db.ref(`communitySubscribers/${message.author.id}`).once("value").catch(() => null),
+            db.ref(`${COMMUNITY_ROOT}/suggestions`).orderByChild("authorId").equalTo(message.author.id).once("value").catch(() => null)
+        ]);
+        const progress = calculateRankProgress(levelSnap?.val() || {}, ADMIN_BOT_CONFIG.leveling?.xpPerLevelBase || 100);
+        const preference = notifySnap?.val()?.eventReminders === true ? "On" : "Off";
+        const ideas = suggestionSnap?.numChildren?.() || 0;
+        await message.reply({ content: `**${message.author.username} · Community Profile**\nLevel: ${progress.level}\nXP: ${progress.xp}/${progress.needed} (${progress.percent}%)\nEvent reminders: ${preference}\nSuggestions submitted: ${ideas}`, allowedMentions: { parse: [] } });
+        return true;
+    }
+    if (command === "!roles") {
+        if (!isFeatureEnabled("smartOnboardingEnabled") || !config.onboarding.enabled) return message.reply("Self-role system বর্তমানে বন্ধ আছে।").then(() => true);
+        const configured = rawCommunitySelfRoles(config);
+        const guild = message.guild;
+        const botMember = guild.members.me || await guild.members.fetchMe().catch(() => null);
+        const options = [];
+        for (const item of configured) {
+            const role = guild.roles.cache.get(item.roleId) || await guild.roles.fetch(item.roleId).catch(() => null);
+            if (!role || role.managed || role.permissions.has(PermissionFlagsBits.Administrator) || !botMember?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= botMember.roles.highest.position) continue;
+            options.push({ label: item.label || role.name, value: role.id, description: item.description || `Select ${role.name}`.slice(0, 100), default: message.member.roles.cache.has(role.id) });
+        }
+        if (!options.length) return message.reply("এখন self-select করার মতো কোনো role configure করা নেই। Admin-কে জানাও।").then(() => true);
+        const menu = new StringSelectMenuBuilder().setCustomId("community_self_roles").setPlaceholder("Choose your optional community roles").setMinValues(0).setMaxValues(options.length).addOptions(options);
+        const row = new ActionRowBuilder().addComponents(menu);
+        const posted = await message.channel.send({ content: `${message.author} নিজের পছন্দের role বেছে নাও। এই নির্বাচন তোমার account-এর জন্য; অন্য সদস্যের role পরিবর্তন করবে না।`, components: [row], allowedMentions: { users: [message.author.id] } });
+        setTimeout(() => posted.delete().catch(() => {}), 120_000).unref?.();
+        return true;
+    }
+    if (command === "!poll") {
+        const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(getConfiguredRoleId("admin"));
+        if (!isServerAdmin) return message.reply("শুধু authorized Admin poll তৈরি করতে পারবে।").then(() => true);
+        const parts = rest.split("|").map(v => v.trim()).filter(Boolean);
+        if (parts.length < 3 || parts.length > 6) return message.reply("ব্যবহার: `!poll প্রশ্ন | Option 1 | Option 2` (২–৫টি option)।").then(() => true);
+        const question = parts[0].slice(0, 250); const options = parts.slice(1).map(x => x.slice(0, 180));
+        const emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"];
+        const embed = new EmbedBuilder().setColor("Purple").setTitle(`📊 ${question}`.slice(0, 256)).setDescription(options.map((option, i) => `${emojis[i]} ${option}`).join("\n")).setFooter({ text: `Poll by ${message.author.username} · React to vote` }).setTimestamp();
+        const poll = await message.channel.send({ embeds: [embed], allowedMentions: { parse: [] } });
+        for (let i = 0; i < options.length; i++) await poll.react(emojis[i]).catch(() => {});
+        await db.ref(`${COMMUNITY_ROOT}/polls/${poll.id}`).set({ messageId: poll.id, channelId: poll.channelId, question, options, createdAt: Date.now(), createdBy: message.author.id });
+        await recordCommunityMetric("pollsCreated");
+        return message.reply("✅ Poll তৈরি হয়েছে। প্রতিক্রিয়ার মাধ্যমে ভোট দেওয়া যাবে।").then(() => true);
+    }
+    if (command === "!notify") {
+        const setting = String(args[0] || "").toLowerCase();
+        if (!["on", "off"].includes(setting)) return message.reply("ব্যবহার: `!notify on` অথবা `!notify off` — Event reminder ping পেতে/বন্ধ করতে।").then(() => true);
+        await db.ref(`communitySubscribers/${message.author.id}`).set({ eventReminders: setting === "on", updatedAt: Date.now() });
+        return message.reply(setting === "on" ? "🔔 Event reminder opt-in চালু হয়েছে। চাইলে `!notify off` দিয়ে বন্ধ করতে পারো।" : "🔕 Event reminder opt-out হয়েছে।").then(() => true);
+    }
+    return false;
+}
+
+async function handleCommunityAutomationMessage(message) {
+    if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
+    if (isFeatureEnabled("communityAnalyticsEnabled")) {
+        const day = getDailyKey(Date.now());
+        const metricKey = `${day}/messages`;
+        communityMetricBuffer.set(metricKey, (communityMetricBuffer.get(metricKey) || 0) + 1);
+    }
+    try {
+        const handled = await handleCommunityCommand(message);
+        if (handled) return;
+    } catch (err) {
+        console.error("Community command failed:", err.message);
+        await recordCommunityAlert("community_command_error", `A community command failed in channel ${message.channelId}: ${String(err.message || err).slice(0, 240)}`);
+        return;
+    }
+    if (!isFeatureEnabled("communityRulesEnabled")) return;
+    const cfg = getCommunityAutomationConfig();
+    if (!cfg.enabled) return;
+    const rule = matchKeywordRule(message.content, cfg.rules, message.channelId);
+    if (!rule || !cooldownAllowed(communityRuleCooldowns, `${rule.id}:${message.author.id}`, rule.cooldownSeconds * 1000)) return;
+    try {
+        await message.reply({ content: rule.reply, allowedMentions: { parse: [] } });
+        await recordCommunityMetric("keywordReplies");
+    } catch (err) { console.warn("Keyword automation reply failed:", err.message); }
+}
+client.on("messageCreate", message => { handleCommunityAutomationMessage(message).catch(err => console.error("Community automation failed:", err.message)); });
+
+client.on("guildMemberAdd", async member => {
+    if (member.guild.id !== ALLOWED_GUILD_ID) return;
+    recordCommunityMetric("joins").catch(() => {});
+    const cfg = getCommunityAutomationConfig();
+    if (isFeatureEnabled("raidAlertEnabled") && cfg.raid.enabled) {
+        const now = Date.now(), windowMs = cfg.raid.windowSeconds * 1000;
+        communityJoinTimes.push(now);
+        while (communityJoinTimes.length && communityJoinTimes[0] < now - windowMs) communityJoinTimes.shift();
+        if (communityJoinTimes.length >= cfg.raid.joinThreshold) {
+            await recordCommunityMetric("raidAlerts");
+            await recordCommunityAlert("join_spike", `${communityJoinTimes.length} members joined within ${cfg.raid.windowSeconds} seconds. This is an alert only; no users were automatically punished.`, { count: communityJoinTimes.length, windowSeconds: cfg.raid.windowSeconds });
+        }
+    }
+    if (!isFeatureEnabled("smartOnboardingEnabled") || !cfg.onboarding.enabled) return;
+    try {
+        if (cfg.onboarding.autoRoleIds.length) {
+            const botMember = member.guild.members.me || await member.guild.members.fetchMe().catch(() => null);
+            for (const roleId of cfg.onboarding.autoRoleIds) {
+                const role = member.guild.roles.cache.get(roleId) || await member.guild.roles.fetch(roleId).catch(() => null);
+                if (!role || role.managed || role.permissions.has(PermissionFlagsBits.Administrator) || !botMember?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= botMember.roles.highest.position) continue;
+                await member.roles.add(role, "Configured RKBACKLES smart onboarding role").catch(err => console.warn("Onboarding auto-role failed:", err.message));
+            }
+        }
+        if (cfg.onboarding.dmEnabled) {
+            const text = cfg.onboarding.dmTemplate.replaceAll("{server}", member.guild.name).replaceAll("{user}", member.user.username).slice(0, 1800);
+            await member.send({ content: text, allowedMentions: { parse: [] } }).catch(() => {});
+        }
+    } catch (err) { console.warn("Smart onboarding failed:", err.message); }
+});
+client.on("guildMemberRemove", member => {
+    if (member.guild.id === ALLOWED_GUILD_ID) recordCommunityMetric("leaves").catch(() => {});
+});
+
+async function processCommunityEventReminders() {
+    if (!client.isReady() || !isFeatureEnabled("eventRemindersEnabled")) return;
+    const cfg = getCommunityAutomationConfig();
+    const events = normalizeEvents(cfg.events);
+    const now = Date.now();
+    for (const event of events) {
+        const minutesDue = dueReminderMinutes(event, now);
+        for (const minutes of minutesDue) {
+            const runKey = `${event.id}:${minutes}`;
+            if (communityEventRuns.has(runKey)) continue;
+            communityEventRuns.add(runKey);
+            const marker = db.ref(`${COMMUNITY_ROOT}/eventReminders/${safeCommunityKey(event.id)}/${minutes}`);
+            try {
+                const claim = await marker.transaction(current => current ? undefined : { state: "sending", claimedAt: now }, undefined, false);
+                if (!claim.committed) continue;
+                const channelId = event.channelId || cfg.eventChannelId;
+                const channel = channelId ? (client.channels.cache.get(channelId) || await client.channels.fetch(channelId).catch(() => null)) : null;
+                if (!channel?.isTextBased?.()) throw new Error("Event reminder target channel is missing or not text-based");
+                let pings = [];
+                if (event.notifySubscribers) {
+                    const subSnap = await db.ref("communitySubscribers").once("value").catch(() => null);
+                    const subs = subSnap?.val() || {};
+                    pings = Object.entries(subs).filter(([, value]) => value?.eventReminders === true).map(([id]) => id).filter(id => /^\d{15,22}$/.test(id)).slice(0, 50);
+                }
+                const when = minutes === 0 ? "শুরু হচ্ছে এখন" : `${minutes} মিনিট পরে`;
+                const embed = new EmbedBuilder().setColor("Blue").setTitle(`📅 Event Reminder · ${event.title}`.slice(0, 256)).setDescription(`${event.description ? `${event.description}\n\n` : ""}⏰ ${when}\n<t:${Math.floor(event.startsAt / 1000)}:F> (<t:${Math.floor(event.startsAt / 1000)}:R>)`).setTimestamp();
+                await channel.send({ content: pings.length ? pings.map(id => `<@${id}>`).join(" ") : undefined, embeds: [embed], allowedMentions: { users: pings } });
+                await marker.set({ state: "sent", sentAt: Date.now() });
+                await recordCommunityMetric("eventsSent");
+            } catch (err) {
+                await marker.remove().catch(() => {});
+                await recordCommunityAlert("event_reminder_failed", `Reminder for event "${event.title}" could not be sent: ${String(err.message || err).slice(0, 180)}`);
+            } finally { setTimeout(() => communityEventRuns.delete(runKey), 60_000).unref?.(); }
+        }
+    }
+}
+setInterval(() => {
+    flushCommunityMetrics().catch(err => console.warn("Community metric flush failed:", err.message));
+    processCommunityEventReminders().catch(err => console.warn("Event reminder scheduler failed:", err.message));
+}, 30_000).unref?.();
 
 const WEEKLY_STATS_PATH = "runtime/botStats/weekly";
 async function countWeeklyMessage(message) {
