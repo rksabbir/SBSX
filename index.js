@@ -251,6 +251,8 @@ let ADMIN_BOT_CONFIG = {
     leveling: { xpMin: 5, xpMax: 9, xpPerLevelBase: 100 },
     links: { verificationLink: "" },
     presence: { status: "online", activityType: "Watching", activityText: "Security & Verification" },
+    moderators: { tickets: [], reports: [], orders: [], features: [], automod: [], community: [], panels: [], resellers: [] },
+    compensation: { enabled: false, ticketClaimRateBdt: 0, ticketResolveRateBdt: 0, resellerCommissionEnabled: false, aiResellerCommissionEnabled: false, resellerBasePercent: 0, resellerMinPercent: 0, resellerMaxPercent: 20 },
     messages: {
         welcomeTitle: "🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম",
         welcomeDescription: "✨ স্বাগতম {user} আমাদের সার্ভারে!\n📜 আমাদের নিয়মগুলো মেনে চলার অনুরোধ রইল। ❤️",
@@ -905,6 +907,8 @@ db.ref("adminConfig/bot").on("value", (snapshot) => {
             channels: { ...(ADMIN_BOT_CONFIG.discord?.channels || {}), ...((root.discord || {}).channels || {}) },
             roles: { ...(ADMIN_BOT_CONFIG.discord?.roles || {}), ...((root.discord || {}).roles || {}) }
         },
+        moderators: { ...(ADMIN_BOT_CONFIG.moderators || {}), ...(root.moderators || {}) },
+        compensation: { ...(ADMIN_BOT_CONFIG.compensation || {}), ...(root.compensation || {}) },
         communityAutomation: {
             ...(ADMIN_BOT_CONFIG.communityAutomation || {}), ...(root.communityAutomation || {}),
             faq: { ...(ADMIN_BOT_CONFIG.communityAutomation?.faq || {}), ...((root.communityAutomation || {}).faq || {}) },
@@ -1056,6 +1060,37 @@ function getConfiguredRoleId(key) {
     };
     return fallback[key] || "";
 }
+function getModeratorRoleIds(key, fallback = []) {
+    const configured = ADMIN_BOT_CONFIG.moderators?.[key];
+    const values = Array.isArray(configured) ? configured : (typeof configured === "string" ? configured.split(/[\s,;]+/) : []);
+    const ids = values.map(value => String(value || "").trim()).filter(value => /^\d{15,25}$/.test(value));
+    if (ids.length) return [...new Set(ids)];
+    return [...new Set(fallback.map(String).filter(value => /^\d{15,25}$/.test(value)))];
+}
+function memberHasModeratorRole(member, key, fallback = []) {
+    const ids = getModeratorRoleIds(key, fallback);
+    return Boolean(member?.roles?.cache && ids.some(id => member.roles.cache.has(id)));
+}
+function ticketModeratorConfig(type) {
+    if (type === "order") return { key: "orders", fallback: [getConfiguredRoleId("supportCustomer")] };
+    if (type === "report") return { key: "reports", fallback: [getConfiguredRoleId("supportTicketReport")] };
+    if (type === "feature") return { key: "features", fallback: [getConfiguredRoleId("supportTicketReport")] };
+    if (type === "customer") return { key: "orders", fallback: [getConfiguredRoleId("supportCustomer")] };
+    return { key: "tickets", fallback: [getConfiguredRoleId("supportTicketReport")] };
+}
+async function recordTicketPerformance(kind, channelId, member, type) {
+    const id = `ticket_${kind}_${String(channelId)}`;
+    const cfg = ADMIN_BOT_CONFIG.compensation || {};
+    const rate = cfg.enabled === true ? (kind === "claim" ? Number(cfg.ticketClaimRateBdt) || 0 : Number(cfg.ticketResolveRateBdt) || 0) : 0;
+    const monthParts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Dhaka", year: "numeric", month: "2-digit" }).formatToParts(new Date());
+    const month = `${monthParts.find(part => part.type === "year")?.value || "0000"}-${monthParts.find(part => part.type === "month")?.value || "00"}`;
+    const ref = db.ref(`staffPerformanceEvents/${id}`);
+    const result = await ref.transaction(current => current || {
+        eventType: kind === "claim" ? "ticket_claim" : "ticket_resolve", discordId: String(member.id), channelId: String(channelId), ticketType: String(type || "ticket"), amountBdt: rate,
+        occurredAt: Date.now(), month
+    }, undefined, false);
+    return Boolean(result.committed && result.snapshot.val()?.discordId === String(member.id));
+}
 function getAutomodSettings() {
     const cfg = ADMIN_BOT_CONFIG.automod || {};
     const num = (value, fallback, min, max) => Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : fallback));
@@ -1102,7 +1137,8 @@ const { attachLiveStudioServer } = require("./live-studio-server");
 attachLiveStudioServer({
     app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit,
     ChannelType, allowedOrigins: ADMIN_PANEL_ORIGINS,
-    getChannelAdminRoleIds: () => [getConfiguredRoleId("admin"), getConfiguredRoleId("developer"), getConfiguredRoleId("supportTicketReport"), getConfiguredRoleId("supportCustomer")],
+    getChannelAdminRoleIds: () => [getConfiguredRoleId("admin"), getConfiguredRoleId("developer"), getConfiguredRoleId("supportTicketReport"), getConfiguredRoleId("supportCustomer"), ...Object.values(ADMIN_BOT_CONFIG.moderators || {}).flatMap(value => Array.isArray(value) ? value : [])],
+    getCompensationConfig: () => ({ ...(ADMIN_BOT_CONFIG.compensation || {}), resellerRoleIds: getModeratorRoleIds("resellers") }),
     setLivePresence: (active) => { liveStudioPresenceActive = Boolean(active); setBotPresence(); }
 });
 
@@ -2299,7 +2335,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
     if (interaction.isButton() && /^offlinepay_(approve|reject)_/.test(interaction.customId)) {
         const isApprover = interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)
             || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin"))
-            || interaction.member?.roles?.cache?.has(getConfiguredRoleId("staff"));
+            || memberHasModeratorRole(interaction.member, "orders", [getConfiguredRoleId("supportCustomer")]);
         if (!isApprover) return interaction.reply({ content: "❌ শুধু অনুমোদিত Admin/Staff offline payment request review করতে পারবেন।", flags: [MessageFlags.Ephemeral] });
         await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const match = /^offlinepay_(approve|reject)_(.+)$/.exec(interaction.customId);
@@ -2942,6 +2978,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
 
             const randomCode = Math.floor(1000 + Math.random() * 9000);
             let supportRoleId = getConfiguredRoleId("supportCustomer");
+            const supportRoleIds = getModeratorRoleIds("orders", [supportRoleId]);
             let channelPrefix = `order-${randomCode}`;
 
             const permissionOverwrites = [
@@ -2950,7 +2987,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
                 { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
             ];
 
-            if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+            for (const roleId of supportRoleIds) if (interaction.guild.roles.cache.has(roleId)) permissionOverwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
             if (interaction.guild.roles.cache.has(getConfiguredRoleId("admin"))) permissionOverwrites.push({ id: getConfiguredRoleId("admin"), allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
             const privateChannel = await interaction.guild.channels.create({
@@ -3059,10 +3096,12 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         const type = parts[1]; const category = parts.slice(2).join("_");
 
         const randomCode = Math.floor(1000 + Math.random() * 9000);
-        let supportRoleId = getConfiguredRoleId("supportTicketReport");
+        const policy = ticketModeratorConfig(type);
+        const supportRoleIds = getModeratorRoleIds(policy.key, policy.fallback);
+        let supportRoleId = supportRoleIds[0] || getConfiguredRoleId("supportTicketReport");
         let channelPrefix = `${type}-${randomCode}`;
 
-        if (type === "customer") supportRoleId = getConfiguredRoleId("supportCustomer");
+        if (type === "customer") supportRoleId = supportRoleIds[0] || getConfiguredRoleId("supportCustomer");
 
         const permissionOverwrites = [
             { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
@@ -3070,7 +3109,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
         ];
 
-        if (interaction.guild.roles.cache.has(supportRoleId)) permissionOverwrites.push({ id: supportRoleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+        for (const roleId of supportRoleIds) if (interaction.guild.roles.cache.has(roleId)) permissionOverwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
         if (interaction.guild.roles.cache.has(getConfiguredRoleId("admin"))) permissionOverwrites.push({ id: getConfiguredRoleId("admin"), allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
 
         const privateChannel = await interaction.guild.channels.create({
@@ -3110,13 +3149,23 @@ Approve করার আগে official bKash/Nagad transaction history নি�
 
     if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
         const type = interaction.customId.split("_")[1];
-        let reqRole = (type === "customer" || type === "order") ? getConfiguredRoleId("supportCustomer") : getConfiguredRoleId("supportTicketReport");
-        if (!interaction.member.roles.cache.has(reqRole) && !interaction.member.roles.cache.has(getConfiguredRoleId("admin"))) return interaction.reply({ content: "❌ পারমিশন নেই!", flags: [MessageFlags.Ephemeral] });
-        
-        await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true }).catch(() => {});
+        const policy = ticketModeratorConfig(type);
+        const isAdmin = Boolean(interaction.member?.permissions?.has(PermissionFlagsBits.Administrator) || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin")));
+        if (!isAdmin && !memberHasModeratorRole(interaction.member, policy.key, policy.fallback)) return interaction.reply({ content: "❌ এই ticket type-এর moderator role প্রয়োজন।", flags: [MessageFlags.Ephemeral] });
+        const claimRef = db.ref(`ticketClaims/${interaction.channel.id}`);
+        const claimedAt = Date.now();
+        const claim = await claimRef.transaction(current => current || { userId: interaction.user.id, type, claimedAt }, undefined, false);
+        if (!claim.committed || claim.snapshot.val()?.userId !== interaction.user.id) return interaction.reply({ content: `⚠️ এই ticket ইতোমধ্যে <@${claim.snapshot.val()?.userId || "0"}> claim করেছেন।`, flags: [MessageFlags.Ephemeral] });
+        if (Number(claim.snapshot.val()?.claimedAt) !== claimedAt) return interaction.reply({ content: "⚠️ এই ticket আপনি আগেই claim করেছেন।", flags: [MessageFlags.Ephemeral] });
+        try {
+            await interaction.channel.permissionOverwrites.edit(interaction.user.id, { ViewChannel: true, SendMessages: true });
+            await recordTicketPerformance("claim", interaction.channel.id, interaction.user, type);
+            await db.ref(`staff_duty/${interaction.user.id}/claims`).transaction(c => (Number(c) || 0) + 1);
+        } catch (err) {
+            await claimRef.transaction(current => current?.userId === interaction.user.id ? null : current);
+            throw err;
+        }
         await interaction.reply({ content: `🛟 এই চ্যানেলটি এখন থেকে স্টাফ ${interaction.user} হ্যান্ডেল করছেন।` });
-
-        db.ref(`staff_duty/${interaction.user.id}/claims`).transaction(c => (c || 0) + 1);
         return;
     }
 
@@ -3125,11 +3174,14 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         const currentOrder = orderLogs[interaction.channel.id];
         const member = interaction.member;
         const isAdmin = Boolean(member?.permissions?.has(PermissionFlagsBits.Administrator) || member?.roles?.cache?.has(getConfiguredRoleId("admin")));
-        const isSupport = Boolean(member?.roles?.cache?.has(getConfiguredRoleId("supportTicketReport")) || member?.roles?.cache?.has(getConfiguredRoleId("supportCustomer")));
-        const isTicketOwner = Boolean(
-            (currentOrder?.userId && currentOrder.userId === interaction.user.id) ||
-            interaction.channel.permissionOverwrites?.cache?.has(interaction.user.id)
-        );
+        const closeType = interaction.customId.split("_")[1];
+        const closePolicy = ticketModeratorConfig(closeType);
+        const isSupport = memberHasModeratorRole(member, closePolicy.key, closePolicy.fallback);
+        const ownerArchive = (await db.ref(`ticketTranscriptIndex/${interaction.channel.id}`).once("value").catch(() => null))?.val() || null;
+        const ticketOwnerId = String(currentOrder?.userId || ownerArchive?.ownerId || "");
+        const isTicketOwner = ticketOwnerId
+            ? ticketOwnerId === interaction.user.id
+            : Boolean(interaction.channel.permissionOverwrites?.cache?.has(interaction.user.id) && !isSupport && !isAdmin);
 
         if (!isAdmin && !isSupport && !isTicketOwner) {
             return interaction.reply({ content: "❌ এই টিকিট বন্ধ করার অনুমতি আপনার নেই।", flags: [MessageFlags.Ephemeral] });
@@ -3179,6 +3231,11 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         if (!transcriptSaved) {
             await interaction.editReply("⚠️ টিকিটের chat backup Admin Panel-এ save করা যায়নি। নিরাপত্তার জন্য ticket channel delete করা হয়নি; পরে আবার Close চাপুন অথবা Admin-কে জানান।");
             return;
+        }
+
+        if (!isTicketOwner && (isAdmin || isSupport)) {
+            await recordTicketPerformance("resolve", interaction.channel.id, interaction.user, closeType).catch(err => console.error("Ticket performance event failed:", err.message));
+            await db.ref(`staff_duty/${interaction.user.id}/resolved`).transaction(c => (Number(c) || 0) + 1).catch(() => {});
         }
 
         if (currentOrder?.trackingMessageId) {
@@ -3387,6 +3444,7 @@ client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
 
     const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(getConfiguredRoleId("admin"));
+    const isPanelModerator = memberHasModeratorRole(message.member, "panels", []);
 
     // Developer/admin access to the one-time-key panel is checked independently of general admin commands.
     if (message.content === "!onetime key" || message.content === "!onetimekey") {
@@ -3398,9 +3456,9 @@ client.on("messageCreate", async (message) => {
         return;
     }
 
-    if (!isServerAdmin) return;
+    if (!isServerAdmin && !isPanelModerator) return;
 
-    if (message.content === "!setup") return sendReplacingBotPanel(message.channel, { embeds: [createVerificationEmbed()], components: [verificationRow] }, { customId: "universal_verify_button" });
+    if (message.content === "!setup" && isServerAdmin) return sendReplacingBotPanel(message.channel, { embeds: [createVerificationEmbed()], components: [verificationRow] }, { customId: "universal_verify_button" });
     if (message.content === "!ticket" && message.channelId === getConfiguredChannelId("ticketPanel")) return sendReplacingBotPanel(message.channel, await getDynamicTicketPanel(), { customId: "select_product_ticket" });
     if (message.content === "!report" && message.channelId === getConfiguredChannelId("reportPanel")) return sendReplacingBotPanel(message.channel, await getDynamicReportPanel(), { customId: "select_report_category" });
     if (message.content === "!customer" && message.channelId === getConfiguredChannelId("customerPanel")) return sendReplacingBotPanel(message.channel, await getDynamicCustomerPanel(), { customId: "select_customer_category" });
@@ -3729,7 +3787,7 @@ async function handleCommunityCommand(message) {
     }
     if (command === "!poll") {
         const isServerAdmin = message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(getConfiguredRoleId("admin"));
-        if (!isServerAdmin) return message.reply("শুধু authorized Admin poll তৈরি করতে পারবে।").then(() => true);
+        if (!isServerAdmin && !memberHasModeratorRole(message.member, "community", [])) return message.reply("শুধু Admin বা Community moderator poll তৈরি করতে পারবে।").then(() => true);
         const parts = rest.split("|").map(v => v.trim()).filter(Boolean);
         if (parts.length < 3 || parts.length > 6) return message.reply("ব্যবহার: `!poll প্রশ্ন | Option 1 | Option 2` (২–৫টি option)।").then(() => true);
         const question = parts[0].slice(0, 250); const options = parts.slice(1).map(x => x.slice(0, 180));
