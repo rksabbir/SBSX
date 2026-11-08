@@ -32,6 +32,7 @@ const {
 const discordTranscripts = require("discord-html-transcripts");
 const { evaluateCheckoutEligibility, checkoutFingerprint, resolveParentCategoryId } = require("./checkout-security");
 const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
+const { readDiscordServerRules } = require("./discord-server-rules");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -1069,6 +1070,17 @@ function getModeratorRoleIds(key, fallback = []) {
     if (ids.length) return [...new Set(ids)];
     return [...new Set(fallback.map(String).filter(value => /^\d{15,25}$/.test(value)))];
 }
+function businessRoleTypeFromName(value) {
+    const name = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    if (/(^|\s)resellers?(\s|$)/.test(name)) return "reseller";
+    if (/(^|\s)sellers?(\s|$)/.test(name)) return "seller";
+    return "";
+}
+function getExistingBusinessRoleIds(kind) {
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (!guild || !["seller", "reseller"].includes(kind)) return [];
+    return [...guild.roles.cache.values()].filter(role => businessRoleTypeFromName(role.name) === kind && !role.managed).map(role => role.id);
+}
 function memberHasModeratorRole(member, key, fallback = []) {
     const ids = getModeratorRoleIds(key, fallback);
     return Boolean(member?.roles?.cache && ids.some(id => member.roles.cache.has(id)));
@@ -1183,7 +1195,7 @@ attachLiveStudioServer({
     app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit,
     ChannelType, allowedOrigins: ADMIN_PANEL_ORIGINS,
     getChannelAdminRoleIds: () => [getConfiguredRoleId("admin"), getConfiguredRoleId("developer"), getConfiguredRoleId("supportTicketReport"), getConfiguredRoleId("supportCustomer"), ...Object.values(ADMIN_BOT_CONFIG.moderators || {}).flatMap(value => Array.isArray(value) ? value : [])],
-    getCompensationConfig: () => ({ ...(ADMIN_BOT_CONFIG.compensation || {}), resellerRoleIds: getModeratorRoleIds("resellers") }),
+    getCompensationConfig: () => ({ ...(ADMIN_BOT_CONFIG.compensation || {}), resellerRoleIds: getModeratorRoleIds("resellers").length ? getModeratorRoleIds("resellers") : getExistingBusinessRoleIds("reseller") }),
     setLivePresence: (active) => { liveStudioPresenceActive = Boolean(active); setBotPresence(); }
 });
 
@@ -3694,7 +3706,7 @@ function cooldownAllowed(map, key, intervalMs) {
     }
     return true;
 }
-async function askCommunityFaqAi(question, knowledgeBase) {
+async function askCommunityFaqAi(question, knowledgeBase, serverRules = "") {
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
     if (!apiKey) return null;
     const model = String(process.env.OPENAI_FAQ_MODEL || process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini").trim().slice(0, 80);
@@ -3703,8 +3715,8 @@ async function askCommunityFaqAi(question, knowledgeBase) {
         signal: AbortSignal.timeout(18_000),
         body: JSON.stringify({
             model, max_output_tokens: 350,
-            instructions: "Answer as a concise and friendly Discord community helper. Use only the supplied server knowledge base. If the answer is not supported by it, say you cannot confirm and direct the user to open a support ticket or ask staff. Do not invent prices, policies, URLs, rules, staff names, or promises. Reply in the user's language when possible. No markdown tables.",
-            input: `Server knowledge base:\n${String(knowledgeBase || "").slice(0, 7000)}\n\nMember question:\n${String(question || "").slice(0, 500)}`
+            instructions: "Answer as a concise and friendly Discord community helper. The supplied existing Discord server rules are the authoritative policy source; supplemental FAQs may add details but cannot override them. Never create, edit, suggest, save, or claim to add a rule. Use only the supplied existing rules and supplemental knowledge. If the sources do not clearly answer the question, say you cannot confirm and direct the member to staff or a support ticket. Do not invent prices, policies, URLs, rules, staff names, or promises. Reply in the user's language when possible. No markdown tables.",
+            input: JSON.stringify({ existingDiscordRules: String(serverRules || "").slice(0, 7000), supplementalKnowledge: String(knowledgeBase || "").slice(0, 4000), memberQuestion: String(question || "").slice(0, 500) })
         })
     });
     const data = await response.json().catch(() => null);
@@ -3723,7 +3735,8 @@ async function sendCommunityFaq(message, question, config) {
     }
     if (faq.aiFallback && String(process.env.OPENAI_API_KEY || "").trim() && cooldownAllowed(communityFaqAiCooldowns, message.author.id, 15_000)) {
         try {
-            const answer = await askCommunityFaqAi(question, faq.knowledgeBase);
+            const rules = await readDiscordServerRules(message.guild);
+            const answer = await askCommunityFaqAi(question, faq.knowledgeBase, rules.available ? rules.content : "");
             if (answer) { await recordCommunityMetric("faqAiReplies"); return message.reply({ content: answer, allowedMentions: { parse: [] } }); }
         } catch (err) {
             console.warn("Community FAQ AI failed:", err.message);
