@@ -33,6 +33,7 @@ const discordTranscripts = require("discord-html-transcripts");
 const { evaluateCheckoutEligibility, checkoutFingerprint, resolveParentCategoryId } = require("./checkout-security");
 const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
 const { readDiscordServerRules } = require("./discord-server-rules");
+const { classifyBusinessRoles } = require("./discord-business-role-classifier");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
 let serviceAccount;
@@ -1070,17 +1071,6 @@ function getModeratorRoleIds(key, fallback = []) {
     if (ids.length) return [...new Set(ids)];
     return [...new Set(fallback.map(String).filter(value => /^\d{15,25}$/.test(value)))];
 }
-function businessRoleTypeFromName(value) {
-    const name = String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    if (/(^|\s)resellers?(\s|$)/.test(name)) return "reseller";
-    if (/(^|\s)sellers?(\s|$)/.test(name)) return "seller";
-    return "";
-}
-function getExistingBusinessRoleIds(kind) {
-    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
-    if (!guild || !["seller", "reseller"].includes(kind)) return [];
-    return [...guild.roles.cache.values()].filter(role => businessRoleTypeFromName(role.name) === kind && !role.managed).map(role => role.id);
-}
 function memberHasModeratorRole(member, key, fallback = []) {
     const ids = getModeratorRoleIds(key, fallback);
     return Boolean(member?.roles?.cache && ids.some(id => member.roles.cache.has(id)));
@@ -1195,7 +1185,7 @@ attachLiveStudioServer({
     app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit,
     ChannelType, allowedOrigins: ADMIN_PANEL_ORIGINS,
     getChannelAdminRoleIds: () => [getConfiguredRoleId("admin"), getConfiguredRoleId("developer"), getConfiguredRoleId("supportTicketReport"), getConfiguredRoleId("supportCustomer"), ...Object.values(ADMIN_BOT_CONFIG.moderators || {}).flatMap(value => Array.isArray(value) ? value : [])],
-    getCompensationConfig: () => ({ ...(ADMIN_BOT_CONFIG.compensation || {}), resellerRoleIds: getModeratorRoleIds("resellers").length ? getModeratorRoleIds("resellers") : getExistingBusinessRoleIds("reseller") }),
+    getCompensationConfig: () => ({ ...(ADMIN_BOT_CONFIG.compensation || {}) }),
     setLivePresence: (active) => { liveStudioPresenceActive = Boolean(active); setBotPresence(); }
 });
 

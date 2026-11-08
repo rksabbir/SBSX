@@ -4,6 +4,7 @@ const { PermissionFlagsBits, EmbedBuilder } = require("discord.js");
 const { TRACK_SOURCE, CHANNEL_PINNED_MESSAGE_TYPE, pinNoticeTargetId, isBotPinActorNotice, isRadarPinNotice, isValidInviteCode, inviteDigest, cleanName, safeTrackSource, trackFlags, normalizeDurationMinutes, safeOrigin, shouldUseTextChannel, isTicketChannel, buildRadarMessage } = require("./live-studio-core");
 const { normalizeAiPlan, buildOverwriteEdit, bitfieldToRestorePayload, overwriteState } = require("./role-permissions");
 const { readDiscordServerRules } = require("./discord-server-rules");
+const { classifyBusinessRoles } = require("./discord-business-role-classifier");
 
 function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiRequest, checkCppRateLimit, ChannelType, allowedOrigins, setLivePresence = () => {}, getChannelAdminRoleIds = () => [], getCompensationConfig = () => ({}) }) {
   const sessions = new Map();
@@ -918,7 +919,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const pinSnapshot = await db.ref(pinsRefPath).once("value").catch(() => null);
       const pinRecords = Object.values(pinSnapshot?.val() || {});
       const data = {
-        version: "1.5.51", guildId, guildName: voice.guildName, active: Boolean(session), updatedAt: Date.now(),
+        version: "1.5.52", guildId, guildName: voice.guildName, active: Boolean(session), updatedAt: Date.now(),
         durationMinutes: session?.durationMinutes || 0, startedAt: session?.startedAt || 0, endsAt: session?.expiresAt || 0,
         voiceChannelCount: voice.channels.length, discordVoiceMemberCount: voice.memberCount,
         screenShareCount, participantCount: safeParticipants.length,
@@ -1010,7 +1011,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
   // A minimal public route health response; never include LiveKit secrets or credentials.
   app.get("/api/live-studio/route-health", (req, res) => {
     const cfg = config();
-    return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", configured: cfg.configured, missingVariables: cfg.missingVariables, panelOrigin: panelOriginFallback, liveRoomBaseOrigin, liveRoomPath: "/?invite=...", publicStatusEndpoint: "/api/live-studio/public-status", ready: cfg.configured });
+    return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", configured: cfg.configured, missingVariables: cfg.missingVariables, panelOrigin: panelOriginFallback, liveRoomBaseOrigin, liveRoomPath: "/?invite=...", publicStatusEndpoint: "/api/live-studio/public-status", ready: cfg.configured });
   });
 
   // Public, minimal read-only status for the Blogger live page. Do not expose participant
@@ -1024,7 +1025,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     res.set("Expires", "0");
     return res.json({
       ok: true,
-      version: "1.5.51",
+      version: "1.5.52",
       active: Boolean(session),
       updatedAt: Date.now(),
       session: session ? {
@@ -1056,7 +1057,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         status: String(item.status || ""), createdAt: Number(item.createdAt) || 0, appliedAt: Number(item.appliedAt) || 0, revertedAt: Number(item.revertedAt) || 0,
         summary: String(item.summary || ""), canRevert: item.status === "applied"
       }));
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", aiConfigured: Boolean(String(process.env.OPENAI_API_KEY || "").trim()), model: String(process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini"), roles, channels, backups });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", aiConfigured: Boolean(String(process.env.OPENAI_API_KEY || "").trim()), model: String(process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini"), roles, channels, backups });
     } catch (err) { return apiError(res, err, "role_permission_catalog_failed"); }
   });
 
@@ -1081,7 +1082,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const planId = crypto.randomBytes(18).toString("base64url");
       const expiresAt = Date.now() + 10 * 60_000;
       pendingRolePermissionPlans.set(planId, { id: planId, actorUid: actor.uid, guildId: guild.id, roleId: role.id, channelId: channel.id, goal, plan, allowedPermissions, expiresAt });
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", planId, expiresAt, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name, type: rolePermissionChannelType(channel) }, currentStates, changedCount, plan });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", planId, expiresAt, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name, type: rolePermissionChannelType(channel) }, currentStates, changedCount, plan });
     } catch (err) { return apiError(res, err, "role_permission_plan_failed"); }
   });
 
@@ -1119,7 +1120,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       await backupRef.update({ status: "applied", appliedAt: Date.now(), appliedAllow: String(channel.permissionOverwrites.cache.get(role.id)?.allow?.bitfield ?? "0"), appliedDeny: String(channel.permissionOverwrites.cache.get(role.id)?.deny?.bitfield ?? "0") });
       pendingRolePermissionPlans.delete(planId);
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "ai_role_permissions_applied", timestamp: Date.now(), summary: `Applied AI-reviewed permission changes to role ${role.name} (${role.id}) in #${channel.name} (${channel.id})`, backupId: backupRef.key, changeCount: Object.keys(editPayload).length }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.51", backupId: backupRef.key, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, applied: Object.keys(editPayload).map(permission => ({ permission, state: editPayload[permission] ? "allow" : "deny" })), appliedAt: Date.now() });
+      return res.json({ ok: true, version: "1.5.52", backupId: backupRef.key, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, applied: Object.keys(editPayload).map(permission => ({ permission, state: editPayload[permission] ? "allow" : "deny" })), appliedAt: Date.now() });
     } catch (err) { return apiError(res, err, "role_permission_apply_failed"); }
   });
 
@@ -1130,7 +1131,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const guild = client.guilds.cache.get(String(guildId));
       if (!guild) throw Object.assign(new Error("Configured Discord server is not available to the Bot"), { statusCode: 503, apiError: "discord_guild_unavailable" });
       const rules = await readDiscordServerRules(guild, { force: req.query?.refresh === "1" });
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", rules });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", rules });
     } catch (err) { return apiError(res, err, "community_server_rules_read_failed"); }
   });
 
@@ -1184,7 +1185,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         } catch (err) { console.warn("Could not mirror suggestion status to Discord:", err.message); }
       }
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "community_suggestion_status_update", timestamp: now, summary: `Set community suggestion ${suggestionId} to ${status}.`, suggestionId, status }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.51", suggestionId, status, statusLabel: statusLabels[status], discordUpdated });
+      return res.json({ ok: true, version: "1.5.52", suggestionId, status, statusLabel: statusLabels[status], discordUpdated });
     } catch (err) { return apiError(res, err, "community_suggestion_status_failed"); }
   });
 
@@ -1209,7 +1210,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       }
       await backupRef.update({ status: "reverted", revertedAt: Date.now(), revertedBy: actor.uid });
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "ai_role_permissions_reverted", timestamp: Date.now(), summary: `Restored previous overwrite for role ${role.name} (${role.id}) in #${channel.name} (${channel.id})`, backupId }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.51", backupId, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, revertedAt: Date.now() });
+      return res.json({ ok: true, version: "1.5.52", backupId, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, revertedAt: Date.now() });
     } catch (err) { return apiError(res, err, "role_permission_revert_failed"); }
   });
 
@@ -1231,7 +1232,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const onlineMembers = members.filter(member => !member.user?.bot && member.presence?.status && member.presence.status !== "offline");
       const botCount = members.filter(member => member.user?.bot).length;
       return res.set("Cache-Control", "no-store").json({
-        ok: true, version: "1.5.51", guildName: String(guild.name || "Discord server").slice(0, 120),
+        ok: true, version: "1.5.52", guildName: String(guild.name || "Discord server").slice(0, 120),
         counts: { members: Number(guild.memberCount) || members.length, humans: humans.length, bots: botCount, onlineHumans: onlineMembers.length, cachedMembers: members.length, presenceIntentEnabledInCode: true },
         memberCountsPartial: members.length < (Number(guild.memberCount) || 0), channels
       });
@@ -1247,13 +1248,13 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const lock = req.body?.locked === true;
       const ref = db.ref(`${MANUAL_CHANNEL_PRIVACY_PATH}/${channel.id}`);
       const old = (await ref.once("value")).val() || null;
-      if (lock && old?.status === "locked") return res.json({ ok: true, version: "1.5.51", channelId: channel.id, locked: true, alreadySet: true });
+      if (lock && old?.status === "locked") return res.json({ ok: true, version: "1.5.52", channelId: channel.id, locked: true, alreadySet: true });
       if (!lock) {
-        if (!old || old.status !== "locked" || !old.targets) return res.json({ ok: true, version: "1.5.51", channelId: channel.id, locked: false, alreadySet: true });
+        if (!old || old.status !== "locked" || !old.targets) return res.json({ ok: true, version: "1.5.52", channelId: channel.id, locked: false, alreadySet: true });
         await restoreManualPrivacy(channel, old, actor.uid);
         await ref.update({ status: "unlocked", unlockedAt: Date.now(), unlockedBy: actor.uid });
         await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "discord_channel_readonly_disabled", timestamp: Date.now(), summary: `Restored saved permissions for #${channel.name} (${channel.id})` }).catch(() => {});
-        return res.json({ ok: true, version: "1.5.51", channelId: channel.id, channelName: channel.name, locked: false });
+        return res.json({ ok: true, version: "1.5.52", channelId: channel.id, channelName: channel.name, locked: false });
       }
 
       const everyoneId = guild.id;
@@ -1280,7 +1281,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         throw applyError;
       }
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "discord_channel_readonly_enabled", timestamp: Date.now(), summary: `Enabled view-only access for #${channel.name} (${channel.id})` }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.51", channelId: channel.id, channelName: channel.name, locked: true, adminRolesPreserved: adminRoles.length });
+      return res.json({ ok: true, version: "1.5.52", channelId: channel.id, channelName: channel.name, locked: true, adminRolesPreserved: adminRoles.length });
     } catch (err) { return apiError(res, err, "channel_privacy_update_failed"); }
   });
 
@@ -1299,7 +1300,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       await verifyAdminApiRequest(req);
       const saved = (await db.ref(PRIVATE_INTEGRATION_SECRET_PATH).once("value").catch(() => null))?.val() || {};
       const configured = Object.fromEntries(Object.entries(INTEGRATION_ENV_NAMES).map(([key, envName]) => [key, Boolean(String(process.env[envName] || saved[key] || "").trim())]));
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", configured, restartRequired: ["discordBotToken"] });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", configured, restartRequired: ["discordBotToken"] });
     } catch (err) { return apiError(res, err, "integration_secrets_status_failed"); }
   });
   app.post("/api/admin/integrations/secrets/save", async (req, res) => {
@@ -1321,7 +1322,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         }
         patch[key] = value;
       }
-      if (!Object.keys(patch).length) return res.json({ ok: true, version: "1.5.51", changed: false, restartRequired: [] });
+      if (!Object.keys(patch).length) return res.json({ ok: true, version: "1.5.52", changed: false, restartRequired: [] });
       const ref = db.ref(PRIVATE_INTEGRATION_SECRET_PATH);
       await ref.update(patch);
       for (const [key, value] of Object.entries(patch)) {
@@ -1331,7 +1332,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       }
       if (Object.keys(patch).some(key => ["liveKitUrl", "liveKitApiKey", "liveKitApiSecret"].includes(key)) && !activeSession()) liveKitRuntime = null;
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "integration_secrets_updated", timestamp: Date.now(), summary: `Updated integration settings (${Object.keys(patch).length} key fields; values hidden)` }).catch(() => {});
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", changed: true, updatedKeys: Object.keys(patch), restartRequired: Object.keys(patch).includes("discordBotToken") ? ["discordBotToken"] : [] });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", changed: true, updatedKeys: Object.keys(patch), restartRequired: Object.keys(patch).includes("discordBotToken") ? ["discordBotToken"] : [] });
     } catch (err) { return apiError(res, err, "integration_secrets_save_failed"); }
   });
 
@@ -1350,27 +1351,22 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     return !role || role.id === role.guild?.id || role.managed || [PermissionFlagsBits.Administrator, PermissionFlagsBits.ManageRoles, PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageChannels].some(flag => role.permissions.has(flag));
   }
 
-  function businessRoleType(roleName) {
-    const name = String(roleName || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    if (/(^|\s)resellers?(\s|$)/.test(name)) return "reseller";
-    if (/(^|\s)sellers?(\s|$)/.test(name)) return "seller";
-    return "";
-  }
-
   async function createAiOperationsInsight({ force = false, source = "scheduled" } = {}) {
     const config = roleAutomationPolicy((await db.ref("adminConfig/bot").once("value").catch(() => null))?.val() || {});
     if (!config.aiInsightsEnabled) return null;
     const latestRef = db.ref(`${AI_OPERATIONS_PATH}/latestInsight`), previous = (await latestRef.once("value").catch(() => null))?.val() || null;
-    if (!force && Number(previous?.createdAt) > Date.now() - 24 * 60 * 60_000) return previous;
+    if (!force && previous?.dataScope === "aggregate_metrics_existing_discord_rules_and_ai_role_classification" && Number(previous?.createdAt) > Date.now() - 24 * 60 * 60_000) return previous;
     const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
     if (!apiKey) return null;
     const guild = client.guilds.cache.get(String(guildId));
     if (!guild) return null;
     const serverRules = await readDiscordServerRules(guild);
+    const businessRoleDetection = await classifyBusinessRoles(guild, serverRules);
+    const businessRoleTypes = new Map(businessRoleDetection.roles.map(role => [role.id, role.businessType]));
     const allMembers = [...guild.members.cache.values()].filter(member => member.guild?.id === guild.id);
     const activeMembers = allMembers.filter(member => member.presence?.status && member.presence.status !== "offline").length;
     const botMembers = allMembers.filter(member => member.user?.bot).length;
-    const roles = [...guild.roles.cache.values()].filter(role => role.id !== guild.id).map(role => ({ name: String(role.name || "role").slice(0, 80), members: allMembers.reduce((count, member) => count + (member.roles.cache.has(role.id) ? 1 : 0), 0), businessType: businessRoleType(role.name), managed: Boolean(role.managed), protected: isProtectedAutomatedRole(role) })).sort((a, b) => b.members - a.members).slice(0, 40);
+    const roles = [...guild.roles.cache.values()].filter(role => role.id !== guild.id).map(role => ({ id: role.id, name: String(role.name || "role").slice(0, 80), members: allMembers.reduce((count, member) => count + (member.roles.cache.has(role.id) ? 1 : 0), 0), businessType: businessRoleTypes.get(role.id) || "", managed: Boolean(role.managed), protected: isProtectedAutomatedRole(role) })).sort((a, b) => b.members - a.members).slice(0, 40);
     const analytics = (await db.ref("runtime/community/analytics").once("value").catch(() => null))?.val() || {};
     const sevenDays = Object.entries(analytics).sort((a, b) => String(b[0]).localeCompare(String(a[0]))).slice(0, 7).reduce((totals, [, day]) => {
       for (const key of ["messages", "joins", "leaves", "faqReplies", "faqAiReplies", "suggestions", "automodHits", "ticketsArchived", "eventsSent", "keywordReplies", "raidAlerts"]) totals[key] += Math.max(0, Number(day?.[key]) || 0);
@@ -1386,8 +1382,8 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     try {
       response = await fetch("https://api.openai.com/v1/responses", { method: "POST", headers: { "Authorization": `Bearer ${apiKey}`, "Content-Type": "application/json" }, signal: AbortSignal.timeout(25_000), body: JSON.stringify({
         model: String(process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini").trim().slice(0, 80),
-        instructions: "You are a cautious Discord community operations analyst. Treat the supplied existing Discord rules-channel text as the only server policy source. Never create, edit, propose, save, or claim to add a rule. Never apply roles, permissions, payments, punishments, or configuration changes. Return practical recommendations in Bengali or English that follow the supplied rules; if a situation is not covered, say it needs Admin/staff review instead of inventing policy. Focus on role coverage, member onboarding, activity patterns, staff ticket activity and automation health. Do not recommend granting Administrator, Manage Roles, Manage Guild, or Manage Channels. If the rules source is unavailable, member cache is partial, or ticket activity sample is capped, say the analysis is incomplete.",
-        input: JSON.stringify({ existingDiscordRules: serverRules.available ? serverRules.content : "Unavailable: " + serverRules.reason, rulesChannelName: serverRules.channelName, businessRoleClassification: "Classify seller/reseller only from existing Discord role names and assigned member roles; the word reseller is checked before seller. Never infer these types from messages.", guildMemberCount: Number(guild.memberCount) || 0, cachedMemberCount: allMembers.length, memberCacheComplete: allMembers.length >= (Number(guild.memberCount) || 0), cachedHumans: allMembers.length - botMembers, cachedBots: botMembers, cachedOnlineMembers: activeMembers, totalRoleCount: guild.roles.cache.size, configuredRoleMode: config.mode, automationEnabled: config.enabled, roleUsage: roles, lastSevenDayActivity: sevenDays, lastSevenDayTicketActivity: ticketActivity, recentRoleChanges: roleActivity }),
+        instructions: "You are a cautious Discord community operations analyst. Treat the supplied existing Discord rules-channel text as the only server policy source. Never create, edit, propose, save, or claim to add a rule. Never apply roles, permissions, payments, punishments, or configuration changes. Return practical recommendations in Bengali or English that follow the supplied rules; if a situation is not covered, say it needs Admin/staff review instead of inventing policy. Use the supplied automatic Seller/Reseller role classification as authoritative; do not infer role types from sentiment or member messages. Focus on role coverage, member onboarding, activity patterns, staff ticket activity and automation health. Do not recommend granting Administrator, Manage Roles, Manage Guild, or Manage Channels. If the rules source is unavailable, role classification is uncertain, member cache is partial, or ticket activity sample is capped, say the analysis is incomplete.",
+        input: JSON.stringify({ existingDiscordRules: serverRules.available ? serverRules.content : "Unavailable: " + serverRules.reason, rulesChannelName: serverRules.channelName, businessRoleDetection: { source: businessRoleDetection.source, reason: businessRoleDetection.reason, classifiedRoles: businessRoleDetection.roles }, guildMemberCount: Number(guild.memberCount) || 0, cachedMemberCount: allMembers.length, memberCacheComplete: allMembers.length >= (Number(guild.memberCount) || 0), cachedHumans: allMembers.length - botMembers, cachedBots: botMembers, cachedOnlineMembers: activeMembers, totalRoleCount: guild.roles.cache.size, configuredRoleMode: config.mode, automationEnabled: config.enabled, roleUsage: roles, lastSevenDayActivity: sevenDays, lastSevenDayTicketActivity: ticketActivity, recentRoleChanges: roleActivity }),
         text: { format: { type: "json_schema", name: "discord_operations_insight", strict: true, schema } }, max_output_tokens: 900
       }) });
     } catch (err) { throw Object.assign(new Error("AI operations analysis could not reach the provider"), { statusCode: 502, apiError: "ai_operations_unavailable" }); }
@@ -1396,7 +1392,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     if (!response.ok || !outputText) throw Object.assign(new Error("AI operations analysis failed; check the API key, model and quota"), { statusCode: 502, apiError: "ai_operations_provider_error" });
     let insight;
     try { insight = JSON.parse(outputText); } catch (_) { throw Object.assign(new Error("AI returned an unreadable operations report"), { statusCode: 502, apiError: "ai_operations_invalid_response" }); }
-    const saved = { summary: String(insight.summary || "").slice(0, 1200), recommendations: (Array.isArray(insight.recommendations) ? insight.recommendations : []).slice(0, 6).map(item => ({ title: String(item.title || "").slice(0, 160), reason: String(item.reason || "").slice(0, 600), priority: ["low", "medium", "high"].includes(item.priority) ? item.priority : "low", suggestedAction: String(item.suggestedAction || "").slice(0, 600) })), createdAt: Date.now(), source, model: String(process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini").slice(0, 80), dataScope: "aggregate_metrics_and_existing_discord_rules", rulesChannelId: serverRules.channelId, rulesAvailable: serverRules.available };
+    const saved = { summary: String(insight.summary || "").slice(0, 1200), recommendations: (Array.isArray(insight.recommendations) ? insight.recommendations : []).slice(0, 6).map(item => ({ title: String(item.title || "").slice(0, 160), reason: String(item.reason || "").slice(0, 600), priority: ["low", "medium", "high"].includes(item.priority) ? item.priority : "low", suggestedAction: String(item.suggestedAction || "").slice(0, 600) })), createdAt: Date.now(), source, model: String(process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini").slice(0, 80), dataScope: "aggregate_metrics_existing_discord_rules_and_ai_role_classification", rulesChannelId: serverRules.channelId, rulesAvailable: serverRules.available, businessRoleDetectionSource: businessRoleDetection.source };
     await latestRef.set(saved);
     await db.ref(`${AI_OPERATIONS_PATH}/lastRunAt`).set(saved.createdAt).catch(() => {});
     return saved;
@@ -1411,7 +1407,9 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const [cfgSnap, insightSnap, eventSnap, analyticsSnap, staffEventSnap] = await Promise.all([db.ref("adminConfig/bot").once("value"), db.ref(`${AI_OPERATIONS_PATH}/latestInsight`).once("value"), db.ref(`${MEMBER_ROLE_AUTOMATION_PATH}/events`).limitToLast(100).once("value"), db.ref("runtime/community/analytics").once("value"), db.ref(STAFF_PERFORMANCE_PATH).orderByChild("occurredAt").startAt(Date.now() - 7 * 24 * 60 * 60_000).limitToLast(2000).once("value")]);
       const config = roleAutomationPolicy(cfgSnap.val() || {}), members = [...guild.members.cache.values()].filter(member => member.guild?.id === guild.id), total = Math.max(0, Number(guild.memberCount) || 0);
       const rulesSource = await readDiscordServerRules(guild);
-      const roles = [...guild.roles.cache.values()].map(role => ({ id: role.id, name: String(role.name || "role").slice(0, 100), position: role.position, businessType: businessRoleType(role.name), managed: Boolean(role.managed), protected: isProtectedAutomatedRole(role), memberCount: members.reduce((count, member) => count + (member.roles.cache.has(role.id) ? 1 : 0), 0) })).sort((a, b) => b.position - a.position);
+      const businessRoleDetection = await classifyBusinessRoles(guild, rulesSource);
+      const businessRoleTypes = new Map(businessRoleDetection.roles.map(role => [role.id, role.businessType]));
+      const roles = [...guild.roles.cache.values()].map(role => ({ id: role.id, name: String(role.name || "role").slice(0, 100), position: role.position, businessType: businessRoleTypes.get(role.id) || "", managed: Boolean(role.managed), protected: isProtectedAutomatedRole(role), memberCount: members.reduce((count, member) => count + (member.roles.cache.has(role.id) ? 1 : 0), 0) })).sort((a, b) => b.position - a.position);
       const businessRoleGroups = Object.fromEntries(["seller", "reseller"].map(type => { const groupRoles = roles.filter(role => role.businessType === type), groupIds = new Set(groupRoles.map(role => role.id)); return [type, { roles: groupRoles.map(role => ({ id: role.id, name: role.name, memberCount: role.memberCount })), cachedMembers: members.filter(member => [...member.roles.cache.keys()].some(roleId => groupIds.has(roleId))).length }]; }));
       const bots = members.filter(member => member.user?.bot).length;
       const analytics = Object.entries(analyticsSnap.val() || {}).sort((a, b) => String(b[0]).localeCompare(String(a[0]))).slice(0, 7).reduce((sum, [, day]) => sum + Math.max(0, Number(day?.messages) || 0), 0);
@@ -1428,7 +1426,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       }
       const staffActivity = [...staffRows.values()].sort((a, b) => (b.claims + b.resolutions + b.resellerOrders) - (a.claims + a.resolutions + a.resellerOrders)).slice(0, 100);
       const events = Object.entries(eventSnap.val() || {}).map(([id, event]) => ({ id, memberId: String(event.memberId || ""), roleId: String(event.roleId || ""), roleName: String(event.roleName || ""), action: String(event.action || ""), source: String(event.source || ""), createdAt: Number(event.createdAt) || 0 })).sort((a, b) => b.createdAt - a.createdAt).slice(0, 30);
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", aiConfigured: Boolean(String(process.env.OPENAI_API_KEY || "").trim()), config, guild: { id: guild.id, name: String(guild.name || "Discord server"), totalMembers: total, cachedMembers: members.length, cacheComplete: members.length >= total, cachedHumans: members.length - bots, cachedBots: bots, cachedOnline: members.filter(member => member.presence?.status && member.presence.status !== "offline").length, totalRoles: guild.roles.cache.size, cachedMessagesLast7Days: analytics }, rulesSource: { configured: rulesSource.configured, available: rulesSource.available, channelId: rulesSource.channelId, channelName: rulesSource.channelName, messageCount: rulesSource.messageCount, syncedAt: rulesSource.syncedAt, reason: rulesSource.reason }, businessRoleGroups, ticketActivity, staffActivity, roleActivityWindowCapped: recentStaffEvents.length >= 2000, roles, recentRoleEvents: events, latestInsight: insightSnap.val() || null });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", aiConfigured: Boolean(String(process.env.OPENAI_API_KEY || "").trim()), config, guild: { id: guild.id, name: String(guild.name || "Discord server"), totalMembers: total, cachedMembers: members.length, cacheComplete: members.length >= total, cachedHumans: members.length - bots, cachedBots: bots, cachedOnline: members.filter(member => member.presence?.status && member.presence.status !== "offline").length, totalRoles: guild.roles.cache.size, cachedMessagesLast7Days: analytics }, rulesSource: { configured: rulesSource.configured, available: rulesSource.available, channelId: rulesSource.channelId, channelName: rulesSource.channelName, messageCount: rulesSource.messageCount, syncedAt: rulesSource.syncedAt, reason: rulesSource.reason }, businessRoleDetection: { available: businessRoleDetection.available, source: businessRoleDetection.source, reason: businessRoleDetection.reason, syncedAt: businessRoleDetection.syncedAt, rulesAvailable: businessRoleDetection.rulesAvailable, classifiedCount: businessRoleDetection.classifiedCount }, businessRoleGroups, ticketActivity, staffActivity, roleActivityWindowCapped: recentStaffEvents.length >= 2000, roles, recentRoleEvents: events, latestInsight: insightSnap.val() || null });
     } catch (err) { return apiError(res, err, "ai_operations_status_failed"); }
   });
 
@@ -1440,7 +1438,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       if (!config.aiInsightsEnabled) throw Object.assign(new Error("AI operations insights are turned off in the Admin Panel"), { statusCode: 409, apiError: "ai_operations_disabled" });
       const insight = await createAiOperationsInsight({ force: true, source: `admin:${String(actor.uid).slice(0, 80)}` });
       if (!insight) throw Object.assign(new Error("AI is not configured. Set the private OpenAI API key in Setup & Status."), { statusCode: 503, apiError: "ai_operations_not_configured" });
-      return res.json({ ok: true, version: "1.5.51", insight });
+      return res.json({ ok: true, version: "1.5.52", insight });
     } catch (err) { return apiError(res, err, "ai_operations_insight_failed"); }
   });
 
@@ -1462,10 +1460,10 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const hasRole = member.roles.cache.has(roleId);
       if ((action === "add" && !hasRole)) await member.roles.add(role, `Manual role update via Admin Panel by ${actor.uid}`);
       else if (action === "remove" && hasRole) await member.roles.remove(role, `Manual role update via Admin Panel by ${actor.uid}`);
-      else return res.json({ ok: true, version: "1.5.51", changed: false, memberId, roleId, action });
+      else return res.json({ ok: true, version: "1.5.52", changed: false, memberId, roleId, action });
       const event = { memberId, roleId, roleName: role.name.slice(0, 100), action, source: "Admin Panel manual action", mode: "manual", adminUid: actor.uid, createdAt: Date.now() };
       await Promise.all([db.ref(`${MEMBER_ROLE_AUTOMATION_PATH}/events`).push(event), db.ref("auditLog").push({ adminUid: actor.uid, actionType: `manual_role_${action}`, timestamp: event.createdAt, summary: `${action === "add" ? "Assigned" : "Removed"} allowlisted role ${role.name} (${role.id}) for member ${memberId}` })]);
-      return res.json({ ok: true, version: "1.5.51", changed: true, memberId, roleId, roleName: role.name, action });
+      return res.json({ ok: true, version: "1.5.52", changed: true, memberId, roleId, roleName: role.name, action });
     } catch (err) { return apiError(res, err, "member_role_change_failed"); }
   });
 
@@ -1492,7 +1490,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         id: channel.id, name: String(channel.name || "Voice channel").slice(0, 100), type: "voice",
         memberCount: Number(channel.members?.size) || 0, selected: active.enabled === true && String(active.channelId) === channel.id
       })).sort((a, b) => a.name.localeCompare(b.name));
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", enabled: active.enabled === true, status: String(active.status || "disabled"), channelId: String(active.channelId || ""), template: String(active.template || "members-{count}"), displayedName: String(active.displayedName || ""), memberCount: Number(active.memberCount) || Number(guild.memberCount) || 0, guildMemberCount: Number(guild.memberCount) || 0, channels });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", enabled: active.enabled === true, status: String(active.status || "disabled"), channelId: String(active.channelId || ""), template: String(active.template || "members-{count}"), displayedName: String(active.displayedName || ""), memberCount: Number(active.memberCount) || Number(guild.memberCount) || 0, guildMemberCount: Number(guild.memberCount) || 0, channels });
     } catch (err) { return apiError(res, err, "member_counter_status_failed"); }
   });
 
@@ -1506,7 +1504,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         if (previous?.enabled && previous.channelId) await restoreCounterBeforeSwitch(previous, actor.uid);
         await ref.update({ enabled: false, status: "disabled", disabledAt: Date.now(), disabledBy: actor.uid }).catch(() => {});
         await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "member_counter_disabled", timestamp: Date.now(), summary: `Disabled the server member counter${previous?.channelName ? ` and restored #${previous.channelName}` : ""}` }).catch(() => {});
-        return res.json({ ok: true, version: "1.5.51", enabled: false, restored: Boolean(previous?.channelId) });
+        return res.json({ ok: true, version: "1.5.52", enabled: false, restored: Boolean(previous?.channelId) });
       }
       const template = String(req.body?.template || "members-{count}").trim().slice(0, 90) || "members-{count}";
       if (!/\{(?:members|count)\}/i.test(template)) throw Object.assign(new Error("Channel name template must include {count} or {members}"), { statusCode: 400, apiError: "member_counter_template_missing_count" });
@@ -1532,13 +1530,16 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         throw applyError;
       }
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "member_counter_enabled", timestamp: Date.now(), summary: `Enabled locked voice member counter in #${channel.name} (${channel.id})` }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.51", enabled: true, channelId: channel.id, channelName: channel.name, memberCount: Number(guild.memberCount) || 0 });
+      return res.json({ ok: true, version: "1.5.52", enabled: true, channelId: channel.id, channelName: channel.name, memberCount: Number(guild.memberCount) || 0 });
     } catch (err) { return apiError(res, err, "member_counter_update_failed"); }
   });
 
-  function compensationConfig() {
+  async function compensationConfig() {
     const cfg = getCompensationConfig() || {};
     const bounded = (value, fallback, min, max) => Math.max(min, Math.min(max, Number.isFinite(Number(value)) ? Number(value) : fallback));
+    const guild = client.guilds.cache.get(String(guildId));
+    const serverRules = guild ? await readDiscordServerRules(guild) : null;
+    const businessRoleDetection = guild ? await classifyBusinessRoles(guild, serverRules) : { available: false, source: "unavailable", reason: "discord_guild_unavailable", roles: [] };
     return {
       enabled: cfg.enabled === true,
       ticketClaimRateBdt: bounded(cfg.ticketClaimRateBdt, 0, 0, 1_000_000),
@@ -1548,7 +1549,8 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       resellerBasePercent: bounded(cfg.resellerBasePercent, 0, 0, 100),
       resellerMinPercent: bounded(cfg.resellerMinPercent, 0, 0, 100),
       resellerMaxPercent: bounded(cfg.resellerMaxPercent, 20, 0, 100),
-      resellerRoleIds: (Array.isArray(cfg.resellerRoleIds) ? cfg.resellerRoleIds : []).map(String).filter(id => /^\d{15,25}$/.test(id))
+      resellerRoleIds: businessRoleDetection.roles.filter(role => role.businessType === "reseller").map(role => role.id),
+      businessRoleDetection
     };
   }
 
@@ -1591,13 +1593,13 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     const checkoutKey = String(checkoutKeyValue || "").trim();
     const resellerDiscordId = String(resellerDiscordIdValue || "").trim();
     if (!/^[A-Za-z0-9_-]{1,120}$/.test(checkoutKey) || !/^\d{15,25}$/.test(resellerDiscordId)) throw Object.assign(new Error("Order key or reseller Discord ID is invalid"), { statusCode: 400, apiError: "invalid_reseller_assignment" });
-    const config = compensationConfig();
+    const config = await compensationConfig();
     if (!config.resellerCommissionEnabled) throw Object.assign(new Error("Enable reseller commission in Staff & Salary settings first"), { statusCode: 409, apiError: "reseller_commission_disabled" });
-    if (!config.resellerRoleIds.length) throw Object.assign(new Error("Add at least one reseller role ID in Staff & Salary settings"), { statusCode: 409, apiError: "reseller_role_missing" });
+    if (!config.resellerRoleIds.length) throw Object.assign(new Error("AI could not confidently identify a Reseller role from the existing Discord rules and roles"), { statusCode: 409, apiError: "reseller_role_missing" });
     const guild = client.guilds.cache.get(String(guildId));
     if (!guild) throw Object.assign(new Error("Configured Discord server is not available to the Bot"), { statusCode: 503, apiError: "discord_guild_unavailable" });
     const member = guild.members.cache.get(resellerDiscordId) || await guild.members.fetch(resellerDiscordId).catch(() => null);
-    if (!member || !config.resellerRoleIds.some(id => member.roles.cache.has(id))) throw Object.assign(new Error("That Discord member does not have a configured reseller role"), { statusCode: 403, apiError: "reseller_role_required" });
+    if (!member || !config.resellerRoleIds.some(id => member.roles.cache.has(id))) throw Object.assign(new Error("That Discord member does not have an AI-detected Reseller role"), { statusCode: 403, apiError: "reseller_role_required" });
     const orderRef = db.ref(`pending_payments/${checkoutKey}`);
     const assignment = await orderRef.transaction(current => {
       if (!current || (current.resellerDiscordId && String(current.resellerDiscordId) !== resellerDiscordId)) return;
@@ -1641,7 +1643,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const month = String(req.query?.month || new Date().toISOString().slice(0, 7));
       if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) throw Object.assign(new Error("Month must use YYYY-MM format"), { statusCode: 400, apiError: "invalid_compensation_month" });
       const [eventsSnap, payoutsSnap] = await Promise.all([db.ref(STAFF_PERFORMANCE_PATH).once("value"), db.ref(`${STAFF_PAYOUTS_PATH}/${month}`).once("value")]);
-      const cfg = compensationConfig(), events = Object.values(eventsSnap.val() || {}).filter(event => (String(event.month || monthFromTimestamp(event.occurredAt)) === month));
+      const cfg = await compensationConfig(), events = Object.values(eventsSnap.val() || {}).filter(event => (String(event.month || monthFromTimestamp(event.occurredAt)) === month));
       const grouped = new Map();
       for (const event of events) {
         const discordId = String(event.discordId || ""); if (!/^\d{15,25}$/.test(discordId)) continue;
@@ -1654,7 +1656,8 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       }
       const payouts = payoutsSnap.val() || {};
       const rows = [...grouped.values()].sort((a, b) => b.payoutBdt - a.payoutBdt).map(row => ({ ...row, payout: payouts[row.discordId] || null }));
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", month, settings: cfg, rows });
+      const { resellerRoleIds, businessRoleDetection, ...settings } = cfg;
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", month, settings, businessRoleDetection: { available: businessRoleDetection.available, source: businessRoleDetection.source, reason: businessRoleDetection.reason, syncedAt: businessRoleDetection.syncedAt, rulesAvailable: businessRoleDetection.rulesAvailable, roles: businessRoleDetection.roles.map(role => ({ name: role.name, businessType: role.businessType, evidence: role.evidence, confidence: role.confidence })) }, rows });
     } catch (err) { return apiError(res, err, "compensation_status_failed"); }
   });
 
@@ -1665,7 +1668,6 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const month = String(req.body?.month || ""), discordId = String(req.body?.discordId || "");
       if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month) || !/^\d{15,25}$/.test(discordId)) throw Object.assign(new Error("Month or Discord ID is invalid"), { statusCode: 400, apiError: "invalid_compensation_settlement" });
       const events = Object.values((await db.ref(STAFF_PERFORMANCE_PATH).once("value")).val() || {}).filter(event => String(event.discordId) === discordId && String(event.month || monthFromTimestamp(event.occurredAt)) === month);
-      const cfg = compensationConfig();
       const total = events.reduce((sum, event) => sum + Math.max(0, Number(event.amountBdt) || 0), 0);
       if (!(total > 0)) throw Object.assign(new Error("No payable balance is recorded for this member and month"), { statusCode: 409, apiError: "compensation_balance_empty" });
       const ref = db.ref(`${STAFF_PAYOUTS_PATH}/${month}/${discordId}`);
@@ -1673,7 +1675,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const result = await ref.transaction(current => current || { status: "marked_paid_manually", settlementId, amountBdt: Math.round(total * 100) / 100, eventCount: events.length, paidAt: Date.now(), paidBy: actor.uid }, undefined, false);
       if (!result.committed || result.snapshot.val()?.settlementId !== settlementId) throw Object.assign(new Error("This balance was already marked settled"), { statusCode: 409, apiError: "compensation_already_settled" });
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "staff_compensation_marked_paid", timestamp: Date.now(), summary: `Marked ৳${Math.round(total * 100) / 100} settled for Discord member ${discordId} (${month})` }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.51", month, discordId, amountBdt: Math.round(total * 100) / 100, payout: result.snapshot.val() });
+      return res.json({ ok: true, version: "1.5.52", month, discordId, amountBdt: Math.round(total * 100) / 100, payout: result.snapshot.val() });
     } catch (err) { return apiError(res, err, "compensation_settlement_failed"); }
   });
 
@@ -1682,7 +1684,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const actor = await verifyAdminApiRequest(req);
       if (!checkCppRateLimit(req, res, "reseller-commission", 30, 60_000)) return;
       const event = await assignResellerCommission(req.body?.checkoutKey, req.body?.resellerDiscordId, actor.uid);
-      return res.json({ ok: true, version: "1.5.51", event });
+      return res.json({ ok: true, version: "1.5.52", event });
     } catch (err) { return apiError(res, err, "reseller_commission_failed"); }
   });
 
@@ -1706,7 +1708,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       let hostJoinUrl = "";
       if (session) hostJoinUrl = hostUrl(session, await createAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host"));
       const radar = (await db.ref(radarRefPath).once("value").catch(() => null))?.val() || null;
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.51", configured: config().configured, active: Boolean(session), session: session ? { sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: session.inviteUrl, inviteExpiresAt: session.inviteExpiresAt, participantCount: participants.length, screenShareCount: participants.filter(p => trackFlags(p.tracks).screenSharing).length, muteAllActive: session.muteAllActive } : null, participants: session ? participants.map(p => participantSummary(p, session)) : [], voiceChannels: voice.channels, discordVoiceMemberCount: voice.memberCount, hostJoinUrl, radar });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.52", configured: config().configured, active: Boolean(session), session: session ? { sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: session.inviteUrl, inviteExpiresAt: session.inviteExpiresAt, participantCount: participants.length, screenShareCount: participants.filter(p => trackFlags(p.tracks).screenSharing).length, muteAllActive: session.muteAllActive } : null, participants: session ? participants.map(p => participantSummary(p, session)) : [], voiceChannels: voice.channels, discordVoiceMemberCount: voice.memberCount, hostJoinUrl, radar });
     } catch (err) { return apiError(res, err, "live_studio_status_failed"); }
   });
   app.post("/api/admin/live-studio/start", async (req, res) => {
@@ -1717,7 +1719,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_start", timestamp: Date.now(), summary: `Live Studio started for ${session.durationMinutes} minutes; invite ${session.inviteUrl}` }).catch(() => {});
       cleanupRequested = false;
       await publishRadar(true);
-      return res.json({ ok: true, version: "1.5.51", active: true, sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: invite.inviteUrl, inviteCode: invite.inviteCode, maxUses: invite.maxUses, hostJoinUrl: hostUrl(session, hostAccess), radarPinsEnabled: false, radarPostsEnabled: postRadarToTextChannels, nonTicketChannelsLockedDuringLive: true, publicOrigin: session.publicOrigin });
+      return res.json({ ok: true, version: "1.5.52", active: true, sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: invite.inviteUrl, inviteCode: invite.inviteCode, maxUses: invite.maxUses, hostJoinUrl: hostUrl(session, hostAccess), radarPinsEnabled: false, radarPostsEnabled: postRadarToTextChannels, nonTicketChannelsLockedDuringLive: true, publicOrigin: session.publicOrigin });
     } catch (err) { return apiError(res, err, "live_studio_start_failed"); }
   });
   app.post("/api/admin/live-studio/invite", async (req, res) => {
