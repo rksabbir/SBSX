@@ -467,7 +467,14 @@ function buildPaymentPage(category, session, readerState, providerNumber) {
 const app = express();
 app.set("trust proxy", 1);
 app.use(express.json({ limit: "32kb", type: "application/json" }));
-const ADMIN_PANEL_ORIGINS = new Set(String(process.env.ADMIN_PANEL_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean));
+const ADMIN_PANEL_DEFAULT_ORIGIN = (() => {
+    try { return new URL(String(process.env.ADMIN_PANEL_DEFAULT_ORIGIN || "https://admin-9x7v1.wuaze.com").trim()).origin; }
+    catch (_) { return "https://admin-9x7v1.wuaze.com"; }
+})();
+const ADMIN_PANEL_ORIGINS = new Set([
+    ADMIN_PANEL_DEFAULT_ORIGIN,
+    ...String(process.env.ADMIN_PANEL_ORIGINS || "").split(",").map(v => v.trim()).filter(Boolean).map(value => { try { return new URL(value).origin; } catch (_) { return ""; } }).filter(Boolean)
+]);
 app.use((req, res, next) => {
     const origin = String(req.get("origin") || "");
     // Public, non-sensitive health probe: allow the panel to read it even when its origin

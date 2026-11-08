@@ -1,6 +1,6 @@
 {
   "name": "payment-reader-discord-bot",
-  "version": "1.5.52",
+  "version": "1.5.54",
   "private": true,
   "description": "RKBACKLES Discord automation, ticket archive, AI business-role detection, Live Studio recovery and Community Automation Center",
   "main": "index.js",
