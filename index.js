@@ -954,7 +954,7 @@ db.ref("adminConfig/bot").on("value", (snapshot) => {
 // ⚙️ Bot Config & Automod Rules
 // ================================
 
-const TOKEN = process.env.TOKEN;
+let TOKEN = process.env.TOKEN;
 const ALLOWED_GUILD_ID = "1488101970425155584";
 const VERIFIED_ROLE_ID = "1488333841402691664";
 
@@ -1086,6 +1086,7 @@ const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildPresences,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
         GatewayIntentBits.GuildVoiceStates,
@@ -1101,6 +1102,7 @@ const { attachLiveStudioServer } = require("./live-studio-server");
 attachLiveStudioServer({
     app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit,
     ChannelType, allowedOrigins: ADMIN_PANEL_ORIGINS,
+    getChannelAdminRoleIds: () => [getConfiguredRoleId("admin"), getConfiguredRoleId("developer"), getConfiguredRoleId("supportTicketReport"), getConfiguredRoleId("supportCustomer")],
     setLivePresence: (active) => { liveStudioPresenceActive = Boolean(active); setBotPresence(); }
 });
 
@@ -1386,10 +1388,67 @@ async function createTicketArchive(channel, closedBy, ownerId, extra = {}) {
         guildId: String(channel.guildId || channel.guild?.id || ""), categoryId: String(channel.parentId || ""),
         categoryName: String(channel.parent?.name || "").slice(0, 100), ticketType: String(channel.name || "ticket").split(/[-_]/)[0].slice(0, 30),
         ownerId: String(ownerId || ""), closedById: String(closedBy?.id || ""), closedByName: String(closedBy?.tag || closedBy?.username || "Admin/Staff").slice(0, 100),
-        closedAt, messageCount: fetched.length, archiveVersion: 1, ...extra
+        status: "closed", closedAt, updatedAt: closedAt, messageCount: fetched.length, archiveVersion: 2, ...extra
     };
     recordCommunityMetric("ticketsArchived").catch(() => {});
     return { ...metadata, messages };
+}
+
+function isTrackedTicketChannel(channel) {
+    return /^(ticket|report|customer|order)-\d{4}$/i.test(String(channel?.name || ""));
+}
+
+async function saveTicketArchiveOpened(channel, owner, category, type, approvalStatus = "") {
+    if (!channel?.id || !isTrackedTicketChannel(channel)) return false;
+    const openedAt = Date.now();
+    const archive = {
+        channelId: String(channel.id), channelName: String(channel.name || "ticket").slice(0, 100),
+        guildId: String(channel.guildId || channel.guild?.id || ""), categoryId: String(channel.parentId || ""),
+        categoryName: String(channel.parent?.name || "").slice(0, 100), ticketType: String(type || channel.name.split(/[-_]/)[0] || "ticket").slice(0, 30),
+        ownerId: String(owner?.id || ""), ownerName: String(owner?.tag || owner?.username || "").slice(0, 100),
+        status: "open", approvalStatus: String(approvalStatus || "").slice(0, 40), openedAt, updatedAt: openedAt,
+        messageCount: 0, archiveVersion: 2, messages: {}
+    };
+    const archiveRef = db.ref(`ticketTranscripts/${channel.id}`);
+    const result = await archiveRef.transaction(current => current || archive, undefined, false);
+    const saved = result.snapshot.val() || archive;
+    const indexEntry = { ...saved };
+    delete indexEntry.messages;
+    await db.ref(`ticketTranscriptIndex/${channel.id}`).set(indexEntry);
+    return true;
+}
+
+async function saveTicketArchiveMessage(message) {
+    const channel = message?.channel;
+    if (!message?.id || !isTrackedTicketChannel(channel)) return false;
+    const archiveRef = db.ref(`ticketTranscripts/${channel.id}`);
+    const archiveSnap = await archiveRef.once("value");
+    if (!archiveSnap.exists()) {
+        await saveTicketArchiveOpened(channel, message.member?.user || message.author, "", channel.name.split(/[-_]/)[0]);
+    }
+    const serialized = serializeTicketMessage(message);
+    const inserted = await archiveRef.child(`messages/${message.id}`).transaction(current => current || serialized, undefined, false);
+    if (!inserted.committed) return false;
+    const updatedAt = Date.now();
+    await archiveRef.child("messageCount").transaction(current => (Number(current) || 0) + 1, undefined, false);
+    await archiveRef.child("updatedAt").set(updatedAt);
+    await db.ref(`ticketTranscriptIndex/${channel.id}/messageCount`).transaction(current => (Number(current) || 0) + 1, undefined, false);
+    await db.ref(`ticketTranscriptIndex/${channel.id}/updatedAt`).set(updatedAt);
+    return true;
+}
+
+async function updateTicketArchiveMessage(message, deleted = false) {
+    const channel = message?.channel;
+    if (!message?.id || !isTrackedTicketChannel(channel)) return false;
+    const messageRef = db.ref(`ticketTranscripts/${channel.id}/messages/${message.id}`);
+    const existing = await messageRef.once("value");
+    if (!existing.exists()) return false;
+    const now = Date.now();
+    if (deleted) await messageRef.update({ deletedAt: now });
+    else await messageRef.set(serializeTicketMessage(message));
+    await db.ref(`ticketTranscripts/${channel.id}/updatedAt`).set(now);
+    await db.ref(`ticketTranscriptIndex/${channel.id}/updatedAt`).set(now);
+    return true;
 }
 
 // ================================
@@ -1571,8 +1630,17 @@ client.on("messageCreate", async (message) => {
     }
 
     // Dynamic invite/verification-link response.
-    if (isFeatureEnabled("linkResponseEnabled") && VERIFICATION_LINK && (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক"))) {
-        return message.reply(`👋 আপনি কি সার্ভার বা ভেরিফিকেশন লিংক খুঁজছেন? এই নিন আমাদের লাইভ লিংক:\n\`${VERIFICATION_LINK}\``);
+    if (isFeatureEnabled("linkResponseEnabled") && (contentLower.includes("link") || contentLower.includes("লিংক") || contentLower.includes("লিঙ্ক"))) {
+        const linkConfig = ADMIN_BOT_CONFIG.links || {};
+        const socialLinks = [
+            ["Discord", linkConfig.discordLink || (VERIFICATION_LINK !== "https://discord.gg/example" ? VERIFICATION_LINK : "")],
+            ["Facebook", linkConfig.facebookLink], ["Website", linkConfig.websiteLink],
+            ["Support", linkConfig.supportLink], ["YouTube", linkConfig.youtubeLink], ["Verification", linkConfig.verificationLink]
+        ].map(([label, value]) => {
+            try { const url = new URL(String(value || "")); return url.protocol === "https:" ? `${label}: ${url.href}` : ""; }
+            catch (_) { return ""; }
+        }).filter(Boolean);
+        if (socialLinks.length) return message.reply(`👋 আমাদের প্রয়োজনীয় লিংকগুলো:\n${socialLinks.map(value => `• ${value}`).join("\n")}`.slice(0, 1900));
     }
 
     const blockedWords = automodSettings.blockedWords;
@@ -2892,6 +2960,10 @@ Approve করার আগে official bKash/Nagad transaction history নি�
                 permissionOverwrites
             });
 
+            await saveTicketArchiveOpened(privateChannel, interaction.user, category, "order", "approved").catch(err => {
+                console.error("❌ Could not create Admin Panel backup index for new order ticket:", privateChannel.id, err.message);
+            });
+
             const orderEmbed = new EmbedBuilder()
                 .setTitle(`🛍️ NEW MEMBERSHIP ORDER CONFIRMED`)
                 .setColor("#00FF00")
@@ -3008,6 +3080,10 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             permissionOverwrites
         });
 
+        await saveTicketArchiveOpened(privateChannel, interaction.user, category, type, "pending").catch(err => {
+            console.error("❌ Could not create Admin Panel backup index for new support ticket:", privateChannel.id, err.message);
+        });
+
         const panelEmbed = new EmbedBuilder().setTitle(`🛠️ ${type.toUpperCase()} REQUEST - ${category.toUpperCase().replace("_", " ")}`).setDescription(`স্বাগতম ${interaction.user}!\nআমাদের সাপোর্ট স্টাফ খুব শীঘ্রই আপনাকে সহায়তা করবে।`).setColor("Green").setTimestamp();
         const actionRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`claim_${type}`).setLabel("🛟 Claim").setStyle(ButtonStyle.Success),
@@ -3063,7 +3139,11 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         let transcriptSaved = false;
         let transcriptLogUploaded = false;
         try {
-            const archive = await createTicketArchive(interaction.channel, interaction.user, currentOrder?.userId || "", { closedByMention: `<@${interaction.user.id}>` });
+            const archiveRef = db.ref(`ticketTranscripts/${interaction.channel.id}`);
+            const previousArchive = (await archiveRef.once("value")).val() || {};
+            const closedArchive = await createTicketArchive(interaction.channel, interaction.user, currentOrder?.userId || previousArchive.ownerId || "", { closedByMention: `<@${interaction.user.id}>` });
+            const mergedMessages = { ...(previousArchive.messages || {}), ...(closedArchive.messages || {}) };
+            const archive = { ...previousArchive, ...closedArchive, openedAt: Number(previousArchive.openedAt) || Number(closedArchive.closedAt) || Date.now(), status: "closed", messages: mergedMessages, messageCount: Object.keys(mergedMessages).length };
             const updates = {};
             updates[`ticketTranscripts/${interaction.channel.id}`] = archive;
             const indexEntry = { ...archive };
@@ -3696,6 +3776,20 @@ async function handleCommunityAutomationMessage(message) {
     } catch (err) { console.warn("Keyword automation reply failed:", err.message); }
 }
 client.on("messageCreate", message => { handleCommunityAutomationMessage(message).catch(err => console.error("Community automation failed:", err.message)); });
+client.on("messageCreate", message => {
+    if (!isTrackedTicketChannel(message.channel)) return;
+    saveTicketArchiveMessage(message).catch(err => console.error("Ticket Admin Panel backup message write failed:", message.channelId, message.id, err.message));
+});
+client.on("messageUpdate", async (_oldMessage, newMessage) => {
+    try {
+        const message = newMessage.partial ? await newMessage.fetch() : newMessage;
+        if (isTrackedTicketChannel(message.channel)) await updateTicketArchiveMessage(message, false);
+    } catch (err) { console.warn("Ticket archive edit sync failed:", newMessage.channelId, newMessage.id, err.message); }
+});
+client.on("messageDelete", message => {
+    if (!isTrackedTicketChannel(message.channel)) return;
+    updateTicketArchiveMessage(message, true).catch(err => console.warn("Ticket archive delete marker failed:", message.channelId, message.id, err.message));
+});
 
 client.on("guildMemberAdd", async member => {
     if (member.guild.id !== ALLOWED_GUILD_ID) return;
@@ -4072,7 +4166,17 @@ function setBotPresence() {
 
 app.listen(PORT, () => { console.log(`🌐 Web server running on port ${PORT}`); });
 
-function startBot() {
+async function startBot() {
+    const privateSecrets = (await db.ref("serverSecrets/adminIntegrations").once("value").catch(() => null))?.val() || {};
+    const secretEnvNames = {
+        discordBotToken: "TOKEN", discordClientId: "DISCORD_CLIENT_ID", discordClientSecret: "DISCORD_CLIENT_SECRET",
+        openAiApiKey: "OPENAI_API_KEY", liveKitUrl: "LIVEKIT_URL", liveKitApiKey: "LIVEKIT_API_KEY",
+        liveKitApiSecret: "LIVEKIT_API_SECRET", facebookAppId: "FACEBOOK_APP_ID", facebookAppSecret: "FACEBOOK_APP_SECRET"
+    };
+    for (const [key, envName] of Object.entries(secretEnvNames)) {
+        if (typeof privateSecrets[key] === "string" && privateSecrets[key].trim()) process.env[envName] = privateSecrets[key].trim();
+    }
+    TOKEN = String(process.env.TOKEN || "").trim();
     if (!TOKEN) {
         console.error("❌ TOKEN Environment Variable is missing!");
         return;
@@ -4082,7 +4186,7 @@ function startBot() {
     });
 }
 
-startBot();
+startBot().catch(err => console.error("❌ Bot startup configuration failed:", err?.message || err));
 
 
 for (const signal of ["SIGINT", "SIGTERM"]) {

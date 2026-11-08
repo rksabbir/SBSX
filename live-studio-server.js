@@ -5,7 +5,7 @@ const { TRACK_SOURCE, CHANNEL_PINNED_MESSAGE_TYPE, pinNoticeTargetId, isBotPinAc
 const { normalizeAiPlan, buildOverwriteEdit, bitfieldToRestorePayload, overwriteState } = require("./role-permissions");
 const { normalizeKeywordRules, cleanText } = require("./community-automation");
 
-function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiRequest, checkCppRateLimit, ChannelType, allowedOrigins, setLivePresence = () => {} }) {
+function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiRequest, checkCppRateLimit, ChannelType, allowedOrigins, setLivePresence = () => {}, getChannelAdminRoleIds = () => [] }) {
   const sessions = new Map();
   const invites = new Map();
   const activity = [];
@@ -51,6 +51,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     "MuteMembers", "DeafenMembers", "MoveMembers", "UseSoundboard", "UseExternalSounds", "UseEmbeddedActivities"
   ];
   const ROLE_PERMISSION_BACKUP_PATH = "runtime/rolePermissionBackups";
+  const MANUAL_CHANNEL_PRIVACY_PATH = "runtime/manualChannelPrivacy";
   const pendingRolePermissionPlans = new Map();
   const pendingCommunityAutomationPlans = new Map();
 
@@ -64,6 +65,109 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     else if (textTypes.includes(channel.type)) names = ROLE_PERMISSION_TEXT_NAMES;
     else if (voiceTypes.includes(channel.type)) names = ROLE_PERMISSION_VOICE_NAMES;
     return names.filter(name => PermissionFlagsBits[name] !== undefined);
+  }
+
+  function manualPrivacyPermissionNames(channel) {
+    if (!channel || channel.isThread?.()) return [];
+    const type = ChannelType || {};
+    const textTypes = [type.GuildText, type.GuildAnnouncement, type.GuildForum, type.GuildMedia].filter(Number.isInteger);
+    const voiceTypes = [type.GuildVoice, type.GuildStageVoice].filter(Number.isInteger);
+    if (textTypes.includes(channel.type)) return ["ViewChannel", "ReadMessageHistory", "SendMessages", "AddReactions", "CreatePublicThreads", "CreatePrivateThreads", "SendMessagesInThreads", "UseApplicationCommands", "SendPolls"].filter(name => PermissionFlagsBits[name] !== undefined);
+    if (voiceTypes.includes(channel.type)) return ["ViewChannel", "Connect", "Speak", "Stream", "UseVAD", "UseSoundboard", "UseExternalSounds", "UseEmbeddedActivities"].filter(name => PermissionFlagsBits[name] !== undefined);
+    return [];
+  }
+
+  function privacyChannelType(channel) {
+    const type = ChannelType || {};
+    if ([type.GuildVoice, type.GuildStageVoice].includes(channel?.type)) return "voice";
+    if (channel?.type === type.GuildForum || channel?.type === type.GuildMedia) return "forum";
+    if (channel?.type === type.GuildAnnouncement) return "announcement";
+    return "text";
+  }
+
+  function isPubliclyVisibleChannel(channel, guild) {
+    return Boolean(channel?.permissionsFor?.(guild?.roles?.everyone)?.has?.(PermissionFlagsBits.ViewChannel));
+  }
+
+  function overwritePermissionStates(channel, targetId, permissionNames) {
+    const overwrite = channel.permissionOverwrites?.cache?.get(String(targetId)) || null;
+    return Object.fromEntries(permissionNames.map(name => [name, overwriteState(overwrite, name, PermissionFlagsBits)]));
+  }
+
+  function privacyLockPayload(channel) {
+    const type = privacyChannelType(channel);
+    const payload = {};
+    if (type === "voice") {
+      Object.assign(payload, { Connect: false, Speak: false, Stream: false, UseVAD: false, UseSoundboard: false, UseExternalSounds: false, UseEmbeddedActivities: false });
+    } else {
+      Object.assign(payload, { SendMessages: false, AddReactions: false, CreatePublicThreads: false, CreatePrivateThreads: false, SendMessagesInThreads: false, UseApplicationCommands: false, SendPolls: false });
+    }
+    return Object.fromEntries(Object.entries(payload).filter(([name]) => PermissionFlagsBits[name] !== undefined));
+  }
+
+  function privacyAdminAllowPayload(channel) {
+    const type = privacyChannelType(channel);
+    const payload = {};
+    if (type === "voice") Object.assign(payload, { Connect: true, Speak: true, Stream: true, UseVAD: true });
+    else Object.assign(payload, { SendMessages: true, AddReactions: true, CreatePublicThreads: true, CreatePrivateThreads: true, SendMessagesInThreads: true, UseApplicationCommands: true, SendPolls: true });
+    return Object.fromEntries(Object.entries(payload).filter(([name]) => PermissionFlagsBits[name] !== undefined));
+  }
+
+  async function getManualPrivacyContext(channelIdValue) {
+    const guild = client.guilds.cache.get(String(guildId));
+    if (!guild) throw Object.assign(new Error("Configured Discord server is not available to the Bot"), { statusCode: 503, apiError: "discord_guild_unavailable" });
+    await guild.roles.fetch().catch(() => {});
+    const channelId = validateDiscordSnowflake(channelIdValue, "Channel");
+    const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    const permissionNames = manualPrivacyPermissionNames(channel);
+    if (!channel || channel.guildId !== guild.id || permissionNames.length === 0) throw Object.assign(new Error("Choose a text, announcement, forum, voice or stage channel"), { statusCode: 404, apiError: "discord_privacy_channel_not_found" });
+    if (!isPubliclyVisibleChannel(channel, guild)) throw Object.assign(new Error("This channel is private to selected roles. Manual read-only only applies to channels everyone can already view."), { statusCode: 403, apiError: "discord_privacy_channel_private" });
+    const botMember = guild.members.me || await guild.members.fetchMe().catch(() => null);
+    const permissions = botMember && channel.permissionsFor(botMember);
+    if (!permissions || !permissions.has(PermissionFlagsBits.ManageRoles) || !permissions.has(PermissionFlagsBits.ViewChannel)) throw Object.assign(new Error("Bot needs View Channel and Manage Roles on the selected channel"), { statusCode: 403, apiError: "discord_bot_manage_roles_missing" });
+    return { guild, channel, permissionNames, botMember };
+  }
+
+  function getPrivacyAdminRoleConfig(guild, botMember) {
+    const configuredRoleIds = new Set((Array.isArray(getChannelAdminRoleIds(guild)) ? getChannelAdminRoleIds(guild) : []).map(String).filter(id => /^\d{15,22}$/.test(id)));
+    const protectedRoleIds = new Set([...guild.roles.cache.values()].filter(role => role.permissions.has(PermissionFlagsBits.ManageChannels)).map(role => role.id));
+    for (const id of configuredRoleIds) protectedRoleIds.add(id);
+    const adminRoles = [...guild.roles.cache.values()].filter(role => role.id !== guild.id && !role.managed && role.position < botMember.roles.highest.position && !role.permissions.has(PermissionFlagsBits.Administrator) && (role.permissions.has(PermissionFlagsBits.ManageChannels) || configuredRoleIds.has(role.id)));
+    return { adminRoles, protectedRoleIds };
+  }
+
+  function overwriteAllowsAny(overwrite, permissionNames) {
+    return permissionNames.some(name => PermissionFlagsBits[name] !== undefined && overwrite?.allow?.has?.(PermissionFlagsBits[name]));
+  }
+
+  async function getManualPrivacyTargets(guild, channel, botMember, permissionNames, adminRoles, protectedRoleIds) {
+    const adminRoleIds = new Set(adminRoles.map(role => role.id));
+    const botId = String(client.user?.id || botMember.id);
+    const targets = new Set([String(guild.id), botId, ...adminRoleIds]);
+    for (const overwrite of channel.permissionOverwrites.cache.values()) {
+      const targetId = String(overwrite.id);
+      if (targets.has(targetId) || !overwriteAllowsAny(overwrite, permissionNames)) continue;
+      const role = guild.roles.cache.get(targetId);
+      if (role) {
+        if (role.permissions.has(PermissionFlagsBits.Administrator) || protectedRoleIds.has(role.id)) continue;
+        targets.add(targetId);
+        continue;
+      }
+      let member = guild.members.cache.get(targetId) || null;
+      if (!member) member = await guild.members.fetch(targetId).catch(() => null);
+      if (!member || member.permissions.has(PermissionFlagsBits.Administrator) || member.roles.cache.some(memberRole => protectedRoleIds.has(memberRole.id))) continue;
+      targets.add(targetId);
+    }
+    return [...targets];
+  }
+
+  async function restoreManualPrivacy(channel, snapshot, actorUid) {
+    for (const [targetId, states] of Object.entries(snapshot?.targets || {})) {
+      const current = channel.permissionOverwrites.cache.get(targetId);
+      if (!current) continue;
+      const payload = Object.fromEntries(Object.entries(states || {}).map(([name, state]) => [name, state === "allow" ? true : state === "deny" ? false : null]));
+      await channel.permissionOverwrites.edit(targetId, payload, { reason: `Restore saved channel privacy state via Admin Panel by ${actorUid}` });
+    }
   }
 
   function rolePermissionChannelType(channel) {
@@ -732,7 +836,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const pinSnapshot = await db.ref(pinsRefPath).once("value").catch(() => null);
       const pinRecords = Object.values(pinSnapshot?.val() || {});
       const data = {
-        version: "1.5.47", guildId, guildName: voice.guildName, active: Boolean(session), updatedAt: Date.now(),
+        version: "1.5.48", guildId, guildName: voice.guildName, active: Boolean(session), updatedAt: Date.now(),
         durationMinutes: session?.durationMinutes || 0, startedAt: session?.startedAt || 0, endsAt: session?.expiresAt || 0,
         voiceChannelCount: voice.channels.length, discordVoiceMemberCount: voice.memberCount,
         screenShareCount, participantCount: safeParticipants.length,
@@ -824,7 +928,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
   // A minimal public route health response; never include LiveKit secrets or credentials.
   app.get("/api/live-studio/route-health", (req, res) => {
     const cfg = config();
-    return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.47", configured: cfg.configured, missingVariables: cfg.missingVariables, panelOrigin: panelOriginFallback, liveRoomBaseOrigin, liveRoomPath: "/?invite=...", publicStatusEndpoint: "/api/live-studio/public-status", ready: cfg.configured });
+    return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.48", configured: cfg.configured, missingVariables: cfg.missingVariables, panelOrigin: panelOriginFallback, liveRoomBaseOrigin, liveRoomPath: "/?invite=...", publicStatusEndpoint: "/api/live-studio/public-status", ready: cfg.configured });
   });
 
   // Public, minimal read-only status for the Blogger live page. Do not expose participant
@@ -838,7 +942,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     res.set("Expires", "0");
     return res.json({
       ok: true,
-      version: "1.5.47",
+      version: "1.5.48",
       active: Boolean(session),
       updatedAt: Date.now(),
       session: session ? {
@@ -870,7 +974,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         status: String(item.status || ""), createdAt: Number(item.createdAt) || 0, appliedAt: Number(item.appliedAt) || 0, revertedAt: Number(item.revertedAt) || 0,
         summary: String(item.summary || ""), canRevert: item.status === "applied"
       }));
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.47", aiConfigured: Boolean(String(process.env.OPENAI_API_KEY || "").trim()), model: String(process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini"), roles, channels, backups });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.48", aiConfigured: Boolean(String(process.env.OPENAI_API_KEY || "").trim()), model: String(process.env.OPENAI_ROLE_PERMISSIONS_MODEL || "gpt-5.4-mini"), roles, channels, backups });
     } catch (err) { return apiError(res, err, "role_permission_catalog_failed"); }
   });
 
@@ -895,7 +999,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const planId = crypto.randomBytes(18).toString("base64url");
       const expiresAt = Date.now() + 10 * 60_000;
       pendingRolePermissionPlans.set(planId, { id: planId, actorUid: actor.uid, guildId: guild.id, roleId: role.id, channelId: channel.id, goal, plan, allowedPermissions, expiresAt });
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.47", planId, expiresAt, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name, type: rolePermissionChannelType(channel) }, currentStates, changedCount, plan });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.48", planId, expiresAt, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name, type: rolePermissionChannelType(channel) }, currentStates, changedCount, plan });
     } catch (err) { return apiError(res, err, "role_permission_plan_failed"); }
   });
 
@@ -933,7 +1037,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       await backupRef.update({ status: "applied", appliedAt: Date.now(), appliedAllow: String(channel.permissionOverwrites.cache.get(role.id)?.allow?.bitfield ?? "0"), appliedDeny: String(channel.permissionOverwrites.cache.get(role.id)?.deny?.bitfield ?? "0") });
       pendingRolePermissionPlans.delete(planId);
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "ai_role_permissions_applied", timestamp: Date.now(), summary: `Applied AI-reviewed permission changes to role ${role.name} (${role.id}) in #${channel.name} (${channel.id})`, backupId: backupRef.key, changeCount: Object.keys(editPayload).length }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.47", backupId: backupRef.key, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, applied: Object.keys(editPayload).map(permission => ({ permission, state: editPayload[permission] ? "allow" : "deny" })), appliedAt: Date.now() });
+      return res.json({ ok: true, version: "1.5.48", backupId: backupRef.key, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, applied: Object.keys(editPayload).map(permission => ({ permission, state: editPayload[permission] ? "allow" : "deny" })), appliedAt: Date.now() });
     } catch (err) { return apiError(res, err, "role_permission_apply_failed"); }
   });
 
@@ -993,7 +1097,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const plan = { id: planId, actorUid: actor.uid, expiresAt: Date.now() + 10 * 60_000, summary: cleanText(parsed.summary || "Keyword reply rules are ready for review.", 240), rules };
       pendingCommunityAutomationPlans.set(planId, plan);
       while (pendingCommunityAutomationPlans.size > 100) pendingCommunityAutomationPlans.delete(pendingCommunityAutomationPlans.keys().next().value);
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.47", planId, expiresAt: plan.expiresAt, summary: plan.summary, rules });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.48", planId, expiresAt: plan.expiresAt, summary: plan.summary, rules });
     } catch (err) { return apiError(res, err, "community_automation_plan_failed"); }
   });
 
@@ -1016,7 +1120,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       if (!result.committed) throw Object.assign(new Error("Could not save automation rules. Retry after refreshing the Admin Panel."), { statusCode: 503, apiError: "community_automation_save_failed" });
       pendingCommunityAutomationPlans.delete(planId);
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "ai_community_automation_applied", timestamp: Date.now(), summary: `Applied ${plan.rules.length} approved keyword reply automation rule(s).`, ruleNames: plan.rules.map(rule => rule.name) }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.47", addedCount: plan.rules.length, rules: plan.rules.map(rule => ({ name: rule.name, keywords: rule.keywords })) });
+      return res.json({ ok: true, version: "1.5.48", addedCount: plan.rules.length, rules: plan.rules.map(rule => ({ name: rule.name, keywords: rule.keywords })) });
     } catch (err) { return apiError(res, err, "community_automation_apply_failed"); }
   });
 
@@ -1057,7 +1161,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         } catch (err) { console.warn("Could not mirror suggestion status to Discord:", err.message); }
       }
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "community_suggestion_status_update", timestamp: now, summary: `Set community suggestion ${suggestionId} to ${status}.`, suggestionId, status }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.47", suggestionId, status, statusLabel: statusLabels[status], discordUpdated });
+      return res.json({ ok: true, version: "1.5.48", suggestionId, status, statusLabel: statusLabels[status], discordUpdated });
     } catch (err) { return apiError(res, err, "community_suggestion_status_failed"); }
   });
 
@@ -1082,8 +1186,130 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       }
       await backupRef.update({ status: "reverted", revertedAt: Date.now(), revertedBy: actor.uid });
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "ai_role_permissions_reverted", timestamp: Date.now(), summary: `Restored previous overwrite for role ${role.name} (${role.id}) in #${channel.name} (${channel.id})`, backupId }).catch(() => {});
-      return res.json({ ok: true, version: "1.5.47", backupId, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, revertedAt: Date.now() });
+      return res.json({ ok: true, version: "1.5.48", backupId, role: { id: role.id, name: role.name }, channel: { id: channel.id, name: channel.name }, revertedAt: Date.now() });
     } catch (err) { return apiError(res, err, "role_permission_revert_failed"); }
+  });
+
+  app.get("/api/admin/channel-privacy/status", async (req, res) => {
+    try {
+      await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "channel-privacy-status", 30, 60_000)) return;
+      const guild = client.guilds.cache.get(String(guildId));
+      if (!guild) throw Object.assign(new Error("Configured Discord server is not available to the Bot"), { statusCode: 503, apiError: "discord_guild_unavailable" });
+      await Promise.all([guild.roles.fetch().catch(() => {}), guild.channels.fetch().catch(() => {})]);
+      const members = [...guild.members.cache.values()];
+      const channelPrivacy = (await db.ref(MANUAL_CHANNEL_PRIVACY_PATH).once("value").catch(() => null))?.val() || {};
+      const types = ChannelType || {};
+      const channels = [...guild.channels.cache.values()].filter(channel => manualPrivacyPermissionNames(channel).length > 0 && isPubliclyVisibleChannel(channel, guild)).map(channel => ({
+        id: channel.id, name: channel.name || `channel-${channel.id}`, type: privacyChannelType(channel), parentName: channel.parent?.name || "",
+        locked: channelPrivacy[channel.id]?.status === "locked", memberCount: [types.GuildVoice, types.GuildStageVoice].includes(channel.type) ? Number(channel.members?.size) || 0 : null
+      })).sort((a, b) => a.name.localeCompare(b.name));
+      const humans = members.filter(member => !member.user?.bot);
+      const onlineMembers = members.filter(member => !member.user?.bot && member.presence?.status && member.presence.status !== "offline");
+      const botCount = members.filter(member => member.user?.bot).length;
+      return res.set("Cache-Control", "no-store").json({
+        ok: true, version: "1.5.48", guildName: String(guild.name || "Discord server").slice(0, 120),
+        counts: { members: Number(guild.memberCount) || members.length, humans: humans.length, bots: botCount, onlineHumans: onlineMembers.length, cachedMembers: members.length, presenceIntentEnabledInCode: true },
+        memberCountsPartial: members.length < (Number(guild.memberCount) || 0), channels
+      });
+    } catch (err) { return apiError(res, err, "channel_privacy_status_failed"); }
+  });
+
+  app.post("/api/admin/channel-privacy/set", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "channel-privacy-set", 20, 60_000)) return;
+      if (activeSession()) throw Object.assign(new Error("End Live Studio before changing channel read-only state; the active Studio session owns temporary channel locks"), { statusCode: 409, apiError: "channel_privacy_live_conflict" });
+      const { guild, channel, botMember } = await getManualPrivacyContext(req.body?.channelId);
+      const lock = req.body?.locked === true;
+      const ref = db.ref(`${MANUAL_CHANNEL_PRIVACY_PATH}/${channel.id}`);
+      const old = (await ref.once("value")).val() || null;
+      if (lock && old?.status === "locked") return res.json({ ok: true, version: "1.5.48", channelId: channel.id, locked: true, alreadySet: true });
+      if (!lock) {
+        if (!old || old.status !== "locked" || !old.targets) return res.json({ ok: true, version: "1.5.48", channelId: channel.id, locked: false, alreadySet: true });
+        await restoreManualPrivacy(channel, old, actor.uid);
+        await ref.update({ status: "unlocked", unlockedAt: Date.now(), unlockedBy: actor.uid });
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "discord_channel_readonly_disabled", timestamp: Date.now(), summary: `Restored saved permissions for #${channel.name} (${channel.id})` }).catch(() => {});
+        return res.json({ ok: true, version: "1.5.48", channelId: channel.id, channelName: channel.name, locked: false });
+      }
+
+      const everyoneId = guild.id;
+      const { adminRoles, protectedRoleIds } = getPrivacyAdminRoleConfig(guild, botMember);
+      const restrictedPermissionNames = Object.entries(privacyLockPayload(channel)).filter(([, value]) => value === false).map(([name]) => name);
+      const targetIds = await getManualPrivacyTargets(guild, channel, botMember, restrictedPermissionNames, adminRoles, protectedRoleIds);
+      const lockPayload = privacyLockPayload(channel), adminPayload = privacyAdminAllowPayload(channel);
+      const adminTargetIds = new Set([...adminRoles.map(role => role.id), String(client.user?.id || botMember.id)]);
+      const payloadForTarget = targetId => targetId !== everyoneId && adminTargetIds.has(targetId) ? adminPayload : lockPayload;
+      const targets = Object.fromEntries(targetIds.map(targetId => [targetId, overwritePermissionStates(channel, targetId, Object.keys(payloadForTarget(targetId)))]));
+      const snapshot = {
+        guildId: guild.id, channelId: channel.id, channelName: channel.name, type: privacyChannelType(channel),
+        status: "applying", targets, createdAt: Date.now(), createdBy: actor.uid
+      };
+      await ref.set(snapshot);
+      try {
+        for (const targetId of targetIds) {
+          await channel.permissionOverwrites.edit(targetId, payloadForTarget(targetId), { reason: `Read-only enabled from Admin Panel by ${actor.uid}` });
+        }
+        await ref.update({ status: "locked", lockedAt: Date.now(), lockedBy: actor.uid, adminRoleIds: adminRoles.map(role => role.id) });
+      } catch (applyError) {
+        await restoreManualPrivacy(channel, snapshot, actor.uid).catch(restoreError => console.warn("Manual privacy rollback failed:", String(restoreError?.message || restoreError).slice(0, 180)));
+        await ref.update({ status: "failed", failedAt: Date.now(), failure: String(applyError?.message || applyError).slice(0, 180) }).catch(() => {});
+        throw applyError;
+      }
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "discord_channel_readonly_enabled", timestamp: Date.now(), summary: `Enabled view-only access for #${channel.name} (${channel.id})` }).catch(() => {});
+      return res.json({ ok: true, version: "1.5.48", channelId: channel.id, channelName: channel.name, locked: true, adminRolesPreserved: adminRoles.length });
+    } catch (err) { return apiError(res, err, "channel_privacy_update_failed"); }
+  });
+
+  const PRIVATE_INTEGRATION_SECRET_PATH = "serverSecrets/adminIntegrations";
+  const INTEGRATION_SECRET_LIMITS = {
+    discordBotToken: 240, discordClientId: 40, discordClientSecret: 300, openAiApiKey: 500,
+    liveKitUrl: 500, liveKitApiKey: 300, liveKitApiSecret: 500, facebookAppId: 80, facebookAppSecret: 300
+  };
+  const INTEGRATION_ENV_NAMES = {
+    discordBotToken: "TOKEN", discordClientId: "DISCORD_CLIENT_ID", discordClientSecret: "DISCORD_CLIENT_SECRET",
+    openAiApiKey: "OPENAI_API_KEY", liveKitUrl: "LIVEKIT_URL", liveKitApiKey: "LIVEKIT_API_KEY",
+    liveKitApiSecret: "LIVEKIT_API_SECRET", facebookAppId: "FACEBOOK_APP_ID", facebookAppSecret: "FACEBOOK_APP_SECRET"
+  };
+  app.get("/api/admin/integrations/secrets/status", async (req, res) => {
+    try {
+      await verifyAdminApiRequest(req);
+      const saved = (await db.ref(PRIVATE_INTEGRATION_SECRET_PATH).once("value").catch(() => null))?.val() || {};
+      const configured = Object.fromEntries(Object.entries(INTEGRATION_ENV_NAMES).map(([key, envName]) => [key, Boolean(String(process.env[envName] || saved[key] || "").trim())]));
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.48", configured, restartRequired: ["discordBotToken"] });
+    } catch (err) { return apiError(res, err, "integration_secrets_status_failed"); }
+  });
+  app.post("/api/admin/integrations/secrets/save", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "integration-secrets-save", 8, 60_000)) return;
+      const values = req.body?.secrets && typeof req.body.secrets === "object" ? req.body.secrets : {};
+      const clearKeys = Array.isArray(req.body?.clearKeys) ? req.body.clearKeys.map(String) : [];
+      const patch = {};
+      for (const [key, maxLength] of Object.entries(INTEGRATION_SECRET_LIMITS)) {
+        if (clearKeys.includes(key)) { patch[key] = null; continue; }
+        if (!Object.prototype.hasOwnProperty.call(values, key)) continue;
+        const value = String(values[key] || "").trim();
+        if (!value) continue;
+        if (value.length > maxLength) throw Object.assign(new Error(`${key} is too long`), { statusCode: 400, apiError: "invalid_integration_secret" });
+        if (key === "liveKitUrl") {
+          let url; try { url = new URL(value); } catch (_) { throw Object.assign(new Error("LiveKit URL is invalid"), { statusCode: 400, apiError: "invalid_integration_secret" }); }
+          if (!/^(https?|wss?):$/.test(url.protocol) || url.username || url.password || url.search || url.hash) throw Object.assign(new Error("LiveKit URL must be a public HTTPS/WSS service URL without credentials or query text"), { statusCode: 400, apiError: "invalid_integration_secret" });
+        }
+        patch[key] = value;
+      }
+      if (!Object.keys(patch).length) return res.json({ ok: true, version: "1.5.48", changed: false, restartRequired: [] });
+      const ref = db.ref(PRIVATE_INTEGRATION_SECRET_PATH);
+      await ref.update(patch);
+      for (const [key, value] of Object.entries(patch)) {
+        const envName = INTEGRATION_ENV_NAMES[key];
+        if (!envName || key === "discordBotToken") continue;
+        if (value === null) delete process.env[envName]; else process.env[envName] = value;
+      }
+      if (Object.keys(patch).some(key => ["liveKitUrl", "liveKitApiKey", "liveKitApiSecret"].includes(key)) && !activeSession()) liveKitRuntime = null;
+      await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "integration_secrets_updated", timestamp: Date.now(), summary: `Updated integration settings (${Object.keys(patch).length} key fields; values hidden)` }).catch(() => {});
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.48", changed: true, updatedKeys: Object.keys(patch), restartRequired: Object.keys(patch).includes("discordBotToken") ? ["discordBotToken"] : [] });
+    } catch (err) { return apiError(res, err, "integration_secrets_save_failed"); }
   });
 
   app.get("/api/admin/live-studio/status", async (req, res) => {
@@ -1096,7 +1322,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       let hostJoinUrl = "";
       if (session) hostJoinUrl = hostUrl(session, await createAccessToken(session, session.hostIdentity, "RKBACKLES Host", "host"));
       const radar = (await db.ref(radarRefPath).once("value").catch(() => null))?.val() || null;
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.47", configured: config().configured, active: Boolean(session), session: session ? { sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: session.inviteUrl, inviteExpiresAt: session.inviteExpiresAt, participantCount: participants.length, screenShareCount: participants.filter(p => trackFlags(p.tracks).screenSharing).length, muteAllActive: session.muteAllActive } : null, participants: session ? participants.map(p => participantSummary(p, session)) : [], voiceChannels: voice.channels, discordVoiceMemberCount: voice.memberCount, hostJoinUrl, radar });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.48", configured: config().configured, active: Boolean(session), session: session ? { sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: session.inviteUrl, inviteExpiresAt: session.inviteExpiresAt, participantCount: participants.length, screenShareCount: participants.filter(p => trackFlags(p.tracks).screenSharing).length, muteAllActive: session.muteAllActive } : null, participants: session ? participants.map(p => participantSummary(p, session)) : [], voiceChannels: voice.channels, discordVoiceMemberCount: voice.memberCount, hostJoinUrl, radar });
     } catch (err) { return apiError(res, err, "live_studio_status_failed"); }
   });
   app.post("/api/admin/live-studio/start", async (req, res) => {
@@ -1107,7 +1333,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "live_studio_start", timestamp: Date.now(), summary: `Live Studio started for ${session.durationMinutes} minutes; invite ${session.inviteUrl}` }).catch(() => {});
       cleanupRequested = false;
       await publishRadar(true);
-      return res.json({ ok: true, version: "1.5.47", active: true, sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: invite.inviteUrl, inviteCode: invite.inviteCode, maxUses: invite.maxUses, hostJoinUrl: hostUrl(session, hostAccess), radarPinsEnabled: false, radarPostsEnabled: postRadarToTextChannels, nonTicketChannelsLockedDuringLive: true, publicOrigin: session.publicOrigin });
+      return res.json({ ok: true, version: "1.5.48", active: true, sessionId: session.sessionId, roomName: session.roomName, startedAt: session.startedAt, expiresAt: session.expiresAt, durationMinutes: session.durationMinutes, inviteUrl: invite.inviteUrl, inviteCode: invite.inviteCode, maxUses: invite.maxUses, hostJoinUrl: hostUrl(session, hostAccess), radarPinsEnabled: false, radarPostsEnabled: postRadarToTextChannels, nonTicketChannelsLockedDuringLive: true, publicOrigin: session.publicOrigin });
     } catch (err) { return apiError(res, err, "live_studio_start_failed"); }
   });
   app.post("/api/admin/live-studio/invite", async (req, res) => {
