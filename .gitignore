@@ -1,0 +1,14 @@
+# Never commit credentials
+.env
+.env.*.local
+**/google-services.json
+**/firebase-service-account.json
+**/serviceAccountKey.json
+**/*service-account*.json
+
+# Build/dependency artifacts
+**/node_modules/
+**/.gradle/
+**/build/
+*.apk
+*.aab

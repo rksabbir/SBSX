@@ -1,0 +1,96 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "adminUids": {
+      "$uid": {
+        ".read": "auth != null && auth.uid == $uid",
+        ".write": false,
+        ".validate": "newData.isBoolean()"
+      }
+    },
+    "adminConfig": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "runtime": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": false
+    },
+    "reader_devices": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      "$uid": {
+        ".read": "auth != null && (auth.uid == $uid || root.child('adminUids').child(auth.uid).val() == true)",
+        ".write": "auth != null && auth.uid == $uid",
+        "enabled": {
+          ".validate": "newData.isBoolean()"
+        },
+        "lastSeenAt": {
+          ".validate": "newData.isNumber()"
+        },
+        "appVersion": {
+          ".validate": "newData.isString() && newData.val().length <= 80"
+        },
+        "deviceModel": {
+          ".validate": "newData.isString() && newData.val().length <= 160"
+        }
+      }
+    },
+    "reader_events": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      "$uid": {
+        ".read": "auth != null && (auth.uid == $uid || root.child('adminUids').child(auth.uid).val() == true)",
+        ".write": "auth != null && auth.uid == $uid",
+        "$eventId": {
+          ".validate": "newData.hasChildren(['transactionId', 'provider', 'verificationStatus', 'capturedAt']) && newData.child('transactionId').isString() && newData.child('transactionId').val().length <= 80 && (newData.child('provider').val() == 'bkash' || newData.child('provider').val() == 'nagad') && newData.child('verificationStatus').isString() && newData.child('capturedAt').isNumber()"
+        }
+      }
+    },
+    "settings": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "panels": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "pending_payments": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": false
+    },
+    "transactions": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "coupons": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "couponRequests": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "auditLog": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "adminActions": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": "auth != null && root.child('adminUids').child(auth.uid).val() == true"
+    },
+    "cppProfiles": {
+      "$uid": {
+        ".read": "auth != null && auth.uid == $uid",
+        ".write": false
+      }
+    },
+    "ticketTranscriptIndex": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": false
+    },
+    "ticketTranscripts": {
+      ".read": "auth != null && root.child('adminUids').child(auth.uid).val() == true",
+      ".write": false
+    }
+  }
+}

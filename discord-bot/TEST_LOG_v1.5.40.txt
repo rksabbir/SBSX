@@ -1,0 +1,260 @@
+
+> payment-reader-discord-bot@1.5.41 test
+> node --test
+
+TAP version 13
+# Subtest: account creation validates database payment evidence before it claims the checkout
+ok 1 - account creation validates database payment evidence before it claims the checkout
+  ---
+  duration_ms: 0.904155
+  type: 'test'
+  ...
+# Subtest: free coupon sessions require successful coupon consumption before proof is written
+ok 2 - free coupon sessions require successful coupon consumption before proof is written
+  ---
+  duration_ms: 0.390537
+  type: 'test'
+  ...
+# Subtest: ticket and order channel creation applies the panel channel category as parent
+ok 3 - ticket and order channel creation applies the panel channel category as parent
+  ---
+  duration_ms: 0.179314
+  type: 'test'
+  ...
+# Subtest: panel commands replace existing bot-owned panels instead of making duplicates
+ok 4 - panel commands replace existing bot-owned panels instead of making duplicates
+  ---
+  duration_ms: 0.333542
+  type: 'test'
+  ...
+# Subtest: allows a checkout only when transaction record is verified, used, and owned by buyer
+ok 5 - allows a checkout only when transaction record is verified, used, and owned by buyer
+  ---
+  duration_ms: 1.029129
+  type: 'test'
+  ...
+# Subtest: blocks a splash/button-only attempt with no verified transaction record
+ok 6 - blocks a splash/button-only attempt with no verified transaction record
+  ---
+  duration_ms: 0.157182
+  type: 'test'
+  ...
+# Subtest: blocks transaction proof that belongs to another buyer
+ok 7 - blocks transaction proof that belongs to another buyer
+  ---
+  duration_ms: 0.113718
+  type: 'test'
+  ...
+# Subtest: blocks paid-total mismatch and tampered totals
+ok 8 - blocks paid-total mismatch and tampered totals
+  ---
+  duration_ms: 0.098395
+  type: 'test'
+  ...
+# Subtest: blocks zero-price checkout unless a full-value coupon was actually consumed
+ok 9 - blocks zero-price checkout unless a full-value coupon was actually consumed
+  ---
+  duration_ms: 0.181819
+  type: 'test'
+  ...
+# Subtest: allows free checkout with matching full-value coupon consumption proof
+ok 10 - allows free checkout with matching full-value coupon consumption proof
+  ---
+  duration_ms: 1.314089
+  type: 'test'
+  ...
+# Subtest: blocks changed checkout price/discount that do not add up
+ok 11 - blocks changed checkout price/discount that do not add up
+  ---
+  duration_ms: 0.173856
+  type: 'test'
+  ...
+# Subtest: blocks a verified transaction from the wrong payment provider
+ok 12 - blocks a verified transaction from the wrong payment provider
+  ---
+  duration_ms: 0.108711
+  type: 'test'
+  ...
+# Subtest: offline payment requires a matching approved staff request
+ok 13 - offline payment requires a matching approved staff request
+  ---
+  duration_ms: 0.327454
+  type: 'test'
+  ...
+# Subtest: payment fingerprint changes when the session value changes after validation
+ok 14 - payment fingerprint changes when the session value changes after validation
+  ---
+  duration_ms: 0.374192
+  type: 'test'
+  ...
+# Subtest: ticket channel uses only a real parent category
+ok 15 - ticket channel uses only a real parent category
+  ---
+  duration_ms: 0.16254
+  type: 'test'
+  ...
+# Subtest: invite codes are random-url-safe bearer credentials
+ok 16 - invite codes are random-url-safe bearer credentials
+  ---
+  duration_ms: 1.946112
+  type: 'test'
+  ...
+# Subtest: LiveKit source values are numeric and no custom enum needs String coercion
+ok 17 - LiveKit source values are numeric and no custom enum needs String coercion
+  ---
+  duration_ms: 0.609129
+  type: 'test'
+  ...
+# Subtest: names and durations are bounded
+ok 18 - names and durations are bounded
+  ---
+  duration_ms: 0.254887
+  type: 'test'
+  ...
+# Subtest: invite base origin only accepts HTTPS exact allowlisted origins
+ok 19 - invite base origin only accepts HTTPS exact allowlisted origins
+  ---
+  duration_ms: 0.210521
+  type: 'test'
+  ...
+# Subtest: Radar message includes invite, counts and duration
+ok 20 - Radar message includes invite, counts and duration
+  ---
+  duration_ms: 0.313963
+  type: 'test'
+  ...
+# Subtest: only sendable text and announcement channels are eligible for radar pins
+ok 21 - only sendable text and announcement channels are eligible for radar pins
+  ---
+  duration_ms: 0.255768
+  type: 'test'
+  ...
+# Subtest: Admin Live Studio routes are protected by verified Firebase Admin sessions
+ok 22 - Admin Live Studio routes are protected by verified Firebase Admin sessions
+  ---
+  duration_ms: 1.609956
+  type: 'test'
+  ...
+# Subtest: LiveKit source grants are numeric values (avoids TrackSource enum string conversion error)
+ok 23 - LiveKit source grants are numeric values (avoids TrackSource enum string conversion error)
+  ---
+  duration_ms: 0.443515
+  type: 'test'
+  ...
+# Subtest: live invite and host URLs use the Blogger root while the Admin Panel origin is validated separately
+ok 24 - live invite and host URLs use the Blogger root while the Admin Panel origin is validated separately
+  ---
+  duration_ms: 0.199014
+  type: 'test'
+  ...
+# Subtest: custom duration is validated, persisted and auto-ends the room
+ok 25 - custom duration is validated, persisted and auto-ends the room
+  ---
+  duration_ms: 0.140437
+  type: 'test'
+  ...
+# Subtest: radar monitors screen sharing and all Discord voice channels, pins and removes session messages
+ok 26 - radar monitors screen sharing and all Discord voice channels, pins and removes session messages
+  ---
+  duration_ms: 0.190732
+  type: 'test'
+  ...
+# Subtest: invalid invite UI offers Admin Panel return and does not display a video watch-link
+ok 27 - invalid invite UI offers Admin Panel return and does not display a video watch-link
+  ---
+  duration_ms: 0.132696
+  type: 'test'
+  ...
+# Subtest: Admin Panel radar shows channel directory, participants, screen-share count and Discord controls
+ok 28 - Admin Panel radar shows channel directory, participants, screen-share count and Discord controls
+  ---
+  duration_ms: 0.225403
+  type: 'test'
+  ...
+# Subtest: existing transaction and payment panel features remain present
+ok 29 - existing transaction and payment panel features remain present
+  ---
+  duration_ms: 0.107288
+  type: 'test'
+  ...
+# Subtest: Blogger public status endpoint exposes only a minimal session payload and widget is no-refresh responsive
+ok 30 - Blogger public status endpoint exposes only a minimal session payload and widget is no-refresh responsive
+  ---
+  duration_ms: 0.54861
+  type: 'test'
+  ...
+# Subtest: Bot profile activity switches on for live sessions and restores configured presence on end
+ok 31 - Bot profile activity switches on for live sessions and restores configured presence on end
+  ---
+  duration_ms: 0.400891
+  type: 'test'
+  ...
+# Subtest: account updates use a narrow transaction for unchanged usernames and give distinct conflict errors
+ok 32 - account updates use a narrow transaction for unchanged usernames and give distinct conflict errors
+  ---
+  duration_ms: 0.194908
+  type: 'test'
+  ...
+# Subtest: looking up another account does not reuse stale form edits; password stays hidden unless replaced
+ok 33 - looking up another account does not reuse stale form edits; password stays hidden unless replaced
+  ---
+  duration_ms: 0.174818
+  type: 'test'
+  ...
+# Subtest: Admin Panel persists responsive dark/light theme toggle
+ok 34 - Admin Panel persists responsive dark/light theme toggle
+  ---
+  duration_ms: 0.09521
+  type: 'test'
+  ...
+# Subtest: membership account delivery references both DM and private support ticket and exposes DM failures
+ok 35 - membership account delivery references both DM and private support ticket and exposes DM failures
+  ---
+  duration_ms: 0.263689
+  type: 'test'
+  ...
+# Subtest: Blogger root theme embeds the Live Room app and reads root invite query
+ok 36 - Blogger root theme embeds the Live Room app and reads root invite query
+  ---
+  duration_ms: 0.254275
+  type: 'test'
+  ...
+# Subtest: only one fresh select_provider session can be claimed
+ok 37 - only one fresh select_provider session can be claimed
+  ---
+  duration_ms: 0.715305
+  type: 'test'
+  ...
+# Subtest: stale or tokenless legacy checking_reader status can be recovered
+ok 38 - stale or tokenless legacy checking_reader status can be recovered
+  ---
+  duration_ms: 0.117774
+  type: 'test'
+  ...
+# Subtest: fresh concurrent check cannot be reclaimed
+ok 39 - fresh concurrent check cannot be reclaimed
+  ---
+  duration_ms: 0.092606
+  type: 'test'
+  ...
+# Subtest: only the owner token can commit the result
+ok 40 - only the owner token can commit the result
+  ---
+  duration_ms: 0.158945
+  type: 'test'
+  ...
+# Subtest: failed owner releases the session to select_provider
+ok 41 - failed owner releases the session to select_provider
+  ---
+  duration_ms: 0.141358
+  type: 'test'
+  ...
+1..41
+# tests 41
+# suites 0
+# pass 41
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 235.934643
