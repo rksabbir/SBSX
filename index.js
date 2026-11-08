@@ -252,6 +252,7 @@ let ADMIN_BOT_CONFIG = {
     links: { verificationLink: "" },
     presence: { status: "online", activityType: "Watching", activityText: "Security & Verification" },
     moderators: { tickets: [], reports: [], orders: [], features: [], automod: [], community: [], panels: [], resellers: [] },
+    roleAutomation: { enabled: true, mode: "automatic", joinRoleIds: [], allowedRoleIds: [], levelRewards: [], removePreviousLevelRole: true, aiInsightsEnabled: true },
     compensation: { enabled: false, ticketClaimRateBdt: 0, ticketResolveRateBdt: 0, resellerCommissionEnabled: false, aiResellerCommissionEnabled: false, resellerBasePercent: 0, resellerMinPercent: 0, resellerMaxPercent: 20 },
     messages: {
         welcomeTitle: "🎉 নতুন সদস্য ট্র্যাকিং সিস্টেম",
@@ -908,6 +909,7 @@ db.ref("adminConfig/bot").on("value", (snapshot) => {
             roles: { ...(ADMIN_BOT_CONFIG.discord?.roles || {}), ...((root.discord || {}).roles || {}) }
         },
         moderators: { ...(ADMIN_BOT_CONFIG.moderators || {}), ...(root.moderators || {}) },
+        roleAutomation: { ...(ADMIN_BOT_CONFIG.roleAutomation || {}), ...(root.roleAutomation || {}) },
         compensation: { ...(ADMIN_BOT_CONFIG.compensation || {}), ...(root.compensation || {}) },
         communityAutomation: {
             ...(ADMIN_BOT_CONFIG.communityAutomation || {}), ...(root.communityAutomation || {}),
@@ -1070,6 +1072,49 @@ function getModeratorRoleIds(key, fallback = []) {
 function memberHasModeratorRole(member, key, fallback = []) {
     const ids = getModeratorRoleIds(key, fallback);
     return Boolean(member?.roles?.cache && ids.some(id => member.roles.cache.has(id)));
+}
+function getRoleAutomationSettings() {
+    const cfg = ADMIN_BOT_CONFIG.roleAutomation || {};
+    const ids = value => (Array.isArray(value) ? value : []).map(String).filter(id => /^\d{15,25}$/.test(id));
+    const joinRoleIds = [...new Set(ids(cfg.joinRoleIds))].slice(0, 20);
+    const legacyJoinRoleIds = ids(ADMIN_BOT_CONFIG.communityAutomation?.onboarding?.autoRoleIds);
+    const defaultLevelRoleId = String(getConfiguredRoleId("level") || "");
+    const allowedRoleIds = [...new Set([...ids(cfg.allowedRoleIds), ...joinRoleIds, ...legacyJoinRoleIds, ...(!Array.isArray(cfg.levelRewards) || cfg.levelRewards.length === 0 ? [defaultLevelRoleId] : [])].filter(id => /^\d{15,25}$/.test(id)))].slice(0, 50);
+    const levelRewards = (Array.isArray(cfg.levelRewards) ? cfg.levelRewards : []).map(item => ({ minLevel: Math.max(1, Math.min(1000, Math.floor(Number(item?.minLevel) || 1))), roleId: String(item?.roleId || "") }))
+        .filter(item => /^\d{15,25}$/.test(item.roleId)).slice(0, 50).sort((a, b) => a.minLevel - b.minLevel);
+    for (const item of levelRewards) if (!allowedRoleIds.includes(item.roleId)) allowedRoleIds.push(item.roleId);
+    return { enabled: cfg.enabled !== false, mode: cfg.mode === "manual" ? "manual" : "automatic", joinRoleIds, allowedRoleIds: allowedRoleIds.slice(0, 50), levelRewards, removePreviousLevelRole: cfg.removePreviousLevelRole !== false, aiInsightsEnabled: cfg.aiInsightsEnabled !== false };
+}
+async function applyConfiguredMemberRole(member, roleIdValue, action, source) {
+    const cfg = getRoleAutomationSettings(), roleId = String(roleIdValue || "");
+    if (!cfg.enabled || cfg.mode !== "automatic" || !cfg.allowedRoleIds.includes(roleId)) return false;
+    const guild = member?.guild, role = guild?.roles?.cache?.get(roleId) || await guild?.roles?.fetch(roleId).catch(() => null);
+    const botMember = guild?.members?.me || await guild?.members?.fetchMe().catch(() => null);
+    const guardedPermissions = [PermissionFlagsBits.Administrator, PermissionFlagsBits.ManageRoles, PermissionFlagsBits.ManageGuild, PermissionFlagsBits.ManageChannels];
+    if (!role || role.id === guild.id || role.managed || guardedPermissions.some(permission => role.permissions.has(permission)) || !botMember?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= botMember.roles.highest.position) return false;
+    const hasRole = member.roles.cache.has(role.id);
+    if ((action === "add" && hasRole) || (action === "remove" && !hasRole)) return false;
+    if (action === "add") await member.roles.add(role, `Approved automatic role rule: ${String(source || "role policy").slice(0, 100)}`);
+    else if (action === "remove") await member.roles.remove(role, `Approved automatic role rule: ${String(source || "role policy").slice(0, 100)}`);
+    else return false;
+    const event = { memberId: member.id, roleId: role.id, roleName: role.name.slice(0, 100), action, source: String(source || "role policy").slice(0, 100), mode: "automatic", createdAt: Date.now() };
+    await Promise.all([
+        db.ref("runtime/memberRoleAutomation/events").push(event).catch(() => {}),
+        db.ref(`runtime/memberRoleAutomation/roleStats/${role.id}/${action}Count`).transaction(value => (Number(value) || 0) + 1).catch(() => {}),
+        db.ref("auditLog").push({ adminUid: "automation", actionType: `automatic_role_${action}`, timestamp: event.createdAt, summary: `${action === "add" ? "Assigned" : "Removed"} role ${role.name} (${role.id}) for member ${member.id}; rule=${event.source}` }).catch(() => {})
+    ]);
+    return true;
+}
+async function syncAutomaticLevelRole(member, level) {
+    const cfg = getRoleAutomationSettings();
+    if (!cfg.enabled || cfg.mode !== "automatic") return;
+    const matched = cfg.levelRewards.filter(rule => rule.minLevel <= Math.max(1, Number(level) || 1)).at(-1);
+    const targetRoleId = matched?.roleId || (!cfg.levelRewards.length ? getConfiguredRoleId("level") : "");
+    if (targetRoleId) await applyConfiguredMemberRole(member, targetRoleId, "add", `level ${Math.max(1, Number(level) || 1)} reward`);
+    if (cfg.removePreviousLevelRole) {
+        const rewardIds = [...new Set([...cfg.levelRewards.map(rule => rule.roleId), ...(!cfg.levelRewards.length && getConfiguredRoleId("level") ? [getConfiguredRoleId("level")] : [])])];
+        for (const roleId of rewardIds) if (roleId !== targetRoleId && member.roles.cache.has(roleId)) await applyConfiguredMemberRole(member, roleId, "remove", `level ${Math.max(1, Number(level) || 1)} reward rotation`).catch(err => console.warn("Automatic level role cleanup failed:", err.message));
+    }
 }
 function ticketModeratorConfig(type) {
     if (type === "order") return { key: "orders", fallback: [getConfiguredRoleId("supportCustomer")] };
@@ -1609,7 +1654,7 @@ async function awardMessageXp(message) {
         await message.channel.send(formatBotMessage("levelUp", "🎉 অভিনন্দন <@{user}>! আপনি লেভেল **{level}** এ উন্নীত হয়েছেন।", { user: message.author.id, level: finalLevel }).slice(0, 1900))
             .then(m => setTimeout(() => m.delete().catch(() => {}), 5000))
             .catch(() => {});
-        await message.member.roles.add(getConfiguredRoleId("level")).catch(() => {});
+        await syncAutomaticLevelRole(message.member, finalLevel).catch(err => console.warn("Automatic level role update failed:", err.message));
     }
 }
 
@@ -3857,6 +3902,10 @@ client.on("guildMemberAdd", async member => {
     if (member.guild.id !== ALLOWED_GUILD_ID) return;
     recordCommunityMetric("joins").catch(() => {});
     const cfg = getCommunityAutomationConfig();
+    const roleAutomation = getRoleAutomationSettings();
+    const joinRoleIds = new Set(roleAutomation.enabled && roleAutomation.mode === "automatic" ? roleAutomation.joinRoleIds : []);
+    if (roleAutomation.enabled && roleAutomation.mode === "automatic" && isFeatureEnabled("smartOnboardingEnabled") && cfg.onboarding.enabled) cfg.onboarding.autoRoleIds.forEach(roleId => joinRoleIds.add(roleId));
+    for (const roleId of joinRoleIds) await applyConfiguredMemberRole(member, roleId, "add", "server join role policy").catch(err => console.warn("Automatic join role failed:", err.message));
     if (isFeatureEnabled("raidAlertEnabled") && cfg.raid.enabled) {
         const now = Date.now(), windowMs = cfg.raid.windowSeconds * 1000;
         communityJoinTimes.push(now);
@@ -3868,14 +3917,6 @@ client.on("guildMemberAdd", async member => {
     }
     if (!isFeatureEnabled("smartOnboardingEnabled") || !cfg.onboarding.enabled) return;
     try {
-        if (cfg.onboarding.autoRoleIds.length) {
-            const botMember = member.guild.members.me || await member.guild.members.fetchMe().catch(() => null);
-            for (const roleId of cfg.onboarding.autoRoleIds) {
-                const role = member.guild.roles.cache.get(roleId) || await member.guild.roles.fetch(roleId).catch(() => null);
-                if (!role || role.managed || role.permissions.has(PermissionFlagsBits.Administrator) || !botMember?.permissions.has(PermissionFlagsBits.ManageRoles) || role.position >= botMember.roles.highest.position) continue;
-                await member.roles.add(role, "Configured RKBACKLES smart onboarding role").catch(err => console.warn("Onboarding auto-role failed:", err.message));
-            }
-        }
         if (cfg.onboarding.dmEnabled) {
             const text = cfg.onboarding.dmTemplate.replaceAll("{server}", member.guild.name).replaceAll("{user}", member.user.username).slice(0, 1800);
             await member.send({ content: text, allowedMentions: { parse: [] } }).catch(() => {});
