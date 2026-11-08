@@ -1632,6 +1632,10 @@ client.on("messageDelete", async (message) => {
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(getConfiguredRoleId("admin"))) return;
+    if (memberHasModeratorRole(message.member, "automod", [])) {
+        if (isFeatureEnabled("levelingEnabled")) await awardMessageXp(message).catch(err => console.error("Moderator leveling XP failed:", err.message));
+        return;
+    }
     if (!isFeatureEnabled("automodEnabled")) {
         if (isFeatureEnabled("levelingEnabled")) await awardMessageXp(message).catch(err => console.error("Leveling XP failed:", err.message));
         return;
