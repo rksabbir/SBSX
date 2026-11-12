@@ -183,6 +183,10 @@ const TRUSTED_READER_UIDS = new Set(
     String(process.env.PAYMENT_READER_UIDS || "").split(",").map(value => value.trim()).filter(Boolean)
 );
 const READER_ONLINE_WINDOW_MS = Math.max(30_000, Number(process.env.READER_ONLINE_WINDOW_MS || 90_000));
+// Offline payment request limits (env-এ override করা যাবে)
+const OFFLINE_REQUEST_COOLDOWN_MS = Math.max(0, Number(process.env.OFFLINE_REQUEST_COOLDOWN_MS || 10 * 60 * 1000));
+const OFFLINE_MAX_OPEN_REQUESTS = Math.max(1, Math.min(5, Number(process.env.OFFLINE_MAX_OPEN_REQUESTS || 2)));
+const OFFLINE_REQUEST_TTL_MS = Math.max(60 * 60 * 1000, Number(process.env.OFFLINE_REQUEST_TTL_MS || 24 * 60 * 60 * 1000));
 const READER_RECHECK_COOLDOWN_MS = Math.max(10_000, Number(process.env.READER_RECHECK_COOLDOWN_MS || 15_000));
 const READER_AUTO_WATCH_INTERVAL_MS = Math.max(10_000, Number(process.env.READER_AUTO_WATCH_INTERVAL_MS || 15_000));
 const READER_AUTO_WATCH_TIMEOUT_MS = Math.max(60_000, Number(process.env.READER_AUTO_WATCH_TIMEOUT_MS || 300_000));
@@ -436,7 +440,11 @@ function buildPaymentPage(category, session, readerState, providerNumber) {
             .setTitle("⚠️ ONLINE CHECK — নম্বর সেট করা নেই")
             .setDescription(`Reader অনলাইন, কিন্তু ${providerLabel}-এর payment number server environment-এ সেট করা নেই। নিরাপত্তার জন্য কোনো নম্বর দেখানো হয়নি।`)
             .setColor("Orange").setTimestamp();
-        return { embeds: [embed], components: [] };
+        const configFallbackRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`offlinepay_request_${category}_${provider}`).setLabel("🧾 Offline payment request করুন").setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder().setCustomId(`offlinepay_status_${category}`).setLabel("🔄 Request status দেখুন").setStyle(ButtonStyle.Primary)
+        );
+        return { embeds: [embed], components: [configFallbackRow] };
     }
 
     const isPartial = totalPaid > 0;
@@ -495,10 +503,27 @@ app.use((req, res, next) => {
     return next();
 });
 app.get("/", (req, res) => { res.send("Bot is running!"); });
+// Panel-এর "Sync" বাটন এখানে হিট করে; একই কাজ bot-এর নিজস্ব sweep-ও করে।
 app.get("/api/cpp/health", (req, res) => {
     const origin = String(req.get("origin") || "");
     return res.json({ ok: true, service: "rkbackles-cpp-bridge", version: require("./package.json").version,
         panelOrigin: origin, corsAllowed: origin ? ADMIN_PANEL_ORIGINS.has(origin) : null });
+});
+
+app.post("/api/admin/offline-payment/sweep", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        await verifyAdminApiRequest(req);
+        const result = await sweepOfflinePaymentRequests();
+        return res.json({ ok: true, ...result, version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Offline sweep API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "sweep_failed" });
+    }
 });
 
 // Small in-memory per-IP limiter for the C++ credential endpoints. Do not log request bodies.
@@ -1935,6 +1960,50 @@ async function creditOfflineSessionFromRequest(requestId, request) {
         setTimeout(() => offlinePanelCreditedRequests.delete(requestId), 60_000).unref?.();
     }
 }
+// Approve/reject হলে ইউজারকে DM — status button চাপতে হবে না।
+async function notifyOfflineRequester(request, approved) {
+    const userId = String(request?.discordUserId || "");
+    if (!/^\d{15,25}$/.test(userId)) return;
+    const user = await client.users.fetch(userId).catch(() => null);
+    if (!user) return;
+    const category = String(request.category || "").toUpperCase();
+    const text = approved
+        ? `✅ আপনার offline payment approve হয়েছে।\n\n📦 প্যাকেজ: **${category}**\n💳 ${String(request.provider || "").toUpperCase()}\n💰 Credit: **${Number(request.approvedAmount) || 0} BDT**\n\nএখন Shop-এ একই package আবার select করলে অথবা checkout-এর "🔄 Request status" বাটনে চাপলে account credential তৈরির অপশন পাবেন। এই request আর নতুন করে পাঠানোর দরকার নেই।`
+        : `❌ আপনার offline payment request approve করা যায়নি।\n\n📦 প্যাকেজ: **${category}**\nকারণ: ${String(request.rejectReasonLabel || "Admin reject করেছেন")}${request.reviewNote ? `\n📝 ${request.reviewNote}` : ""}\n\nসঠিক তথ্য থাকলে আবার request দিন, অথবা Support-এ যোগাযোগ করুন।`;
+    await user.send({ content: text }).catch(() => {});
+}
+
+// কেউ status/approve না চাপলেও deadline-পেরোনো request expire হবে, আর staff reminder পাবে।
+async function sweepOfflinePaymentRequests() {
+    const snap = await db.ref("offline_payment_requests").once("value");
+    const now = Date.now();
+    const deadlineMs = getCheckoutSettings().sessionExpiryHours * 60 * 60 * 1000;
+    let expired = 0;
+    const reminders = [];
+    for (const [id, record] of Object.entries(snap.val() || {})) {
+        if (!record || !isOpenOfflineReviewStatus(record.status)) continue;
+        if (await expireStaleOfflineRequest(id, record)) { expired++; continue; }
+        const age = now - (Number(record.createdAt) || 0);
+        const ttl = Math.max(deadlineMs, OFFLINE_REQUEST_TTL_MS);
+        // deadline-এর ২৫% বাকি থাকলে একবার reminder — spam এড়াতে reminderAt দিয়ে গার্ড
+        if (age > ttl * 0.75 && !record.reminderSentAt) {
+            reminders.push({ id, record });
+        }
+    }
+    if (reminders.length) {
+        const channel = await client.channels.fetch(STAFF_ADMIN_LOG_ID).catch(() => null);
+        if (channel?.isTextBased?.()) {
+            for (const { id, record } of reminders) {
+                const deadlineAt = Math.floor(((Number(record.createdAt) || now) + Math.max(deadlineMs, OFFLINE_REQUEST_TTL_MS)) / 1000);
+                await channel.send({ content: `⏳ **Reminder:** offline payment request \`${id}\` (<@${record.discordUserId}>, ${record.category}, ${record.claimedAmount || record.amount} BDT) এখনো review হয়নি — deadline <t:${deadlineAt}:R>।` }).catch(() => {});
+                await db.ref(`offline_payment_requests/${id}`).update({ reminderSentAt: now }).catch(() => {});
+            }
+        }
+    }
+    if (expired) console.log(`[offlinepay] Sweep expired ${expired} stale request(s)`);
+    return { expired, reminded: reminders.length };
+}
+
 function registerOfflinePaymentRequestListener() {
     if (offlineRequestListenerRegistered) return;
     offlineRequestListenerRegistered = true;
@@ -2405,12 +2474,55 @@ client.on("interactionCreate", async (interaction) => {
     }
 
     // Offline payment requires explicit staff/admin approval after they verify the provider transaction manually.
+    // Offline payment requires explicit staff/admin approval after they verify the provider transaction manually.
+    // Step 1: collect TxnID + sender number + amount so staff can verify without asking the user again.
     if (interaction.isButton() && interaction.customId.startsWith("offlinepay_request_")) {
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const match = /^offlinepay_request_(.+)_(bkash|nagad)$/.exec(interaction.customId);
-        if (!match) return interaction.editReply("❌ Offline payment request invalid.");
+        if (!match) return interaction.reply({ content: "❌ Offline payment request invalid.", flags: [MessageFlags.Ephemeral] });
         const category = getNormalizedCategory(match[1]);
         const provider = match[2];
+        const modal = new ModalBuilder()
+            .setCustomId(`modal_offlinepay_${category}_${provider}`)
+            .setTitle("🧾 Offline Payment Request");
+        modal.addComponents(
+            new ActionRowBuilder().addComponents(new TextInputBuilder()
+                .setCustomId("offline_txnid").setLabel("Transaction ID (TxnID)")
+                .setPlaceholder("bKash/Nagad SMS-এ যে TxnID আছে").setStyle(TextInputStyle.Short)
+                .setMinLength(6).setMaxLength(40).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder()
+                .setCustomId("offline_sender").setLabel("যে নম্বর থেকে টাকা পাঠিয়েছেন")
+                .setPlaceholder("01XXXXXXXXX").setStyle(TextInputStyle.Short)
+                .setMinLength(11).setMaxLength(17).setRequired(true)),
+            new ActionRowBuilder().addComponents(new TextInputBuilder()
+                .setCustomId("offline_amount").setLabel("কত টাকা পাঠিয়েছেন (BDT)")
+                .setPlaceholder("যেমন 299").setStyle(TextInputStyle.Short)
+                .setMinLength(1).setMaxLength(10).setRequired(true))
+        );
+        return interaction.showModal(modal);
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_offlinepay_")) {
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const modalMatch = /^modal_offlinepay_(.+)_(bkash|nagad)$/.exec(interaction.customId);
+        if (!modalMatch) return interaction.editReply("❌ Offline payment request invalid.");
+        const category = getNormalizedCategory(modalMatch[1]);
+        const provider = modalMatch[2];
+        const txnId = normalizeTxnId(interaction.fields.getTextInputValue("offline_txnid"));
+        const senderNumber = normalizeSenderNumber(interaction.fields.getTextInputValue("offline_sender"));
+        const claimedAmount = parseAmount(interaction.fields.getTextInputValue("offline_amount"));
+        if (!txnId) return interaction.editReply("❌ TxnID ঠিক নয়। ৬–৪০ অক্ষরের ইংরেজি অক্ষর/সংখ্যা দিন (যেমন A1B2C3D4E5)।");
+        if (!senderNumber) return interaction.editReply("❌ নম্বরটা ঠিক নয়। বাংলাদেশি নম্বর দিন — যেমন 01XXXXXXXXX বা +8801XXXXXXXXX।");
+        if (!claimedAmount) return interaction.editReply("❌ টাকার পরিমাণ ঠিক নয়। শুধু সংখ্যা দিন (যেমন 299)।");
+
+        const txnSnap = await db.ref(`transactions/${txnId}`).once("value");
+        const txnRecord = txnSnap.val();
+        if (txnRecord && txnRecord.used === true && String(txnRecord.usedBy || "") !== interaction.user.id) {
+            return interaction.editReply("🚫 এই TxnID আগেই অন্য একটি অর্ডারে ব্যবহার হয়েছে। ভুল হলে Support-এ যোগাযোগ করুন।");
+        }
+        if (txnRecord && String(txnRecord.provider || "").toLowerCase() && String(txnRecord.provider || "").toLowerCase() !== provider) {
+            return interaction.editReply(`❌ এই TxnID ${String(txnRecord.provider).toUpperCase()}-এর, কিন্তু আপনি ${provider.toUpperCase()} নির্বাচন করেছেন। সঠিক provider বেছে আবার request দিন।`);
+        }
+
         const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
         const sessionSnap = await sessionRef.once("value");
         const session = sessionSnap.val();
@@ -2418,23 +2530,31 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply("⌛ এই checkout-এর মেয়াদ শেষ হয়ে গেছে। Shop থেকে নতুন করে package নির্বাচন করে আবার চেষ্টা করুন।");
         }
         if (session.provider !== provider || session.status !== "reader_offline") {
-            return interaction.editReply("⚠️ এই checkout এখন offline-payment request-এর জন্য প্রস্তুত নয়। Payment option আবার নির্বাচন করুন।");
+            return interaction.editReply("⚠️ এই checkout এখন offline-payment request-এর জন্য প্রস্তুত নয়। Payment option আবার নির্বাচন করুন।");
         }
         const existingSnap = await db.ref("offline_payment_requests").orderByChild("discordUserId").equalTo(interaction.user.id).once("value");
-        let existing = null;
+        const openRecords = [];
         for (const [openId, openRecord] of Object.entries(existingSnap.val() || {})) {
             if (!openRecord || openRecord.category !== category) continue;
             if (!isOpenOfflineReviewStatus(String(openRecord.status || ""))) continue;
             // মেয়াদোত্তীর্ণ request হলে expired করে দিন, যাতে নতুন request আটকে না থাকে।
             if (await expireStaleOfflineRequest(openId, openRecord)) continue;
-            existing = { ...openRecord, id: openRecord.id || openId };
-            break;
+            openRecords.push({ ...openRecord, id: openRecord.id || openId });
         }
-        if (existing) return interaction.editReply(`🕓 আপনার offline payment request ইতোমধ্যে pending আছে। Request ID: \`${existing.id}\``);
+        const gate = canUserCreateOfflineRequest({
+            existingRequests: openRecords, category, now: Date.now(),
+            cooldownMs: OFFLINE_REQUEST_COOLDOWN_MS, maxOpen: OFFLINE_MAX_OPEN_REQUESTS
+        });
+        if (!gate.allowed) {
+            if (gate.reason === "duplicate_category") return interaction.editReply(`🕓 এই প্যাকেজের জন্য আপনার একটি offline payment request ইতোমধ্যে pending আছে। Request ID: \`${gate.requestId}\``);
+            if (gate.reason === "too_many_open") return interaction.editReply("⚠️ আপনার একসাথে একাধিক offline payment request pending আছে। আগেরগুলো নিষ্পত্তি হওয়ার পর নতুন request দিন।");
+            return interaction.editReply(`🛡️ Spam protection: আবার offline request দেওয়ার আগে ${Math.ceil((gate.retryAfterMs || 0) / 60000)} মিনিট অপেক্ষা করুন।`);
+        }
         const reqRef = db.ref("offline_payment_requests").push();
         const requestData = {
             id: reqRef.key, discordUserId: interaction.user.id, discordUsername: interaction.user.username,
             category, provider, amount: Number(session.targetPrice) || 0, status: "pending",
+            txnId, senderNumber, claimedAmount,
             createdAt: Date.now(), checkoutKey: `${interaction.user.id}_${category}`, guildId: interaction.guild.id
         };
         await reqRef.set(requestData);
@@ -2453,10 +2573,14 @@ client.on("interactionCreate", async (interaction) => {
             .setDescription(`**User:** <@${interaction.user.id}> (\`${interaction.user.id}\`)
 **Package:** ${category}
 **Provider:** ${provider.toUpperCase()}
-**Amount:** ${requestData.amount} BDT
+**Package price:** ${requestData.amount} BDT
+**User বলেছেন পাঠিয়েছেন:** ${claimedAmount} BDT
+**TxnID:** \`${txnId}\`
+**Sender number:** \`${senderNumber}\`
 **Request ID:** \`${reqRef.key}\`
+**Deadline:** <t:${Math.floor((requestData.createdAt + OFFLINE_REQUEST_TTL_MS) / 1000)}:R>
 
-Approve করার আগে official bKash/Nagad transaction history নিজে যাচাই করুন। Reader evidence না থাকলে bot payment verify করেছে বলে গণ্য হবে না।`)
+Approve করার আগে official bKash/Nagad transaction history-তে এই TxnID ও টাকার পরিমাণ নিজে যাচাই করুন। Reader evidence না থাকলে bot payment verify করেছে বলে গণ্য হবে না।`)
             .setColor("Orange").setTimestamp();
         await staffChannel.send({ embeds: [reviewEmbed], components: [approvalRow] });
         return interaction.editReply("🕓 Offline payment request Admin/Staff-এর কাছে পাঠানো হয়েছে। Official transaction যাচাই করে approve না করা পর্যন্ত account তৈরি করা যাবে না।");
@@ -2469,12 +2593,24 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         const session = sessionSnap.val();
         if (!session) return interaction.editReply("কোনো checkout session পাওয়া যায়নি। Shop থেকে package নির্বাচন করুন।");
         if (session.status === "offline_payment_approved") {
+            const paid = Number(session.totalPaid) || 0;
+            const target_ = Number(session.targetPrice) || 0;
+            if (paid > 0 && target_ > 0 && paid + 0.009 < target_) {
+                const partialRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Account credential তৈরি করুন").setStyle(ButtonStyle.Secondary));
+                return interaction.editReply({ content: `⚠️ আংশিক পেমেন্ট approve হয়েছে — **${paid} / ${target_} BDT**। বাকি ${Math.max(0, target_ - paid)} BDT পরিশোধ না হওয়া পর্যন্ত সম্পূর্ণ অ্যাক্সেস নাও পেতে পারেন।`, components: [partialRow] });
+            }
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success));
             return interaction.editReply({ content: "✅ Admin/Staff offline payment approve করেছেন। নিচের বাটনে username/password তৈরি করুন।", components: [row] });
         }
         if (session.status === "expired") return interaction.editReply("⌛ এই checkout-এর মেয়াদ শেষ হয়ে গেছে, তাই offline payment request-ও বাতিল হয়েছে। Shop থেকে নতুন করে package নির্বাচন করুন।");
         if (session.status === "offline_payment_requested") return interaction.editReply("🕓 Offline payment request এখনও Admin/Staff review-এর অপেক্ষায় আছে।");
-        if (session.status === "offline_payment_rejected") return interaction.editReply("❌ Offline payment request reject করা হয়েছে। সঠিক payment proof থাকলে staff-এর সঙ্গে যোগাযোগ করুন।");
+        if (session.status === "offline_payment_rejected") {
+            const rejectedRecord = session.offlinePaymentRequestId
+                ? (await db.ref(`offline_payment_requests/${session.offlinePaymentRequestId}`).once("value")).val()
+                : null;
+            const outcome = describeOfflineOutcome(rejectedRecord);
+            return interaction.editReply(`${outcome || "❌ Offline payment request reject করা হয়েছে।"}\n\nসঠিক payment proof থাকলে আবার request দিন অথবা Support-এ যোগাযোগ করুন।`);
+        }
         if (session.status === "offline_payment_request_expired") return interaction.editReply("⌛ Offline payment request-এর মেয়াদ শেষ (staff নির্ধারিত সময়ের মধ্যে review করতে পারেননি)। Shop থেকে নতুন request দিন।");
         return interaction.editReply("ℹ️ কোনো pending offline payment request নেই। Reader offline হলে payment option থেকে Offline payment request বেছে নিন।");
     }
@@ -2484,23 +2620,63 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin"))
             || memberHasModeratorRole(interaction.member, "orders", [getConfiguredRoleId("supportCustomer")]);
         if (!isApprover) return interaction.reply({ content: "❌ শুধু অনুমোদিত Admin/Staff offline payment request review করতে পারবেন।", flags: [MessageFlags.Ephemeral] });
-        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
         const match = /^offlinepay_(approve|reject)_(.+)$/.exec(interaction.customId);
         const action = match[1]; const requestId = match[2];
+        // Approve: staff records how much money actually arrived. Reject: staff records why.
+        const modal = new ModalBuilder()
+            .setCustomId(`modal_offline${action}_${requestId}`)
+            .setTitle(action === "approve" ? "✅ Approve Offline Payment" : "❌ Reject Offline Payment");
+        if (action === "approve") {
+            modal.addComponents(new ActionRowBuilder().addComponents(new TextInputBuilder()
+                .setCustomId("approved_amount").setLabel("Provider history-তে যত টাকা পেয়েছেন (BDT)")
+                .setPlaceholder("যেমন 299").setStyle(TextInputStyle.Short)
+                .setMinLength(1).setMaxLength(10).setRequired(true)));
+        } else {
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder()
+                    .setCustomId("reject_reason").setLabel("কারণ কোড")
+                    .setPlaceholder("txn_not_found / amount_mismatch / duplicate_txn / wrong_provider / old_transaction / other")
+                    .setStyle(TextInputStyle.Short).setMinLength(3).setMaxLength(40).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder()
+                    .setCustomId("reject_note").setLabel("নোট (User দেখতে পাবে, ইচ্ছাধীন)")
+                    .setPlaceholder("সংক্ষেপে কারণ লিখুন").setStyle(TextInputStyle.Paragraph)
+                    .setMaxLength(300).setRequired(false)))
+        }
+        return interaction.showModal(modal);
+    }
+
+    if (interaction.isModalSubmit() && /^modal_offline(approve|reject)_/.test(interaction.customId)) {
+        const modalMatch = /^modal_offline(approve|reject)_(.+)$/.exec(interaction.customId);
+        const action = modalMatch[1] === "approve" ? "approve" : "reject";
+        const requestId = modalMatch[2];
+        const isApprover = interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)
+            || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin"))
+            || memberHasModeratorRole(interaction.member, "orders", [getConfiguredRoleId("supportCustomer")]);
+        if (!isApprover) return interaction.reply({ content: "❌ শুধু অনুমোদিত Admin/Staff offline payment request review করতে পারবেন।", flags: [MessageFlags.Ephemeral] });
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const approvedAmountInput = action === "approve" ? parseAmount(interaction.fields.getTextInputValue("approved_amount")) : null;
+        if (action === "approve" && !approvedAmountInput) return interaction.editReply("❌ টাকার পরিমাণ ঠিক নয়। শুধু সংখ্যা দিন (যেমন 299)।");
+        const rejectInfo = action === "reject"
+            ? normalizeRejectReason(interaction.fields.getTextInputValue("reject_reason"), interaction.fields.getTextInputValue("reject_note"))
+            : null;
         const reqRef = db.ref(`offline_payment_requests/${requestId}`);
         const actorTag = `<@${interaction.user.id}>`;
         const whoReviewed = describeReviewer;
         const reviewedWhen = describeReviewedAt;
         // Session approve idempotent: already approved with same requestId = success (no-op).
-        const approveSession = async (checkoutKey) => {
+        const approveSession = async (checkoutKey, creditAmount) => {
             const sessionRef = db.ref(`pending_payments/${checkoutKey}`);
             const result = await sessionRef.transaction(current => {
                 if (!current) return;
                 if (current.status === "offline_payment_approved" && current.offlinePaymentRequestId === requestId) return current;
                 if (current.status !== "offline_payment_requested" || current.offlinePaymentRequestId !== requestId) return;
-                const amount = Math.max(0, Number(current.targetPrice) || 0);
-                return { ...current, status: "offline_payment_approved", totalPaid: amount,
-                    usedTxns: [...(Array.isArray(current.usedTxns) ? current.usedTxns : []), `OFFLINE_ADMIN_APPROVED:${requestId}`],
+                const target = Math.max(0, Number(current.targetPrice) || 0);
+                const alreadyPaid = Math.max(0, Number(current.totalPaid) || 0);
+                const credit = Math.min(Math.max(0, Number(creditAmount) || 0), Math.max(0, target - alreadyPaid));
+                if (credit <= 0) return;
+                const markers = [...(Array.isArray(current.usedTxns) ? current.usedTxns : []), `OFFLINE_ADMIN_APPROVED:${requestId}`];
+                return { ...current, status: "offline_payment_approved", totalPaid: alreadyPaid + credit,
+                    usedTxns: markers,
                     offlineApprovedBy: interaction.user.id, offlineApprovedAt: Date.now(), offlinePaymentRequestId: requestId };
             }, undefined, false);
             return result.committed;
@@ -2515,7 +2691,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         // Already approved (by any admin): approving again is a safe no-op, rejecting is blocked.
         if (existing.status === "approved" || existing.status === "approved_but_session_changed") {
             if (action === "approve") {
-                const healed = await approveSession(existing.checkoutKey);
+                const healed = await approveSession(existing.checkoutKey, Number(existing.approvedAmount) || Number(existing.amount) || 0);
                 if (healed) {
                     await reqRef.update({ status: "approved", sessionCreditedAt: Date.now(), updatedAt: Date.now() });
                     await interaction.message.edit({ components: [] }).catch(() => {});
@@ -2546,10 +2722,38 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             console.error(`[offlinepay] Unexpected status: ${existing.status} requestId=${requestId} action=${action}`);
             return interaction.editReply(`⚠️ এই request-এর status \`${existing.status}\` — review করা যাচ্ছে না।`);
         }
+        // Approve করলে আগে যাচাই: TxnID অন্য কোথাও used কিনা, আর টাকার পরিমাণ ঠিক আছে কিনা।
+        let approvalPlan = null;
+        if (action === "approve") {
+            const checkoutSettings = getCheckoutSettings();
+            let txnAlreadyUsed = false;
+            if (existing.txnId) {
+                const txnRecord = (await db.ref(`transactions/${existing.txnId}`).once("value")).val();
+                txnAlreadyUsed = Boolean(txnRecord && txnRecord.used === true &&
+                    String(txnRecord.usedBy || "") !== String(existing.discordUserId || ""));
+            }
+            const plan = validateOfflineApproval({
+                request: existing,
+                targetPrice: Number(existing.amount) || 0,
+                amountReceived: approvedAmountInput,
+                allowPartialPayments: checkoutSettings.allowPartialPayments !== false,
+                txnAlreadyUsed
+            });
+            if (!plan.ok) {
+                if (plan.reason === "duplicate_txn") return interaction.editReply(`🚫 এই TxnID (\`${existing.txnId}\`) আগেই অন্য একটি অর্ডারে ব্যবহার হয়েছে। approve করা যাবে না — reject করুন।`);
+                if (plan.reason === "partial_not_allowed") return interaction.editReply(`⚠️ Admin partial payment বন্ধ রেখেছেন। প্রাপ্ত ${plan.credit} BDT, প্রয়োজন ${plan.target} BDT। পুরো টাকা না পাওয়া পর্যন্ত approve করা যাবে না।`);
+                return interaction.editReply(`⚠️ এই request approve করা যাচ্ছে না (${plan.reason})।`);
+            }
+            approvalPlan = plan;
+        }
         const claim = await reqRef.transaction(current => {
             if (!current || !isOpenOfflineReviewStatus(String(current.status || ""))) return;
-            return { ...current, status: action === "approve" ? "approved" : "rejected", reviewedBy: interaction.user.id,
-                reviewedByUsername: interaction.user.username, reviewedAt: Date.now() };
+            const base = { ...current, status: action === "approve" ? "approved" : "rejected",
+                reviewedBy: interaction.user.id, reviewedByUsername: interaction.user.username, reviewedAt: Date.now() };
+            if (action === "approve") {
+                return { ...base, approvedAmount: approvalPlan.credit, approvedByStaffTag: actorTag };
+            }
+            return { ...base, rejectReasonCode: rejectInfo.reasonCode, rejectReasonLabel: rejectInfo.reasonLabel, reviewNote: rejectInfo.note };
         }, undefined, false);
         if (!claim.committed) {
             const retrySnap = await reqRef.once("value");
@@ -2558,7 +2762,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             if (!retryVal) return interaction.editReply(`⚠️ এই request আর পাওয়া যাচ্ছে না (Request ID: \`${requestId}\`)।`);
             if (retryVal.status === "approved" || retryVal.status === "approved_but_session_changed") {
                 if (action === "approve") {
-                    const healed = await approveSession(retryVal.checkoutKey);
+                    const healed = await approveSession(retryVal.checkoutKey, Number(retryVal.approvedAmount) || Number(retryVal.amount) || 0);
                     if (healed) {
                         await reqRef.update({ status: "approved", sessionCreditedAt: Date.now(), updatedAt: Date.now() });
                         await interaction.message.edit({ components: [] }).catch(() => {});
@@ -2581,18 +2785,37 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         const request = claim.snapshot.val();
         const sessionRef = db.ref(`pending_payments/${request.checkoutKey}`);
         if (action === "approve") {
-            const approved = await approveSession(request.checkoutKey);
+            const approved = await approveSession(request.checkoutKey, Number(request.approvedAmount) || Number(request.amount) || 0);
             if (!approved) {
                 await reqRef.update({ status: "approved_but_session_changed", updatedAt: Date.now() });
                 const currentStatus = String((await sessionRef.once("value")).val()?.status || "missing");
                 return interaction.editReply(`⚠️ Request approve হয়েছে (${actorTag}), কিন্তু checkout session আর মেলেনি — session টি এখন \`${currentStatus}\`। Account credit করা হয়নি; Firebase-এ যাচাই করুন।`);
             }
+            // TxnID টা claim করা হয়, যাতে একই transaction দিয়ে দ্বিতীয়বার credit না হয়।
+            if (request.txnId) {
+                const now = Date.now();
+                const txnClaim = await db.ref(`transactions/${request.txnId}`).transaction(current => {
+                    if (current && current.used === true &&
+                        String(current.usedBy || "") !== String(request.discordUserId || "")) return;
+                    return { ...(current || {}), transactionId: request.txnId, provider: request.provider,
+                        amount: Number(request.approvedAmount) || Number(request.claimedAmount) || 0, currency: "BDT",
+                        used: true, usedBy: request.discordUserId, usedAt: now,
+                        verificationStatus: "verified", verificationSource: "manual_admin_review",
+                        reviewedBy: interaction.user.id, reviewedAt: now, offlinePaymentRequestId: requestId };
+                }, undefined, false);
+                if (!txnClaim.committed) {
+                    await reqRef.update({ status: "approved_but_txn_duplicate", updatedAt: Date.now() }).catch(() => {});
+                    return interaction.editReply(`🚫 এই TxnID (\`${request.txnId}\`) এইমাত্র অন্য একটি অর্ডারে ব্যবহৃত হয়েছে। Account credit করা হয়নি — Firebase-এ যাচাই করুন।`);
+                }
+            }
             await reqRef.update({ sessionCreditedAt: Date.now() }).catch(() => {});
-            await interaction.editReply(`✅ Offline payment request approve করা হয়েছে (${actorTag})। User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।`);
+            await notifyOfflineRequester(request, true).catch(() => {});
+            await interaction.editReply(`✅ Offline payment request approve করা হয়েছে (${actorTag})। ${Number(request.approvedAmount)} BDT credit হয়েছে; User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।`);
         } else {
             await sessionRef.transaction(current => current?.offlinePaymentRequestId === requestId && current.status === "offline_payment_requested"
                 ? { ...current, status: "offline_payment_rejected", offlineRejectedBy: interaction.user.id, offlineRejectedAt: Date.now() } : undefined, undefined, false);
-            await interaction.editReply(`❌ Offline payment request reject করা হয়েছে (${actorTag})।`);
+            await notifyOfflineRequester(request, false).catch(() => {});
+            await interaction.editReply(`❌ Offline payment request reject করা হয়েছে (${actorTag}) — কারণ: ${rejectInfo.reasonLabel}`);
         }
         await interaction.message.edit({ components: [] }).catch(() => {});
         return;
@@ -2713,6 +2936,23 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             const session = snap.val();
             if (!session || !["reader_offline", "number_not_configured", "awaiting_txn", "pending"].includes(session.status) || !["bkash", "nagad"].includes(String(session.provider || ""))) {
                 return interaction.editReply({ content: "❌ সক্রিয় payment session পাওয়া যায়নি। Shop থেকে package নির্বাচন করুন।", embeds: [], components: [] });
+            }
+            // If the Reader came back while an offline request is still open, tell the user they can
+            // switch to the normal auto-verified path instead of waiting for staff.
+            if (["offline_payment_requested", "offline_payment_approved", "offline_payment_rejected"].includes(String(session.status || ""))) {
+                const openRequestId = String(session.offlinePaymentRequestId || "");
+                if (openRequestId) {
+                    const record = (await db.ref(`offline_payment_requests/${openRequestId}`).once("value")).val();
+                    if (record && isOpenOfflineReviewStatus(record.status)) {
+                        const readerNow = await getPaymentReaderState();
+                        if (readerNow.online) {
+                            const hintRow = new ActionRowBuilder().addComponents(
+                                new ButtonBuilder().setCustomId(`offlinepay_status_${category}`).setLabel("🔄 Request status").setStyle(ButtonStyle.Primary)
+                            );
+                            return interaction.editReply({ content: `✅ Reader এখন অনলাইন! আপনার offline request \`${openRequestId}\` এখনো review-এর অপেক্ষায় আছে, কিন্তু এখন আপনি চাইলে **স্বাভাবিক (auto-verify) পথে** payment করে সাথে সাথে account পেতে পারেন।`, components: [hintRow] });
+                        }
+                    }
+                }
             }
             const storedCheckAt = Number(session.lastReaderCheckAt) || 0;
             if (storedCheckAt > 0 && (now - storedCheckAt) < READER_RECHECK_COOLDOWN_MS) {
@@ -4354,6 +4594,9 @@ client.on("ready", async () => {
     setBotPresence();
     registerCouponRequestListener();
     registerOfflinePaymentRequestListener();
+    if (offlineSweepTimer) clearInterval(offlineSweepTimer);
+    offlineSweepTimer = setInterval(() => sweepOfflinePaymentRequests().catch(err => console.error("Offline sweep failed:", err.message)), 15 * 60 * 1000);
+    setTimeout(() => sweepOfflinePaymentRequests().catch(() => {}), 60_000);
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message));
     heartbeatTimer = setInterval(() => publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message)), 30_000);
@@ -4419,6 +4662,7 @@ async function processCouponRequest(requestId, request) {
 
 let couponRequestListenerRegistered = false;
 let offlineRequestListenerRegistered = false;
+let offlineSweepTimer = null;
 function registerCouponRequestListener() {
     if (couponRequestListenerRegistered) return;
     couponRequestListenerRegistered = true;
