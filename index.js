@@ -1893,6 +1893,59 @@ async function expireStaleOfflineRequest(requestId, request) {
 }
 
 
+// Admin Panel থেকে approve করা request-এর checkout session credit করে।
+// Panel শুধু offline_payment_requests/{id}.status লেখে (pending_payments-এ admin write বন্ধ),
+// তাই session credit করার কাজটা service account-চালিত bot করে — যাতে একই credit দুইবার না হয়।
+const offlinePanelCreditedRequests = new Set();
+async function creditOfflineSessionFromRequest(requestId, request) {
+    if (!request || String(request.status || "") !== "approved") return false;
+    if (request.sessionCreditedAt) return false;
+    if (offlinePanelCreditedRequests.has(requestId)) return false;
+    const checkoutKey = String(request.checkoutKey || "");
+    if (!checkoutKey) return false;
+    const reqRef = db.ref(`offline_payment_requests/${requestId}`);
+    offlinePanelCreditedRequests.add(requestId);
+    try {
+        const result = await db.ref(`pending_payments/${checkoutKey}`).transaction(current => {
+            if (!current) return;
+            if (current.offlinePaymentRequestId !== requestId) return;
+            if (current.status === "offline_payment_approved") return current;
+            if (current.status !== "offline_payment_requested") return;
+            const amount = Math.max(0, Number(current.targetPrice) || 0);
+            return { ...current, status: "offline_payment_approved", totalPaid: amount,
+                usedTxns: [...(Array.isArray(current.usedTxns) ? current.usedTxns : []), `OFFLINE_ADMIN_APPROVED:${requestId}`],
+                offlineApprovedBy: request.reviewedBy || "admin-panel", offlineApprovedAt: Date.now(),
+                offlinePaymentRequestId: requestId };
+        }, undefined, false);
+        if (result.committed) {
+            await reqRef.update({ sessionCreditedAt: Date.now(), updatedAt: Date.now() }).catch(() => {});
+            console.log(`[offlinepay] Panel-approved request ${requestId} credited session ${checkoutKey}`);
+            return true;
+        }
+        // Already credited or session changed — mark only when the session really matches this request.
+        const session = (await db.ref(`pending_payments/${checkoutKey}`).once("value")).val();
+        if (session && session.offlinePaymentRequestId === requestId && session.status === "offline_payment_approved") {
+            await reqRef.update({ sessionCreditedAt: Date.now() }).catch(() => {});
+        } else if (session) {
+            await reqRef.update({ status: "approved_but_session_changed", updatedAt: Date.now() }).catch(() => {});
+            console.warn(`[offlinepay] Request ${requestId} approved by panel but session ${checkoutKey} is ${session.status}`);
+        }
+        return false;
+    } finally {
+        setTimeout(() => offlinePanelCreditedRequests.delete(requestId), 60_000).unref?.();
+    }
+}
+function registerOfflinePaymentRequestListener() {
+    if (offlineRequestListenerRegistered) return;
+    offlineRequestListenerRegistered = true;
+    const handler = snap => creditOfflineSessionFromRequest(snap.key, snap.val())
+        .catch(err => console.error(`[offlinepay] Panel sync failed for ${snap.key}: ${err.message}`));
+    db.ref("offline_payment_requests").orderByChild("status").equalTo("approved").on("child_added", handler);
+    db.ref("offline_payment_requests").orderByChild("status").equalTo("approved").on("child_changed", handler);
+    console.log("[offlinepay] Admin Panel approval listener active");
+}
+
+
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
@@ -2464,7 +2517,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             if (action === "approve") {
                 const healed = await approveSession(existing.checkoutKey);
                 if (healed) {
-                    if (existing.status === "approved_but_session_changed") await reqRef.update({ status: "approved", updatedAt: Date.now() });
+                    await reqRef.update({ status: "approved", sessionCreditedAt: Date.now(), updatedAt: Date.now() });
                     await interaction.message.edit({ components: [] }).catch(() => {});
                     return interaction.editReply(`✅ এই request আগেই ${whoReviewed(existing)} approve করেছেন${reviewedWhen(existing)}। আপনি (${actorTag}) আবার যাচাই করে approve নিশ্চিত করেছেন — User এখন account তৈরি করতে পারবেন।`);
                 }
@@ -2507,7 +2560,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
                 if (action === "approve") {
                     const healed = await approveSession(retryVal.checkoutKey);
                     if (healed) {
-                        if (retryVal.status === "approved_but_session_changed") await reqRef.update({ status: "approved", updatedAt: Date.now() });
+                        await reqRef.update({ status: "approved", sessionCreditedAt: Date.now(), updatedAt: Date.now() });
                         await interaction.message.edit({ components: [] }).catch(() => {});
                         return interaction.editReply(`✅ এই request আগেই ${whoReviewed(retryVal)} approve করেছেন${reviewedWhen(retryVal)}। আপনি (${actorTag}) আবার যাচাই করে approve নিশ্চিত করেছেন।`);
                     }
@@ -2534,6 +2587,7 @@ Approve করার আগে official bKash/Nagad transaction history নি�
                 const currentStatus = String((await sessionRef.once("value")).val()?.status || "missing");
                 return interaction.editReply(`⚠️ Request approve হয়েছে (${actorTag}), কিন্তু checkout session আর মেলেনি — session টি এখন \`${currentStatus}\`। Account credit করা হয়নি; Firebase-এ যাচাই করুন।`);
             }
+            await reqRef.update({ sessionCreditedAt: Date.now() }).catch(() => {});
             await interaction.editReply(`✅ Offline payment request approve করা হয়েছে (${actorTag})। User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।`);
         } else {
             await sessionRef.transaction(current => current?.offlinePaymentRequestId === requestId && current.status === "offline_payment_requested"
@@ -4299,6 +4353,7 @@ client.on("ready", async () => {
     console.log(`🤖 Logged in as ${client.user.tag}!`);
     setBotPresence();
     registerCouponRequestListener();
+    registerOfflinePaymentRequestListener();
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message));
     heartbeatTimer = setInterval(() => publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message)), 30_000);
@@ -4363,6 +4418,7 @@ async function processCouponRequest(requestId, request) {
 }
 
 let couponRequestListenerRegistered = false;
+let offlineRequestListenerRegistered = false;
 function registerCouponRequestListener() {
     if (couponRequestListenerRegistered) return;
     couponRequestListenerRegistered = true;
