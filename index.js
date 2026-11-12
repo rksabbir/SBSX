@@ -2399,35 +2399,95 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         const match = /^offlinepay_(approve|reject)_(.+)$/.exec(interaction.customId);
         const action = match[1]; const requestId = match[2];
         const reqRef = db.ref(`offline_payment_requests/${requestId}`);
-        const claim = await reqRef.transaction(current => {
-            if (!current || current.status !== "pending") return;
-            return { ...current, status: action === "approve" ? "approved" : "rejected", reviewedBy: interaction.user.id, reviewedAt: Date.now() };
-        }, undefined, false);
-        if (!claim.committed) return interaction.editReply("⚠️ এই request আগেই review হয়েছে অথবা আর পাওয়া যাচ্ছে না।");
-        const request = claim.snapshot.val();
-        const sessionRef = db.ref(`pending_payments/${request.checkoutKey}`);
-        if (action === "approve") {
-            const approved = await sessionRef.transaction(current => {
-                if (!current || current.status !== "offline_payment_requested" || current.offlinePaymentRequestId !== requestId) return;
+        // Session approve idempotent: already approved with same requestId = success (no-op).
+        const approveSession = async (checkoutKey) => {
+            const sessionRef = db.ref(`pending_payments/${checkoutKey}`);
+            const result = await sessionRef.transaction(current => {
+                if (!current) return;
+                if (current.status === "offline_payment_approved" && current.offlinePaymentRequestId === requestId) return current;
+                if (current.status !== "offline_payment_requested" || current.offlinePaymentRequestId !== requestId) return;
                 const amount = Math.max(0, Number(current.targetPrice) || 0);
                 return { ...current, status: "offline_payment_approved", totalPaid: amount,
                     usedTxns: [...(Array.isArray(current.usedTxns) ? current.usedTxns : []), `OFFLINE_ADMIN_APPROVED:${requestId}`],
                     offlineApprovedBy: interaction.user.id, offlineApprovedAt: Date.now(), offlinePaymentRequestId: requestId };
             }, undefined, false);
-            if (!approved.committed) {
-                await reqRef.update({ status: "approved_but_session_changed", updatedAt: Date.now() });
-                return interaction.editReply("⚠️ Request approve হয়েছে, কিন্তু checkout session আর মেলেনি। Account credit করা হয়নি; Admin-কে session যাচাই করতে হবে।");
+            return result.committed;
+        };
+        // Read first for specific handling + self-heal (request approved but session stuck in requested).
+        const snap = await reqRef.once("value");
+        const existing = snap.val();
+        if (!existing) {
+            console.error(`[offlinepay] Request not found: ${requestId} action=${action} by=${interaction.user.id}`);
+            return interaction.editReply(`⚠️ এই request পাওয়া যাচ্ছে না। Request ID: \`${requestId}\` — Firebase-এ রেকর্ড ডিলিট হয়েছে কিনা যাচাই করুন।`);
+        }
+        if (existing.status === "approved" || existing.status === "approved_but_session_changed") {
+            if (action === "approve") {
+                const healed = await approveSession(existing.checkoutKey);
+                if (healed) {
+                    if (existing.status === "approved_but_session_changed") await reqRef.update({ status: "approved", updatedAt: Date.now() });
+                    await interaction.message.edit({ components: [] }).catch(() => {});
+                    return interaction.editReply("✅ এই request আগেই approve করা হয়েছিল। Session আবার যাচাই করে approve নিশ্চিত করা হয়েছে। User এখন account তৈরি করতে পারবেন।");
+                }
+                return interaction.editReply("⚠️ Request approve আছে, কিন্তু checkout session আর মেলেনি। Admin-কে Firebase-এ session যাচাই করতে হবে।");
             }
-            await interaction.editReply("✅ Offline payment request approve করা হয়েছে। User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।");
+            await interaction.message.edit({ components: [] }).catch(() => {});
+            return interaction.editReply("⚠️ এই request আগেই approve করা হয়েছে, এখন reject করা যাবে না।");
+        }
+        if (existing.status === "rejected") {
+            await interaction.message.edit({ components: [] }).catch(() => {});
+            return interaction.editReply("⚠️ এই request আগেই reject করা হয়েছে।");
+        }
+        if (existing.status === "needs_staff_channel") {
+            return interaction.editReply("⚠️ এই request-এর staff channel পাওয়া যায়নি। Admin-কে STAFF_ADMIN_LOG_ID যাচাই করতে হবে।");
+        }
+        if (existing.status !== "pending") {
+            console.error(`[offlinepay] Unexpected status: ${existing.status} requestId=${requestId} action=${action}`);
+            return interaction.editReply(`⚠️ এই request-এর status \`${existing.status}\` — review করা যাচ্ছে না।`);
+        }
+        const claim = await reqRef.transaction(current => {
+            if (!current || current.status !== "pending") return;
+            return { ...current, status: action === "approve" ? "approved" : "rejected", reviewedBy: interaction.user.id, reviewedAt: Date.now() };
+        }, undefined, false);
+        if (!claim.committed) {
+            const retrySnap = await reqRef.once("value");
+            const retryVal = retrySnap.val();
+            console.error(`[offlinepay] Claim race: requestId=${requestId} status=${retryVal?.status} action=${action}`);
+            if (retryVal?.status === "approved" || retryVal?.status === "approved_but_session_changed") {
+                if (action === "approve") {
+                    const healed = await approveSession(retryVal.checkoutKey);
+                    if (healed) {
+                        if (retryVal.status === "approved_but_session_changed") await reqRef.update({ status: "approved", updatedAt: Date.now() });
+                        await interaction.message.edit({ components: [] }).catch(() => {});
+                        return interaction.editReply("✅ এই request আগেই approve করা হয়েছিল। Session আবার যাচাই করে approve নিশ্চিত করা হয়েছে। User এখন account তৈরি করতে পারবেন।");
+                    }
+                } else {
+                    await interaction.message.edit({ components: [] }).catch(() => {});
+                    return interaction.editReply("⚠️ এই request আগেই approve করা হয়েছে, এখন reject করা যাবে না।");
+                }
+            }
+            if (retryVal?.status === "rejected") {
+                await interaction.message.edit({ components: [] }).catch(() => {});
+                return interaction.editReply("⚠️ এই request একই সময়ে আরেকজন reject করেছে।");
+            }
+            return interaction.editReply("⚠️ এই request একই সময়ে আরেকজন review করেছে। Status আপডেট হয়েছে।");
+        }
+        const request = claim.snapshot.val();
+        const sessionRef = db.ref(`pending_payments/${request.checkoutKey}`);
+        if (action === "approve") {
+            const approved = await approveSession(request.checkoutKey);
+            if (!approved) {
+                await reqRef.update({ status: "approved_but_session_changed", updatedAt: Date.now() });
+                return interaction.editReply("⚠️ Request approve হয়েছে, কিন্তু checkout session আর মেলেনি। Account credit করা হয়নি; Admin-কে session যাচাই করতে হবে।");
+            }
+            await interaction.editReply("✅ Offline payment request approve করা হয়েছে। User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।");
         } else {
             await sessionRef.transaction(current => current?.offlinePaymentRequestId === requestId && current.status === "offline_payment_requested"
                 ? { ...current, status: "offline_payment_rejected", offlineRejectedBy: interaction.user.id, offlineRejectedAt: Date.now() } : undefined, undefined, false);
-            await interaction.editReply("❌ Offline payment request reject করা হয়েছে।");
+            await interaction.editReply("❌ Offline payment request reject করা হয়েছে।");
         }
         await interaction.message.edit({ components: [] }).catch(() => {});
         return;
     }
-
     if (interaction.isButton() && interaction.customId.startsWith("pay_provider_")) {
         const match = /^pay_provider_(bkash|nagad)_(.+)$/.exec(interaction.customId);
         if (!match) return interaction.reply({ content: "❌ Payment option invalid.", flags: [MessageFlags.Ephemeral] });
