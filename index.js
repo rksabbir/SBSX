@@ -31,7 +31,11 @@ const {
 // html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
 const { evaluateCheckoutEligibility, checkoutFingerprint, resolveParentCategoryId } = require("./checkout-security");
+const { normalizeTxnId, normalizeSenderNumber, parseAmount, canUserCreateOfflineRequest, validateOfflineApproval,
+    normalizeRejectReason, describeOfflineOutcome } = require("./offline-payment");
 const { isOpenOfflineReviewStatus, shouldExpireOfflineRequest, describeReviewer, describeReviewedAt } = require("./offline-payment-review");
+const { findReaderEventByTxnId, evaluateReaderMatch, evaluateStrikeGate, nextStrikeState, describeAutoApproval } = require("./offline-payment-auto");
+const { OFFLINE_FRAUD_REASONS, normalizeFraudReason, buildSessionRevokePatch, buildTxnFlagPatch, buildBanPlan, buildUnbanPlan, describeRevokeOutcome } = require("./offline-payment-fraud");
 const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
 const { readDiscordServerRules } = require("./discord-server-rules");
 const { classifyBusinessRoles } = require("./discord-business-role-classifier");
@@ -187,6 +191,18 @@ const READER_ONLINE_WINDOW_MS = Math.max(30_000, Number(process.env.READER_ONLIN
 const OFFLINE_REQUEST_COOLDOWN_MS = Math.max(0, Number(process.env.OFFLINE_REQUEST_COOLDOWN_MS || 10 * 60 * 1000));
 const OFFLINE_MAX_OPEN_REQUESTS = Math.max(1, Math.min(5, Number(process.env.OFFLINE_MAX_OPEN_REQUESTS || 2)));
 const OFFLINE_REQUEST_TTL_MS = Math.max(60 * 60 * 1000, Number(process.env.OFFLINE_REQUEST_TTL_MS || 24 * 60 * 60 * 1000));
+// Offline payment auto-verify + fraud control (env-এ override করা যাবে)
+// সব অঙ্কে auto approve (৫০০ BDT সীমা নেই) — 0 মানে সীমা নেই। দরকার হলে env দিয়ে সীমা বসানো যাবে।
+const OFFLINE_AUTO_APPROVE_ENABLED = String(process.env.OFFLINE_AUTO_APPROVE_ENABLED || "true").toLowerCase() !== "false";
+const OFFLINE_AUTO_APPROVE_MAX_BDT = Math.max(0, Number(process.env.OFFLINE_AUTO_APPROVE_MAX_BDT || 0));
+// Reader heartbeat ফিরে আসার পর কতক্ষণ ধরে বারবার মিলিয়ে দেখা হবে।
+const OFFLINE_AUTO_VERIFY_WINDOW_MS = Math.max(60_000, Number(process.env.OFFLINE_AUTO_VERIFY_WINDOW_MS || 6 * 60 * 60 * 1000));
+const OFFLINE_AUTO_VERIFY_INTERVAL_MS = Math.max(30_000, Number(process.env.OFFLINE_AUTO_VERIFY_INTERVAL_MS || 2 * 60 * 1000));
+// কতবার ফেক ধরলে ইউজারের নতুন offline request বন্ধ হবে।
+const OFFLINE_MAX_STRIKES = Math.max(1, Number(process.env.OFFLINE_MAX_STRIKES || 3));
+const OFFLINE_FRAUD_BAN_ENABLED = String(process.env.OFFLINE_FRAUD_BAN_ENABLED || "true").toLowerCase() !== "false";
+let offlineSweepTimer = null;
+let offlineAutoVerifyTimer = null;
 const READER_RECHECK_COOLDOWN_MS = Math.max(10_000, Number(process.env.READER_RECHECK_COOLDOWN_MS || 15_000));
 const READER_AUTO_WATCH_INTERVAL_MS = Math.max(10_000, Number(process.env.READER_AUTO_WATCH_INTERVAL_MS || 15_000));
 const READER_AUTO_WATCH_TIMEOUT_MS = Math.max(60_000, Number(process.env.READER_AUTO_WATCH_TIMEOUT_MS || 300_000));
@@ -510,13 +526,124 @@ app.get("/api/cpp/health", (req, res) => {
         panelOrigin: origin, corsAllowed: origin ? ADMIN_PANEL_ORIGINS.has(origin) : null });
 });
 
+// Admin Panel: auto-verify pass চালাও (Reader ফিরে এলে সাথে সাথে মিলিয়ে দেখতে)।
+app.post("/api/admin/offline-payment/auto-verify", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        await verifyAdminApiRequest(req);
+        const result = await runOfflineAutoVerifyPass();
+        return res.json({ ok: true, ...result, enabled: OFFLINE_AUTO_APPROVE_ENABLED,
+            maxBdt: OFFLINE_AUTO_APPROVE_MAX_BDT, version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Offline auto-verify API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "auto_verify_failed" });
+    }
+});
+
+// Admin Panel: ফেক প্রমাণিত হলে credit ফেরত + account ban।
+app.post("/api/admin/offline-payment/revoke", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const requestId = String(req.body?.requestId || "").trim();
+        if (!/^[A-Za-z0-9_-]{1,120}$/.test(requestId)) return res.status(400).json({ ok: false, error: "invalid_request_id" });
+        const fraudInfo = normalizeFraudReason(req.body?.reasonCode, req.body?.note);
+        const ban = req.body?.ban !== false;
+        const result = await handleOfflineFraudRevoke({ requestId, fraudInfo, actor: { id: actor.uid, username: actor.email || actor.uid }, ban });
+        if (!result.ok) {
+            const statusCode = result.reason === "not_found" ? 404 : 409;
+            return res.status(statusCode).json({ ok: false, error: result.reason });
+        }
+        return res.json({ ok: true, ...result, reasonCode: fraudInfo.reasonCode, reasonLabel: fraudInfo.reasonLabel,
+            version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Offline revoke API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "revoke_failed" });
+    }
+});
+
+// Admin Panel: ভুল করে ban হলে account ফিরিয়ে দেওয়া।
+app.post("/api/admin/offline-payment/unban", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const requestId = String(req.body?.requestId || "").trim();
+        if (!/^[A-Za-z0-9_-]{1,120}$/.test(requestId)) return res.status(400).json({ ok: false, error: "invalid_request_id" });
+        const result = await handleOfflineFraudUnban({ requestId, actor: { id: actor.uid, username: actor.email || actor.uid } });
+        if (!result.ok) return res.status(404).json({ ok: false, error: result.reason });
+        return res.json({ ok: true, ...result, version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Offline unban API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "unban_failed" });
+    }
+});
+
+// Admin Panel: auto-approved list + strike হিসাব একসাথে।
+app.get("/api/admin/offline-payment/overview", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        await verifyAdminApiRequest(req);
+        const [requestsSnap, strikesSnap] = await Promise.all([
+            db.ref("offline_payment_requests").once("value"),
+            db.ref("offline_payment_strikes").once("value")
+        ]);
+        const rows = [];
+        for (const [id, record] of Object.entries(requestsSnap.val() || {})) {
+            if (!record) continue;
+            rows.push({
+                id, discordUserId: String(record.discordUserId || ""), category: String(record.category || ""),
+                provider: String(record.provider || ""), txnId: String(record.txnId || ""),
+                senderNumber: String(record.senderNumber || ""), claimedAmount: Number(record.claimedAmount) || 0,
+                approvedAmount: Number(record.approvedAmount) || 0, status: String(record.status || ""),
+                autoApproved: record.autoApproved === true, checkedByAdmin: record.checkedByAdmin === true,
+                readerVerifiedAmount: Number(record.readerVerifiedAmount) || 0,
+                autoVerifyStage: String(record.autoVerifyStage || ""), autoVerifyReason: String(record.autoVerifyReason || ""),
+                createdAt: Number(record.createdAt) || 0, reviewedAt: Number(record.reviewedAt) || 0,
+                revokedAt: Number(record.revokedAt) || 0, rejectReasonLabel: String(record.rejectReasonLabel || ""),
+                revokeReasonLabel: String(record.revokeReasonLabel || "")
+            });
+        }
+        rows.sort((a, b) => b.createdAt - a.createdAt);
+        const strikes = Object.entries(strikesSnap.val() || {}).map(([discordUserId, value]) => ({
+            discordUserId, count: Number(value?.count) || 0, lastAt: Number(value?.updatedAt) || 0,
+            lastReason: String(value?.lastReason || ""), blocked: (Number(value?.count) || 0) >= OFFLINE_MAX_STRIKES
+        })).sort((a, b) => b.count - a.count);
+        return res.json({
+            ok: true, requests: rows.slice(0, 500), strikes: strikes.slice(0, 200),
+            settings: { autoApproveEnabled: OFFLINE_AUTO_APPROVE_ENABLED, autoApproveMaxBdt: OFFLINE_AUTO_APPROVE_MAX_BDT,
+                maxStrikes: OFFLINE_MAX_STRIKES, fraudBanEnabled: OFFLINE_FRAUD_BAN_ENABLED },
+            fraudReasons: OFFLINE_FRAUD_REASONS, version: require("./package.json").version
+        });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Offline overview API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "overview_failed" });
+    }
+});
+
 app.post("/api/admin/offline-payment/sweep", async (req, res) => {
     const origin = String(req.get("origin") || "");
     if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
     try {
         await verifyAdminApiRequest(req);
+        const autoVerify = await runOfflineAutoVerifyPass().catch(() => ({ checked: 0, approved: 0 }));
         const result = await sweepOfflinePaymentRequests();
-        return res.json({ ok: true, ...result, version: require("./package.json").version });
+        return res.json({ ok: true, ...result, autoVerify, version: require("./package.json").version });
     } catch (err) {
         if (err?.statusCode === 401 || err?.statusCode === 403) {
             return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
@@ -1923,7 +2050,7 @@ async function expireStaleOfflineRequest(requestId, request) {
 // তাই session credit করার কাজটা service account-চালিত bot করে — যাতে একই credit দুইবার না হয়।
 const offlinePanelCreditedRequests = new Set();
 async function creditOfflineSessionFromRequest(requestId, request) {
-    if (!request || String(request.status || "") !== "approved") return false;
+    if (!request || !["approved", "auto_approved"].includes(String(request.status || ""))) return false;
     if (request.sessionCreditedAt) return false;
     if (offlinePanelCreditedRequests.has(requestId)) return false;
     const checkoutKey = String(request.checkoutKey || "");
@@ -1961,14 +2088,17 @@ async function creditOfflineSessionFromRequest(requestId, request) {
     }
 }
 // Approve/reject হলে ইউজারকে DM — status button চাপতে হবে না।
-async function notifyOfflineRequester(request, approved) {
+async function notifyOfflineRequester(request, approved, opts = {}) {
     const userId = String(request?.discordUserId || "");
     if (!/^\d{15,25}$/.test(userId)) return;
     const user = await client.users.fetch(userId).catch(() => null);
     if (!user) return;
     const category = String(request.category || "").toUpperCase();
+    const autoNote = opts.auto
+        ? "\n\n🤖 এই approve-টি Payment Reader-এর ধরা transaction মিলিয়ে **স্বয়ংক্রিয়ভাবে** হয়েছে। কোনো সমস্যা হলে Support-এ জানান।"
+        : "";
     const text = approved
-        ? `✅ আপনার offline payment approve হয়েছে।\n\n📦 প্যাকেজ: **${category}**\n💳 ${String(request.provider || "").toUpperCase()}\n💰 Credit: **${Number(request.approvedAmount) || 0} BDT**\n\nএখন Shop-এ একই package আবার select করলে অথবা checkout-এর "🔄 Request status" বাটনে চাপলে account credential তৈরির অপশন পাবেন। এই request আর নতুন করে পাঠানোর দরকার নেই।`
+        ? `✅ আপনার offline payment approve হয়েছে।\n\n📦 প্যাকেজ: **${category}**\n💳 ${String(request.provider || "").toUpperCase()}\n💰 Credit: **${Number(request.approvedAmount) || 0} BDT**\n\nএখন Shop-এ একই package আবার select করলে অথবা checkout-এর "🔄 Request status" বাটনে চাপলে account credential তৈরির অপশন পাবেন। এই request আর নতুন করে পাঠানোর দরকার নেই।${autoNote}`
         : `❌ আপনার offline payment request approve করা যায়নি।\n\n📦 প্যাকেজ: **${category}**\nকারণ: ${String(request.rejectReasonLabel || "Admin reject করেছেন")}${request.reviewNote ? `\n📝 ${request.reviewNote}` : ""}\n\nসঠিক তথ্য থাকলে আবার request দিন, অথবা Support-এ যোগাযোগ করুন।`;
     await user.send({ content: text }).catch(() => {});
 }
@@ -1995,13 +2125,462 @@ async function sweepOfflinePaymentRequests() {
         if (channel?.isTextBased?.()) {
             for (const { id, record } of reminders) {
                 const deadlineAt = Math.floor(((Number(record.createdAt) || now) + Math.max(deadlineMs, OFFLINE_REQUEST_TTL_MS)) / 1000);
-                await channel.send({ content: `⏳ **Reminder:** offline payment request \`${id}\` (<@${record.discordUserId}>, ${record.category}, ${record.claimedAmount || record.amount} BDT) এখনো review হয়নি — deadline <t:${deadlineAt}:R>।` }).catch(() => {});
+                const readerHint = record.autoVerifyStage === "awaiting_reader"
+                    ? " Reader এখনো এই TxnID দেখেনি"
+                    : record.autoVerifyReason ? ` auto-verify: ${record.autoVerifyReason}` : "";
+                await channel.send({ content: `⏳ **Reminder:** offline payment request \`${id}\` (<@${record.discordUserId}>, ${record.category}, ${record.claimedAmount || record.amount} BDT) এখনো review হয়নি — deadline <t:${deadlineAt}:R>।${readerHint}` }).catch(() => {});
                 await db.ref(`offline_payment_requests/${id}`).update({ reminderSentAt: now }).catch(() => {});
             }
         }
     }
     if (expired) console.log(`[offlinepay] Sweep expired ${expired} stale request(s)`);
     return { expired, reminded: reminders.length };
+}
+
+// ── Reader-assisted auto approval ──────────────────────────────────────────────
+// Reader offline থাকার সময় ইউজার টাকা পাঠায় → bot অপেক্ষা করে → Reader ফিরে এলে
+// Reader-এর ধরা transaction (TxnID + provider + amount) মিলিয়ে bot নিজেই approve করে।
+// তারপর Admin পরে মিলিয়ে দেখে; ফেক হলে revoke + ban (handleOfflineFraudRevoke)।
+const offlineAutoVerifyBusy = new Set();
+const offlineFraudLocks = new Set();
+const offlineAutoVerifyCooldown = new Map();
+
+async function readReaderSnapshots() {
+    return Promise.all([...TRUSTED_READER_UIDS].map(async uid => {
+        const snap = await db.ref(`reader_events/${uid}`).once("value");
+        return { uid, events: snap.val() || {} };
+    }));
+}
+
+function setOfflineVerifyStage(requestId, stage, extra = {}) {
+    return db.ref(`offline_payment_requests/${requestId}`)
+        .update({ autoVerifyStage: String(stage), autoVerifyAt: Date.now(), updatedAt: Date.now(), ...extra })
+        .catch(() => {});
+}
+
+async function tryAutoApproveOfflineRequest(requestId) {
+    if (!OFFLINE_AUTO_APPROVE_ENABLED) return { approved: false, reason: "auto_disabled" };
+    if (offlineAutoVerifyBusy.has(requestId)) return { approved: false, reason: "busy" };
+    const lastTry = offlineAutoVerifyCooldown.get(requestId) || 0;
+    if (Date.now() - lastTry < 15_000) return { approved: false, reason: "recently_checked" };
+    offlineAutoVerifyBusy.add(requestId);
+    offlineAutoVerifyCooldown.set(requestId, Date.now());
+    try {
+        const snap = await db.ref(`offline_payment_requests/${requestId}`).once("value");
+        const request = snap.val();
+        if (!request || !isOpenOfflineReviewStatus(request.status)) return { approved: false, reason: "not_open" };
+        // মেয়াদ পার হলে আগে expire করাই ঠিক।
+        if (await expireStaleOfflineRequest(requestId, request)) return { approved: false, reason: "expired" };
+        if (request.status === "needs_staff_channel") {
+            await db.ref(`offline_payment_requests/${requestId}`).update({ status: "pending", updatedAt: Date.now() }).catch(() => {});
+            request.status = "pending";
+        }
+        const txnId = String(request.txnId || "");
+        if (!txnId) return { approved: false, reason: "missing_txnid" };
+
+        const readerSnapshots = await readReaderSnapshots();
+        const found = findReaderEventByTxnId({ readerSnapshots, txnId });
+        if (!found.found) {
+            await setOfflineVerifyStage(requestId, "awaiting_reader");
+            return { approved: false, reason: found.reason };
+        }
+        let session = null;
+        if (request.checkoutKey) session = (await db.ref(`pending_payments/${request.checkoutKey}`).once("value")).val();
+        const verdict = evaluateReaderMatch({
+            request, readerMatch: found, session, now: Date.now(),
+            allowPartialPayments: getCheckoutSettings().allowPartialPayments !== false
+        });
+        if (!verdict.ok) {
+            await setOfflineVerifyStage(requestId, "manual_review", { autoVerifyReason: String(verdict.reason) });
+            return { approved: false, reason: verdict.reason };
+        }
+        // ইচ্ছাকৃত সীমা (default 0 = সব অঙ্কে auto)।
+        if (OFFLINE_AUTO_APPROVE_MAX_BDT > 0 && verdict.credit > OFFLINE_AUTO_APPROVE_MAX_BDT) {
+            await setOfflineVerifyStage(requestId, "over_auto_limit", { autoVerifyReason: "over_auto_limit" });
+            return { approved: false, reason: "over_auto_limit" };
+        }
+        if (!request.checkoutKey || !session) {
+            await setOfflineVerifyStage(requestId, "manual_review", { autoVerifyReason: "session_missing" });
+            return { approved: false, reason: "session_missing" };
+        }
+        // TxnID আগেই অন্য কারো অর্ডারে ব্যবহৃত হলে auto approve হবে না।
+        const txnRecord = (await db.ref(`transactions/${txnId}`).once("value")).val();
+        if (txnRecord && txnRecord.used === true && String(txnRecord.usedBy || "") !== String(request.discordUserId || "")) {
+            await setOfflineVerifyStage(requestId, "manual_review", { autoVerifyReason: "duplicate_txn" });
+            return { approved: false, reason: "duplicate_txn" };
+        }
+
+        const now = Date.now();
+        const claimed = await db.ref(`offline_payment_requests/${requestId}`).transaction(current => {
+            if (!current || !isOpenOfflineReviewStatus(String(current.status || ""))) return;
+            return {
+                ...current,
+                status: "auto_approved",
+                approvedAmount: Number(verdict.credit) || 0,
+                approvedBy: "reader_auto",
+                reviewedBy: "reader_auto",
+                reviewedByUsername: "Payment Reader",
+                reviewedAt: now,
+                autoApproved: true,
+                readerVerifiedUid: String(verdict.readerUid || ""),
+                readerVerifiedEventKey: String(verdict.readerEventKey || ""),
+                readerVerifiedAmount: Number(verdict.readerAmount) || 0,
+                readerVerifiedAt: now,
+                autoVerifyStage: "credited",
+                autoVerifyReason: "reader_verified",
+                updatedAt: now
+            };
+        }, undefined, false);
+        if (!claimed.committed) return { approved: false, reason: "claim_race" };
+        const claimedRequest = claimed.snapshot.val();
+        const credit = Number(verdict.credit) || 0;
+
+        const sessionResult = await db.ref(`pending_payments/${request.checkoutKey}`).transaction(current => {
+            if (!current) return;
+            if (current.offlinePaymentRequestId !== requestId) return;
+            if (current.status === "offline_payment_approved") return current;
+            if (current.status !== "offline_payment_requested") return;
+            const target = Math.max(0, Number(current.targetPrice) || 0);
+            const alreadyPaid = Math.max(0, Number(current.totalPaid) || 0);
+            const applied = Math.min(credit, Math.max(0, target - alreadyPaid));
+            if (applied <= 0) return;
+            return {
+                ...current,
+                status: "offline_payment_approved",
+                totalPaid: alreadyPaid + applied,
+                usedTxns: [...(Array.isArray(current.usedTxns) ? current.usedTxns : []), `OFFLINE_AUTO_APPROVED:${requestId}`],
+                offlineApprovedBy: "reader_auto",
+                offlineApprovedAt: now,
+                offlinePaymentRequestId: requestId
+            };
+        }, undefined, false);
+        if (!sessionResult.committed) {
+            await db.ref(`offline_payment_requests/${requestId}`)
+                .update({ status: "approved_but_session_changed", updatedAt: Date.now() }).catch(() => {});
+            return { approved: false, reason: "session_changed" };
+        }
+        // TxnID claim — একই transaction দিয়ে দ্বিতীয়বার credit বন্ধ।
+        let txnClaimed = true;
+        if (txnId) {
+            const txnClaim = await db.ref(`transactions/${txnId}`).transaction(current => {
+                if (current && current.used === true && String(current.usedBy || "") !== String(request.discordUserId || "")) return;
+                return {
+                    ...(current || {}),
+                    transactionId: txnId,
+                    provider: request.provider,
+                    amount: credit,
+                    currency: "BDT",
+                    used: true,
+                    usedBy: request.discordUserId,
+                    usedAt: now,
+                    verificationStatus: "verified",
+                    verificationSource: "reader_auto_verify",
+                    readerEventUid: String(verdict.readerUid || ""),
+                    readerEventKey: String(verdict.readerEventKey || ""),
+                    offlinePaymentRequestId: requestId,
+                    offlinePaymentRequestedAt: Number(request.createdAt) || 0,
+                    checkedByAdmin: false
+                };
+            }, undefined, false);
+            txnClaimed = txnClaim.committed;
+        }
+        if (!txnClaimed) {
+            await db.ref(`offline_payment_requests/${requestId}`)
+                .update({ status: "approved_but_txn_duplicate", updatedAt: Date.now() }).catch(() => {});
+            return { approved: false, reason: "duplicate_txn" };
+        }
+        const finalRequest = { ...claimedRequest, approvedAmount: credit };
+        await db.ref(`offline_payment_requests/${requestId}`)
+            .update({ sessionCreditedAt: now, updatedAt: now }).catch(() => {});
+        await notifyOfflineRequester(finalRequest, true, { auto: true }).catch(() => {});
+        await postOfflineApprovedReview(finalRequest, { auto: true }).catch(() => {});
+        await db.ref("auditLog").push({
+            adminUid: "reader_auto", actionType: "offline_payment_auto_approved", timestamp: now,
+            summary: `Auto approved offline request ${requestId} for ${request.discordUserId} — ${credit} BDT (reader ${verdict.readerUid}/${verdict.readerEventKey}, txn ${txnId})`
+        }).catch(() => {});
+        console.log(`[offlinepay] Auto-approved ${requestId} for ${request.discordUserId} — ${credit} BDT via reader ${verdict.readerUid}`);
+        return { approved: true, credit, requestId };
+    } catch (err) {
+        console.error(`[offlinepay] Auto verify failed for ${requestId}: ${err.message}`);
+        return { approved: false, reason: "error", error: err.message };
+    } finally {
+        offlineAutoVerifyBusy.delete(requestId);
+        if (offlineAutoVerifyCooldown.size > 2000) {
+            const cutoff = Date.now() - 10 * 60 * 1000;
+            for (const [key, at] of offlineAutoVerifyCooldown) if (at < cutoff) offlineAutoVerifyCooldown.delete(key);
+        }
+    }
+}
+
+// Request তৈরি হওয়ার সাথে সাথে একবার মিলিয়ে দেখা — Reader ইতিমধ্যে online থাকলে সাথে সাথে approve।
+// Reader offline থাকলে একটু পরপর কয়েকবার চেষ্টা করা হয় (Reader app queue থেকে upload করলে যাতে দেরি না হয়)।
+const offlineAutoVerifyAfterCreate = new Set();
+function scheduleOfflineAutoVerifyAfterCreate(requestId, request) {
+    if (!OFFLINE_AUTO_APPROVE_ENABLED || !requestId) return;
+    if (offlineAutoVerifyAfterCreate.has(requestId)) return;
+    offlineAutoVerifyAfterCreate.add(requestId);
+    const createdAt = Number(request?.createdAt) || Date.now();
+    const attempt = () => {
+        if (Date.now() - createdAt > OFFLINE_AUTO_VERIFY_WINDOW_MS) {
+            offlineAutoVerifyAfterCreate.delete(requestId);
+            return;
+        }
+        tryAutoApproveOfflineRequest(requestId)
+            .then(result => { if (result?.approved) offlineAutoVerifyAfterCreate.delete(requestId); })
+            .catch(() => {});
+    };
+    attempt();
+    // ৩০ সেকেন্ড, ২ মিনিট, ৫ মিনিট — প্রথম দফার দ্রুত চেষ্টা।
+    for (const delay of [30_000, 120_000, 300_000]) {
+        const timer = setTimeout(attempt, delay);
+        if (typeof timer.unref === "function") timer.unref();
+    }
+}
+
+// Reader ফিরে এলে সব pending request একবারে মিলিয়ে দেখা হয়।
+async function runOfflineAutoVerifyPass() {
+    if (!OFFLINE_AUTO_APPROVE_ENABLED) return { checked: 0, approved: 0, skipped: true };
+    const readerState = await getPaymentReaderState().catch(() => ({ online: false }));
+    const snap = await db.ref("offline_payment_requests").once("value");
+    const records = Object.entries(snap.val() || {}).filter(([, record]) => record && isOpenOfflineReviewStatus(record.status));
+    if (!records.length) return { checked: 0, approved: 0, readerOnline: readerState.online };
+    if (!readerState.online) {
+        // Reader offline: Reader-এর পুরোনো event আগেও থাকতে পারে (app queue থেকে upload হওয়া), তাই মাঝে মাঝে দেখে নেওয়া হয়।
+        return { checked: 0, approved: 0, readerOnline: false, waiting: records.length };
+    }
+    let approved = 0; let checked = 0;
+    for (const [id] of records) {
+        checked++;
+        const result = await tryAutoApproveOfflineRequest(id).catch(() => ({ approved: false }));
+        if (result.approved) approved++;
+    }
+    if (approved) console.log(`[offlinepay] Auto verify pass approved ${approved}/${checked} request(s)`);
+    return { checked, approved, readerOnline: true };
+}
+
+function startOfflineAutoVerifyTimer() {
+    if (offlineAutoVerifyTimer) clearInterval(offlineAutoVerifyTimer);
+    offlineAutoVerifyTimer = setInterval(() => {
+        runOfflineAutoVerifyPass().catch(err => console.error("Offline auto verify pass failed:", err.message));
+    }, OFFLINE_AUTO_VERIFY_INTERVAL_MS);
+    if (typeof offlineAutoVerifyTimer.unref === "function") offlineAutoVerifyTimer.unref();
+}
+
+// approve হওয়ার পর Admin-কে জানানো হয় (নজরদারি + এক ক্লিকে "Fake" বাটন)।
+async function postOfflineApprovedReview(request, opts = {}) {
+    const channel = await client.channels.fetch(STAFF_ADMIN_LOG_ID).catch(() => null);
+    if (!channel?.isTextBased?.()) return;
+    const requestId = String(request.id || "");
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`offlinepay_fake_${requestId}`).setLabel("🚫 Fake — Revoke & Ban").setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId(`offlinepay_markok_${requestId}`).setLabel("✅ Verified OK").setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId(`offlinepay_revoke_${requestId}`).setLabel("↩️ শুধু Credit ফেরত").setStyle(ButtonStyle.Secondary)
+    );
+    const isAuto = opts.auto === true;
+    const embed = new EmbedBuilder()
+        .setTitle(isAuto ? "🤖 Reader-verified — Auto Approved (post review)" : "✅ Manually Approved — post review")
+        .setDescription(`**User:** <@${request.discordUserId}> (\`${request.discordUserId}\`)
+**Package:** ${request.category}
+**Provider:** ${String(request.provider || "").toUpperCase()}
+**Credit দেওয়া হয়েছে:** ${Number(request.approvedAmount) || 0} BDT
+**User বলেছিল পাঠিয়েছে:** ${Number(request.claimedAmount) || 0} BDT
+**Reader দেখেছে:** ${Number(request.readerVerifiedAmount) || 0} BDT${isAuto ? "" : `\n**Approve করেছেন:** <@${request.reviewedBy}>`}
+**TxnID:** \`${request.txnId}\`
+**Sender number:** \`${request.senderNumber}\`
+**Request ID:** \`${requestId}\`
+
+Bot Reader-এর notification মিলিয়ে account credit করে দিয়েছে। এখন official bKash/Nagad history-তে মিলিয়ে দেখুন।
+✅ ঠিক থাকলে **Verified OK** চাপুন। 🚫 ফেক হলে **Fake — Revoke & Ban** চাপুন — credit ফেরত যাবে এবং ইউজারের account ban হবে।`)
+        .setColor("Blue").setTimestamp();
+    await channel.send({ embeds: [embed], components: [row] }).catch(() => {});
+}
+
+// ── Fake payment: credit revoke + account ban ─────────────────────────────────
+// Admin post-review-এ ফেক ধরলে: credit ফেরত, TxnID flagged, সব C++ account disable, strike যোগ।
+async function findAccountsByDiscordId(discordId) {
+    const id = String(discordId || "").trim();
+    if (!/^\d{15,25}$/.test(id)) return [];
+    const snap = await db.ref("users").orderByChild("discordId").equalTo(id).once("value");
+    const accounts = [];
+    for (const [username, record] of Object.entries(snap.val() || {})) {
+        if (!record || record.discordId === undefined || String(record.discordId) !== id) continue;
+        accounts.push({ username, record });
+    }
+    return accounts;
+}
+
+async function resolveDiscordMember(discordId) {
+    const id = String(discordId || "");
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (guild) {
+        const cached = guild.members.cache.get(id);
+        if (cached) return cached;
+        const fetched = await guild.members.fetch(id).catch(() => null);
+        if (fetched) return fetched;
+    }
+    return null;
+}
+
+async function handleOfflineFraudRevoke({ requestId, fraudInfo, actor, ban = true }) {
+    const actorId = String(actor?.id || actor?.uid || "admin");
+    const actorName = String(actor?.username || actor?.tag || actorId);
+    // একই request একসাথে দুইবার revoke হলে দ্বিতীয়টা সাথে সাথে বন্ধ (double credit-reversal ঠেকাতে)।
+    if (offlineFraudLocks.has(requestId)) return { ok: false, reason: "busy" };
+    offlineFraudLocks.add(requestId);
+    try {
+        const snap = await db.ref(`offline_payment_requests/${requestId}`).once("value");
+        const request = snap.val();
+        if (!request) return { ok: false, reason: "not_found" };
+        const status = String(request.status || "");
+        if (status === "revoked_fake") return { ok: false, reason: "already_revoked" };
+
+        const now = Date.now();
+        const creditAmount = Number(request.approvedAmount) || Number(request.claimedAmount) || 0;
+        const userId = String(request.discordUserId || "");
+
+        // ১. request revoked_fake
+        await db.ref(`offline_payment_requests/${requestId}`).update({
+            status: "revoked_fake",
+            revokedAt: now,
+            revokedBy: actorId,
+            revokedByUsername: actorName,
+            revokeReasonCode: fraudInfo.reasonCode,
+            revokeReasonLabel: fraudInfo.reasonLabel,
+            revokeNote: fraudInfo.note,
+            previousStatus: status,
+            updatedAt: now
+        }).catch(() => {});
+
+        // ২. session credit ফেরত
+        let creditReversed = false;
+        if (request.checkoutKey && request.sessionCreditedAt) {
+            const sessionResult = await db.ref(`pending_payments/${request.checkoutKey}`).transaction(current =>
+                buildSessionRevokePatch(current, { requestId, actorId, now }), undefined, false);
+            creditReversed = Boolean(sessionResult.committed);
+        }
+
+        // ৩. TxnID flagged (রেকর্ড মুছে ফেলা হয় না — প্রমাণ রাখা হয়)
+        if (request.txnId) {
+            await db.ref(`transactions/${request.txnId}`).transaction(current =>
+                buildTxnFlagPatch(current, { txnId: request.txnId, userId, requestId, actorId, now }), undefined, false)
+                .catch(() => {});
+        }
+
+        // ৪. সব C++ account disable
+        let accountsDisabled = 0;
+        if (ban && OFFLINE_FRAUD_BAN_ENABLED) {
+            const accounts = await findAccountsByDiscordId(userId);
+            const plan = buildBanPlan({ accounts, now, reason: `offline_payment_fraud:${fraudInfo.reasonCode}` });
+            for (const entry of plan.patches) {
+                if (!entry.username) continue;
+                await db.ref(`users/${entry.username}`).update(entry.patch)
+                    .then(() => { accountsDisabled++; })
+                    .catch(err => console.error(`[offlinepay] Ban failed for ${entry.username}: ${err.message}`));
+            }
+        }
+
+        // ৫. strike ledger
+        const strikeRef = db.ref(`offline_payment_strikes/${userId}`);
+        const strikeResult = await strikeRef.transaction(current =>
+            nextStrikeState(current, { reason: fraudInfo.reasonCode, requestId, actorId, now }), undefined, false);
+        const strikeCount = Number(strikeResult.snapshot.val()?.count) || 0;
+
+        // ৬. Discord-এ verified role সরানো (থাকলে) — ban নয়, শুধু role
+        if (ban && OFFLINE_FRAUD_BAN_ENABLED) {
+            const member = await resolveDiscordMember(userId);
+            const verifiedRoleId = getConfiguredRoleId("verified");
+            if (member && verifiedRoleId && member.roles.cache.has(verifiedRoleId)) {
+                await member.roles.remove(verifiedRoleId, `Offline payment fraud: ${fraudInfo.reasonLabel}`).catch(() => {});
+            }
+        }
+
+        // ৭. audit log
+        await db.ref("auditLog").push({
+            adminUid: actorId, actionType: "offline_payment_revoked_fake", timestamp: now,
+            summary: `Revoked offline request ${requestId} as fake (${fraudInfo.reasonCode}); credit=${creditAmount} BDT reversed=${creditReversed}; accounts disabled=${accountsDisabled}; strike=${strikeCount}/${OFFLINE_MAX_STRIKES}; txn=${request.txnId || "none"}`
+        }).catch(() => {});
+
+        // ৮. staff channel + user DM
+        const channel = await client.channels.fetch(STAFF_ADMIN_LOG_ID).catch(() => null);
+        if (channel?.isTextBased?.()) {
+            await channel.send({
+                embeds: [new EmbedBuilder().setTitle("🚫 Offline Payment Revoked — Fake")
+                    .setDescription(`**User:** <@${userId}> (\`${userId}\`)
+**Request ID:** \`${requestId}\`
+**TxnID:** \`${request.txnId || "none"}\`
+**Credit ছিল:** ${creditAmount} BDT ${creditReversed ? "(ফেরত নেওয়া হয়েছে)" : "(credit পাওয়া যায়নি)"}
+**কারণ:** ${fraudInfo.reasonLabel}${fraudInfo.note ? `\n📝 ${fraudInfo.note}` : ""}
+**Account disable:** ${accountsDisabled}
+**Strike:** ${strikeCount}/${OFFLINE_MAX_STRIKES}${strikeCount >= OFFLINE_MAX_STRIKES ? " — ⛔ নতুন offline request বন্ধ" : ""}
+**Action by:** <@${actorId}>`)
+                    .setColor("DarkRed").setTimestamp()],
+                components: [new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`offlinepay_unban_${requestId}`).setLabel("🔓 ভুল হয়েছে — Unban & Restore").setStyle(ButtonStyle.Secondary))]
+            }).catch(() => {});
+        }
+        const user = await client.users.fetch(userId).catch(() => null);
+        if (user) {
+            await user.send({
+                content: `🚫 আপনার offline payment request যাচাইয়ে **fake** প্রমাণিত হয়েছে।\n\n📦 প্যাকেজ: **${String(request.category || "").toUpperCase()}**\nকারণ: ${fraudInfo.reasonLabel}${fraudInfo.note ? `\n📝 ${fraudInfo.note}` : ""}\n\n${accountsDisabled > 0 ? "আপনার C++ account সাময়িকভাবে বন্ধ করা হয়েছে। " : ""}${strikeCount >= OFFLINE_MAX_STRIKES ? "বারবার ভুল প্রমাণ পাওয়ায় নতুন offline payment request পাঠানোর সুবিধা বন্ধ হয়েছে। " : ""}\nভুল হয়েছে মনে হলে Support-এ যোগাযোগ করুন।`
+            }).catch(() => {});
+        }
+        console.log(`[offlinepay] Revoked ${requestId} as fake by ${actorId}; accounts=${accountsDisabled} strike=${strikeCount}`);
+        return { ok: true, creditReversed, accountsDisabled, strikes: strikeCount, strikeLimit: OFFLINE_MAX_STRIKES, creditAmount };
+    } finally {
+        offlineFraudLocks.delete(requestId);
+    }
+}
+
+// ভুল করে ban হলে ফেরানো।
+async function handleOfflineFraudUnban({ requestId, actor }) {
+    const actorId = String(actor?.id || actor?.uid || "admin");
+    const snap = await db.ref(`offline_payment_requests/${requestId}`).once("value");
+    const request = snap.val();
+    if (!request) return { ok: false, reason: "not_found" };
+    const userId = String(request.discordUserId || "");
+    const now = Date.now();
+    const accounts = await findAccountsByDiscordId(userId);
+    const plan = buildUnbanPlan({ accounts, now });
+    let restored = 0;
+    for (const entry of plan.patches) {
+        if (!entry.username) continue;
+        await db.ref(`users/${entry.username}`).update(entry.patch).then(() => { restored++; }).catch(() => {});
+    }
+    await db.ref(`offline_payment_requests/${requestId}`).update({
+        status: "revoked_restored", restoredAt: now, restoredBy: actorId, updatedAt: now
+    }).catch(() => {});
+    const strikeRef = db.ref(`offline_payment_strikes/${userId}`);
+    await strikeRef.transaction(current => {
+        if (!current) return;
+        return { ...current, count: Math.max(0, (Number(current.count) || 0) - 1), updatedAt: now };
+    }, undefined, false).catch(() => {});
+    await db.ref("auditLog").push({
+        adminUid: actorId, actionType: "offline_payment_unban", timestamp: now,
+        summary: `Restored accounts for ${userId} after fake-revoke of ${requestId}; accounts restored=${restored}`
+    }).catch(() => {});
+    return { ok: true, restored };
+}
+
+// Reader-এর TxnID দিয়ে pending request খুঁজে সাথে সাথে auto approve (reader event এলেই)।
+async function onReaderEventArrived(readerUid, eventKey, event) {
+    if (!OFFLINE_AUTO_APPROVE_ENABLED) return;
+    const txnId = String(event?.transactionId || eventKey || "").trim();
+    if (!txnId) return;
+    const snap = await db.ref("offline_payment_requests").orderByChild("txnId").equalTo(txnId).once("value").catch(() => null);
+    if (!snap || !snap.exists()) return;
+    for (const [, record] of Object.entries(snap.val() || {})) {
+        if (!record || !isOpenOfflineReviewStatus(record.status)) continue;
+        await tryAutoApproveOfflineRequest(record.id).catch(() => {});
+    }
+}
+
+function registerReaderEventAutoVerifyListeners() {
+    for (const uid of TRUSTED_READER_UIDS) {
+        db.ref(`reader_events/${uid}`).on("child_added", snap => {
+            onReaderEventArrived(uid, snap.key, snap.val()).catch(() => {});
+        });
+    }
+    if (TRUSTED_READER_UIDS.size) console.log(`[offlinepay] Reader event auto-verify listener active for ${TRUSTED_READER_UIDS.size} device(s)`);
 }
 
 function registerOfflinePaymentRequestListener() {
@@ -2011,6 +2590,9 @@ function registerOfflinePaymentRequestListener() {
         .catch(err => console.error(`[offlinepay] Panel sync failed for ${snap.key}: ${err.message}`));
     db.ref("offline_payment_requests").orderByChild("status").equalTo("approved").on("child_added", handler);
     db.ref("offline_payment_requests").orderByChild("status").equalTo("approved").on("child_changed", handler);
+    // Admin Panel থেকে auto-approved request-ও credit হতে হবে (একই single-credit guard)।
+    db.ref("offline_payment_requests").orderByChild("status").equalTo("auto_approved").on("child_added", handler);
+    db.ref("offline_payment_requests").orderByChild("status").equalTo("auto_approved").on("child_changed", handler);
     console.log("[offlinepay] Admin Panel approval listener active");
 }
 
@@ -2541,6 +3123,12 @@ client.on("interactionCreate", async (interaction) => {
             if (await expireStaleOfflineRequest(openId, openRecord)) continue;
             openRecords.push({ ...openRecord, id: openRecord.id || openId });
         }
+        // ফেক প্রমাণিত হলে বারবার request দেওয়া বন্ধ (strike limit)।
+        const strikesSnap = await db.ref(`offline_payment_strikes/${interaction.user.id}`).once("value").catch(() => null);
+        const strikeGate = evaluateStrikeGate({ strikes: strikesSnap?.val(), maxStrikes: OFFLINE_MAX_STRIKES });
+        if (strikeGate.blocked) {
+            return interaction.editReply(`⛔ আপনার আগের offline payment ${strikeGate.count} বার fake প্রমাণিত হয়েছে, তাই নতুন offline payment request পাঠানো যাবে না। অনুগ্রহ করে Support-এ যোগাযোগ করুন।`);
+        }
         const gate = canUserCreateOfflineRequest({
             existingRequests: openRecords, category, now: Date.now(),
             cooldownMs: OFFLINE_REQUEST_COOLDOWN_MS, maxOpen: OFFLINE_MAX_OPEN_REQUESTS
@@ -2561,9 +3149,12 @@ client.on("interactionCreate", async (interaction) => {
         await sessionRef.update({ status: "offline_payment_requested", offlinePaymentRequestId: reqRef.key, offlinePaymentRequestedAt: Date.now() });
         let staffChannel = interaction.guild.channels.cache.get(STAFF_ADMIN_LOG_ID);
         if (!staffChannel) staffChannel = await interaction.guild.channels.fetch(STAFF_ADMIN_LOG_ID).catch(() => null);
-        if (!staffChannel || !staffChannel.isTextBased()) {
-            await reqRef.update({ status: "needs_staff_channel", updatedAt: Date.now() });
-            return interaction.editReply("⚠️ Offline request সংরক্ষিত হয়েছে, কিন্তু staff review channel পাওয়া যায়নি। Admin-কে STAFF_ADMIN_LOG_ID channel সেট করতে বলুন।");
+        const staffChannelReady = Boolean(staffChannel && staffChannel.isTextBased());
+        if (!staffChannelReady) {
+            // Channel না থাকলেও request বাতিল হয় না — Reader ফিরে এলে auto verify নিজেই চলে।
+            await reqRef.update({ status: "needs_staff_channel", updatedAt: Date.now() }).catch(() => {});
+            scheduleOfflineAutoVerifyAfterCreate(reqRef.key, requestData);
+            return interaction.editReply("🕓 Offline request সংরক্ষিত হয়েছে। Reader online হলে bot নিজেই transaction মিলিয়ে approve করার চেষ্টা করবে। (Staff review channel সেট করা নেই, তাই manual review আপাতত বন্ধ।)");
         }
         const approvalRow = new ActionRowBuilder().addComponents(
             new ButtonBuilder().setCustomId(`offlinepay_approve_${reqRef.key}`).setLabel("Approve (manual verify) ").setStyle(ButtonStyle.Success),
@@ -2580,10 +3171,11 @@ client.on("interactionCreate", async (interaction) => {
 **Request ID:** \`${reqRef.key}\`
 **Deadline:** <t:${Math.floor((requestData.createdAt + OFFLINE_REQUEST_TTL_MS) / 1000)}:R>
 
-Approve করার আগে official bKash/Nagad transaction history-তে এই TxnID ও টাকার পরিমাণ নিজে যাচাই করুন। Reader evidence না থাকলে bot payment verify করেছে বলে গণ্য হবে না।`)
+🔎 Reader offline ছিল, তাই bot আগে auto-verify চেষ্টা করছে। Reader ফিরে এলে TxnID + amount মিললে bot নিজেই credit দেবে — নিচের বাটনগুলো তখন জরুরি নয়।\n\nApprove করার আগে official bKash/Nagad transaction history-তে এই TxnID ও টাকার পরিমাণ নিজে যাচাই করুন। Reader evidence না থাকলে bot payment verify করেছে বলে গণ্য হবে না।`)
             .setColor("Orange").setTimestamp();
         await staffChannel.send({ embeds: [reviewEmbed], components: [approvalRow] });
-        return interaction.editReply("🕓 Offline payment request Admin/Staff-এর কাছে পাঠানো হয়েছে। Official transaction যাচাই করে approve না করা পর্যন্ত account তৈরি করা যাবে না।");
+        scheduleOfflineAutoVerifyAfterCreate(reqRef.key, requestData);
+        return interaction.editReply("🕓 Offline payment request সংরক্ষিত হয়েছে। Reader ফিরে এলে bot নিজেই transaction মিলিয়ে approve করার চেষ্টা করবে। মিল না হলে Admin/Staff হাতে যাচাই করবে।");
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("offlinepay_status_")) {
@@ -2600,10 +3192,24 @@ Approve করার আগে official bKash/Nagad transaction history-তে �
                 return interaction.editReply({ content: `⚠️ আংশিক পেমেন্ট approve হয়েছে — **${paid} / ${target_} BDT**। বাকি ${Math.max(0, target_ - paid)} BDT পরিশোধ না হওয়া পর্যন্ত সম্পূর্ণ অ্যাক্সেস নাও পেতে পারেন।`, components: [partialRow] });
             }
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success));
-            return interaction.editReply({ content: "✅ Admin/Staff offline payment approve করেছেন। নিচের বাটনে username/password তৈরি করুন।", components: [row] });
+            const approvedRecord = session.offlinePaymentRequestId
+                ? (await db.ref(`offline_payment_requests/${session.offlinePaymentRequestId}`).once("value")).val()
+                : null;
+            const approvedCopy = approvedRecord?.autoApproved
+                ? `✅ Reader-verified payment পাওয়া গেছে, credit হয়েছে **${paid} BDT**। নিচের বাটনে username/password তৈরি করুন — Admin পরে যাচাই করে নেবেন।`
+                : `✅ Admin/Staff offline payment approve করেছেন। নিচের বাটনে username/password তৈরি করুন।`;
+            return interaction.editReply({ content: approvedCopy, components: [row] });
         }
         if (session.status === "expired") return interaction.editReply("⌛ এই checkout-এর মেয়াদ শেষ হয়ে গেছে, তাই offline payment request-ও বাতিল হয়েছে। Shop থেকে নতুন করে package নির্বাচন করুন।");
-        if (session.status === "offline_payment_requested") return interaction.editReply("🕓 Offline payment request এখনও Admin/Staff review-এর অপেক্ষায় আছে।");
+        if (session.status === "offline_payment_requested") {
+            const pendingRecord = session.offlinePaymentRequestId
+                ? (await db.ref(`offline_payment_requests/${session.offlinePaymentRequestId}`).once("value")).val()
+                : null;
+            if (pendingRecord && pendingRecord.autoVerifyStage === "awaiting_reader") {
+                return interaction.editReply("🕓 আপনার request সংরক্ষিত আছে। Reader এখনো online হয়নি — Reader ফিরে এলে bot নিজেই TxnID মিলিয়ে approve করবে, আপনাকে কিছু করতে হবে না।");
+            }
+            return interaction.editReply("🕓 Offline payment request এখনও review-এর অপেক্ষায় আছে (Reader-এর সাথে মিলিয়ে দেখা হচ্ছে / Admin যাচাই করছেন)।");
+        }
         if (session.status === "offline_payment_rejected") {
             const rejectedRecord = session.offlinePaymentRequestId
                 ? (await db.ref(`offline_payment_requests/${session.offlinePaymentRequestId}`).once("value")).val()
@@ -2613,6 +3219,91 @@ Approve করার আগে official bKash/Nagad transaction history-তে �
         }
         if (session.status === "offline_payment_request_expired") return interaction.editReply("⌛ Offline payment request-এর মেয়াদ শেষ (staff নির্ধারিত সময়ের মধ্যে review করতে পারেননি)। Shop থেকে নতুন request দিন।");
         return interaction.editReply("ℹ️ কোনো pending offline payment request নেই। Reader offline হলে payment option থেকে Offline payment request বেছে নিন।");
+    }
+
+    // ── Post-review: Verified OK / Fake (Revoke & Ban) / Unban ─────────────────
+    if (interaction.isButton() && /^offlinepay_(markok|fake|revoke|unban)_/.test(interaction.customId)) {
+        const isApprover = interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)
+            || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin"))
+            || memberHasModeratorRole(interaction.member, "orders", [getConfiguredRoleId("supportCustomer")]);
+        if (!isApprover) return interaction.reply({ content: "❌ শুধু অনুমোদিত Admin/Staff offline payment review করতে পারবেন।", flags: [MessageFlags.Ephemeral] });
+        const match = /^offlinepay_(markok|fake|revoke|unban)_(.+)$/.exec(interaction.customId);
+        const action = match[1];
+        const requestId = match[2];
+        if (action === "fake") {
+            const modal = new ModalBuilder()
+                .setCustomId(`modal_offlinefraud_${requestId}`)
+                .setTitle("🚫 Fake Payment — Revoke & Ban");
+            modal.addComponents(
+                new ActionRowBuilder().addComponents(new TextInputBuilder()
+                    .setCustomId("fraud_reason").setLabel("কারণ কোড")
+                    .setPlaceholder("txn_not_found / amount_mismatch / duplicate_txn / old_transaction / wrong_account / other")
+                    .setStyle(TextInputStyle.Short).setMinLength(3).setMaxLength(40).setRequired(true)),
+                new ActionRowBuilder().addComponents(new TextInputBuilder()
+                    .setCustomId("fraud_note").setLabel("নোট (User ও audit log-এ যাবে)")
+                    .setPlaceholder("যেমন: official history-তে এই TxnID নেই").setStyle(TextInputStyle.Paragraph)
+                    .setMaxLength(300).setRequired(false)));
+            return interaction.showModal(modal);
+        }
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        if (action === "markok") {
+            const now = Date.now();
+            await db.ref(`offline_payment_requests/${requestId}`).update({
+                checkedByAdmin: true, checkedBy: interaction.user.id,
+                checkedByUsername: interaction.user.username, checkedAt: now, updatedAt: now
+            }).catch(() => {});
+            if (requestId) {
+                const txnId = (await db.ref(`offline_payment_requests/${requestId}`).once("value")).val()?.txnId;
+                if (txnId) await db.ref(`transactions/${txnId}`).update({
+                    checkedByAdmin: true, checkedBy: interaction.user.id, checkedAt: now }).catch(() => {});
+            }
+            await db.ref("auditLog").push({
+                adminUid: interaction.user.id, actionType: "offline_payment_check_ok", timestamp: now,
+                summary: `Verified auto-approved offline request ${requestId} against provider history — OK`
+            }).catch(() => {});
+            await interaction.message.edit({ components: [] }).catch(() => {});
+            return interaction.editReply(`✅ Offline request \`${requestId}\` official history-তে মিলে গেছে — **Verified OK** হিসেবে রেকর্ড হয়েছে।`);
+        }
+        if (action === "unban") {
+            const result = await handleOfflineFraudUnban({ requestId, actor: interaction.user });
+            await interaction.message.edit({ components: [] }).catch(() => {});
+            if (!result.ok) return interaction.editReply(`⚠️ Unban করা যায়নি (${result.reason})।`);
+            return interaction.editReply(`🔓 Account ফেরত দেওয়া হয়েছে (**${result.restored}** টি C++ account), strike কমানো হয়েছে।`);
+        }
+        // revoke = credit ফেরত কিন্তু ban নয়
+        const snapNow = await db.ref(`offline_payment_requests/${requestId}`).once("value");
+        const record = snapNow.val();
+        if (!record) return interaction.editReply(`⚠️ এই request পাওয়া যাচ্ছে না (\`${requestId}\`)।`);
+        const info = normalizeFraudReason("other", `Credit revoke only by ${interaction.user.username} (ban দেওয়া হয়নি)`);
+        const result = await handleOfflineFraudRevoke({ requestId, fraudInfo: info, actor: interaction.user, ban: false });
+        await interaction.message.edit({ components: [] }).catch(() => {});
+        if (!result.ok) return interaction.editReply(`⚠️ Revoke করা যায়নি (${result.reason})।`);
+        return interaction.editReply(describeRevokeOutcome({
+            request: { id: requestId }, creditReversed: result.creditReversed,
+            accountsDisabled: 0, strikes: result.strikes, strikeLimit: result.strikeLimit
+        }));
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId.startsWith("modal_offlinefraud_")) {
+        const isApprover = interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)
+            || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin"))
+            || memberHasModeratorRole(interaction.member, "orders", [getConfiguredRoleId("supportCustomer")]);
+        if (!isApprover) return interaction.reply({ content: "❌ শুধু অনুমোদিত Admin/Staff এই কাজ করতে পারবেন।", flags: [MessageFlags.Ephemeral] });
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const requestId = interaction.customId.slice("modal_offlinefraud_".length);
+        const fraudInfo = normalizeFraudReason(
+            interaction.fields.getTextInputValue("fraud_reason"),
+            interaction.fields.getTextInputValue("fraud_note"));
+        const result = await handleOfflineFraudRevoke({ requestId, fraudInfo, actor: interaction.user, ban: true });
+        await interaction.message?.edit({ components: [] }).catch(() => {});
+        if (!result.ok) {
+            if (result.reason === "already_revoked") return interaction.editReply("ℹ️ এই request আগেই fake হিসেবে revoke করা হয়েছে।");
+            return interaction.editReply(`⚠️ Revoke করা যায়নি (${result.reason})।`);
+        }
+        return interaction.editReply(describeRevokeOutcome({
+            request: { id: requestId }, creditReversed: result.creditReversed,
+            accountsDisabled: result.accountsDisabled, strikes: result.strikes, strikeLimit: result.strikeLimit
+        }) + `\n\nব্যবহৃত কারণ: ${fraudInfo.reasonLabel}`);
     }
 
     if (interaction.isButton() && /^offlinepay_(approve|reject)_/.test(interaction.customId)) {
@@ -2689,7 +3380,11 @@ Approve করার আগে official bKash/Nagad transaction history-তে �
             return interaction.editReply(`⚠️ এই request পাওয়া যাচ্ছে না। Request ID: \`${requestId}\` — Firebase-এ রেকর্ড ডিলিট হয়েছে কিনা যাচাই করুন।`);
         }
         // Already approved (by any admin): approving again is a safe no-op, rejecting is blocked.
-        if (existing.status === "approved" || existing.status === "approved_but_session_changed") {
+        if (existing.status === "revoked_fake" || existing.status === "revoked_restored") {
+            await interaction.message.edit({ components: [] }).catch(() => {});
+            return interaction.editReply(`🚫 এই request fake হিসেবে revoke করা হয়েছে (${whoReviewed(existing)}${reviewedWhen(existing)})। approve/reject করা যাবে না — ভুল হলে Unban বাটন ব্যবহার করুন।`);
+        }
+        if (existing.status === "approved" || existing.status === "approved_but_session_changed" || existing.status === "auto_approved") {
             if (action === "approve") {
                 const healed = await approveSession(existing.checkoutKey, Number(existing.approvedAmount) || Number(existing.amount) || 0);
                 if (healed) {
@@ -2760,7 +3455,7 @@ Approve করার আগে official bKash/Nagad transaction history-তে �
             const retryVal = retrySnap.val();
             console.error(`[offlinepay] Claim race: requestId=${requestId} status=${retryVal?.status} action=${action}`);
             if (!retryVal) return interaction.editReply(`⚠️ এই request আর পাওয়া যাচ্ছে না (Request ID: \`${requestId}\`)।`);
-            if (retryVal.status === "approved" || retryVal.status === "approved_but_session_changed") {
+            if (retryVal.status === "approved" || retryVal.status === "approved_but_session_changed" || retryVal.status === "auto_approved") {
                 if (action === "approve") {
                     const healed = await approveSession(retryVal.checkoutKey, Number(retryVal.approvedAmount) || Number(retryVal.amount) || 0);
                     if (healed) {
@@ -2810,6 +3505,8 @@ Approve করার আগে official bKash/Nagad transaction history-তে �
             }
             await reqRef.update({ sessionCreditedAt: Date.now() }).catch(() => {});
             await notifyOfflineRequester(request, true).catch(() => {});
+            // post-review: Admin এক ক্লিকে "Fake — Revoke & Ban" করতে পারেন।
+            await postOfflineApprovedReview({ ...request, id: requestId }, { auto: false }).catch(() => {});
             await interaction.editReply(`✅ Offline payment request approve করা হয়েছে (${actorTag})। ${Number(request.approvedAmount)} BDT credit হয়েছে; User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।`);
         } else {
             await sessionRef.transaction(current => current?.offlinePaymentRequestId === requestId && current.status === "offline_payment_requested"
@@ -4594,9 +5291,13 @@ client.on("ready", async () => {
     setBotPresence();
     registerCouponRequestListener();
     registerOfflinePaymentRequestListener();
+    registerReaderEventAutoVerifyListeners();
     if (offlineSweepTimer) clearInterval(offlineSweepTimer);
     offlineSweepTimer = setInterval(() => sweepOfflinePaymentRequests().catch(err => console.error("Offline sweep failed:", err.message)), 15 * 60 * 1000);
     setTimeout(() => sweepOfflinePaymentRequests().catch(() => {}), 60_000);
+    // Reader ফিরে এলে যত দ্রুত সম্ভব মিলিয়ে নেওয়া — ২ মিনিট পর পর pass।
+    startOfflineAutoVerifyTimer();
+    setTimeout(() => runOfflineAutoVerifyPass().catch(() => {}), 20_000);
     if (heartbeatTimer) clearInterval(heartbeatTimer);
     publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message));
     heartbeatTimer = setInterval(() => publishBotHeartbeat().catch(err => console.error("Bot heartbeat failed:", err.message)), 30_000);
@@ -4662,7 +5363,7 @@ async function processCouponRequest(requestId, request) {
 
 let couponRequestListenerRegistered = false;
 let offlineRequestListenerRegistered = false;
-let offlineSweepTimer = null;
+
 function registerCouponRequestListener() {
     if (couponRequestListenerRegistered) return;
     couponRequestListenerRegistered = true;
@@ -4727,6 +5428,8 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
     process.on(signal, async () => {
         if (heartbeatTimer) clearInterval(heartbeatTimer);
         if (weeklyReportTimer) clearInterval(weeklyReportTimer);
+        if (offlineAutoVerifyTimer) clearInterval(offlineAutoVerifyTimer);
+        if (offlineSweepTimer) clearInterval(offlineSweepTimer);
         try { await db.ref("runtime/bot").update({ online: false, lastHeartbeatAt: Date.now(), offlineReason: signal }); } catch (_) {}
         try { client.destroy(); } catch (_) {}
         process.exit(0);

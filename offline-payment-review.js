@@ -13,10 +13,13 @@ function getOfflineReviewDecision({ action, request }) {
   if (!request) return { allowed: false, reason: "not_found" };
   const status = String(request.status || "");
 
-  if (status === "approved" || status === "approved_but_session_changed") {
+  if (status === "approved" || status === "approved_but_session_changed" || status === "auto_approved") {
     if (action === "approve") return { allowed: true, reason: "already_approved_self_heal", idempotent: true };
     return { allowed: false, reason: "already_approved" };
   }
+  // fake প্রমাণিত request আর approve/reject করা যাবে না — শুধু unban/restore।
+  if (status === "revoked_fake") return { allowed: false, reason: "revoked_fake" };
+  if (status === "revoked_restored") return { allowed: false, reason: "revoked_restored" };
   if (status === "rejected") {
     if (action === "reject") return { allowed: false, reason: "already_rejected", idempotent: true };
     return { allowed: false, reason: "already_rejected_blocks_approve" };
