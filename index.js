@@ -31,6 +31,7 @@ const {
 // html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
 const { evaluateCheckoutEligibility, checkoutFingerprint, resolveParentCategoryId } = require("./checkout-security");
+const { isOpenOfflineReviewStatus, shouldExpireOfflineRequest, describeReviewer, describeReviewedAt } = require("./offline-payment-review");
 const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
 const { readDiscordServerRules } = require("./discord-server-rules");
 const { classifyBusinessRoles } = require("./discord-business-role-classifier");
@@ -1871,6 +1872,27 @@ function getDisabledFeatureMessage(interaction) {
     return null;
 }
 
+async function expireStaleOfflineRequest(requestId, request) {
+    if (!request || !isOpenOfflineReviewStatus(request.status)) return false;
+    const settings = getCheckoutSettings();
+    const deadlineMs = settings.sessionExpiryHours * 60 * 60 * 1000;
+    let session = null;
+    if (request.checkoutKey) session = (await db.ref(`pending_payments/${request.checkoutKey}`).once("value")).val();
+    if (!shouldExpireOfflineRequest({ request, session, now: Date.now(), deadlineMs })) return false;
+    const now = Date.now();
+    await db.ref(`offline_payment_requests/${requestId}`)
+        .update({ status: "expired", expiredAt: now, updatedAt: now })
+        .catch(err => console.error(`[offlinepay] Expire request failed: ${requestId} ${err.message}`));
+    if (request.checkoutKey && session && ["offline_payment_requested", "reader_offline"].includes(String(session.status || ""))) {
+        await db.ref(`pending_payments/${request.checkoutKey}`)
+            .update({ status: "expired", expiredAt: now, lastUpdated: now })
+            .catch(() => {});
+    }
+    console.log(`[offlinepay] Expired stale request ${requestId} (session=${session?.status || "missing"})`);
+    return true;
+}
+
+
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
 
@@ -2339,12 +2361,23 @@ client.on("interactionCreate", async (interaction) => {
         const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
         const sessionSnap = await sessionRef.once("value");
         const session = sessionSnap.val();
-        if (!session || session.provider !== provider || session.status !== "reader_offline") {
+        if (!session || session.status === "expired") {
+            return interaction.editReply("⌛ এই checkout-এর মেয়াদ শেষ হয়ে গেছে। Shop থেকে নতুন করে package নির্বাচন করে আবার চেষ্টা করুন।");
+        }
+        if (session.provider !== provider || session.status !== "reader_offline") {
             return interaction.editReply("⚠️ এই checkout এখন offline-payment request-এর জন্য প্রস্তুত নয়। Payment option আবার নির্বাচন করুন।");
         }
         const existingSnap = await db.ref("offline_payment_requests").orderByChild("discordUserId").equalTo(interaction.user.id).once("value");
-        const existing = Object.entries(existingSnap.val() || {}).find(([, r]) => r && r.category === category && r.status === "pending");
-        if (existing) return interaction.editReply(`🕓 আপনার offline payment request ইতোমধ্যে pending আছে। Request ID: \`${existing[0]}\``);
+        let existing = null;
+        for (const [openId, openRecord] of Object.entries(existingSnap.val() || {})) {
+            if (!openRecord || openRecord.category !== category) continue;
+            if (!isOpenOfflineReviewStatus(String(openRecord.status || ""))) continue;
+            // মেয়াদোত্তীর্ণ request হলে expired করে দিন, যাতে নতুন request আটকে না থাকে।
+            if (await expireStaleOfflineRequest(openId, openRecord)) continue;
+            existing = { ...openRecord, id: openRecord.id || openId };
+            break;
+        }
+        if (existing) return interaction.editReply(`🕓 আপনার offline payment request ইতোমধ্যে pending আছে। Request ID: \`${existing.id}\``);
         const reqRef = db.ref("offline_payment_requests").push();
         const requestData = {
             id: reqRef.key, discordUserId: interaction.user.id, discordUsername: interaction.user.username,
@@ -2353,7 +2386,8 @@ client.on("interactionCreate", async (interaction) => {
         };
         await reqRef.set(requestData);
         await sessionRef.update({ status: "offline_payment_requested", offlinePaymentRequestId: reqRef.key, offlinePaymentRequestedAt: Date.now() });
-        const staffChannel = interaction.guild.channels.cache.get(STAFF_ADMIN_LOG_ID);
+        let staffChannel = interaction.guild.channels.cache.get(STAFF_ADMIN_LOG_ID);
+        if (!staffChannel) staffChannel = await interaction.guild.channels.fetch(STAFF_ADMIN_LOG_ID).catch(() => null);
         if (!staffChannel || !staffChannel.isTextBased()) {
             await reqRef.update({ status: "needs_staff_channel", updatedAt: Date.now() });
             return interaction.editReply("⚠️ Offline request সংরক্ষিত হয়েছে, কিন্তু staff review channel পাওয়া যায়নি। Admin-কে STAFF_ADMIN_LOG_ID channel সেট করতে বলুন।");
@@ -2385,8 +2419,10 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success));
             return interaction.editReply({ content: "✅ Admin/Staff offline payment approve করেছেন। নিচের বাটনে username/password তৈরি করুন।", components: [row] });
         }
+        if (session.status === "expired") return interaction.editReply("⌛ এই checkout-এর মেয়াদ শেষ হয়ে গেছে, তাই offline payment request-ও বাতিল হয়েছে। Shop থেকে নতুন করে package নির্বাচন করুন।");
         if (session.status === "offline_payment_requested") return interaction.editReply("🕓 Offline payment request এখনও Admin/Staff review-এর অপেক্ষায় আছে।");
         if (session.status === "offline_payment_rejected") return interaction.editReply("❌ Offline payment request reject করা হয়েছে। সঠিক payment proof থাকলে staff-এর সঙ্গে যোগাযোগ করুন।");
+        if (session.status === "offline_payment_request_expired") return interaction.editReply("⌛ Offline payment request-এর মেয়াদ শেষ (staff নির্ধারিত সময়ের মধ্যে review করতে পারেননি)। Shop থেকে নতুন request দিন।");
         return interaction.editReply("ℹ️ কোনো pending offline payment request নেই। Reader offline হলে payment option থেকে Offline payment request বেছে নিন।");
     }
 
@@ -2399,6 +2435,9 @@ Approve করার আগে official bKash/Nagad transaction history নি�
         const match = /^offlinepay_(approve|reject)_(.+)$/.exec(interaction.customId);
         const action = match[1]; const requestId = match[2];
         const reqRef = db.ref(`offline_payment_requests/${requestId}`);
+        const actorTag = `<@${interaction.user.id}>`;
+        const whoReviewed = describeReviewer;
+        const reviewedWhen = describeReviewedAt;
         // Session approve idempotent: already approved with same requestId = success (no-op).
         const approveSession = async (checkoutKey) => {
             const sessionRef = db.ref(`pending_payments/${checkoutKey}`);
@@ -2420,56 +2459,71 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             console.error(`[offlinepay] Request not found: ${requestId} action=${action} by=${interaction.user.id}`);
             return interaction.editReply(`⚠️ এই request পাওয়া যাচ্ছে না। Request ID: \`${requestId}\` — Firebase-এ রেকর্ড ডিলিট হয়েছে কিনা যাচাই করুন।`);
         }
+        // Already approved (by any admin): approving again is a safe no-op, rejecting is blocked.
         if (existing.status === "approved" || existing.status === "approved_but_session_changed") {
             if (action === "approve") {
                 const healed = await approveSession(existing.checkoutKey);
                 if (healed) {
                     if (existing.status === "approved_but_session_changed") await reqRef.update({ status: "approved", updatedAt: Date.now() });
                     await interaction.message.edit({ components: [] }).catch(() => {});
-                    return interaction.editReply("✅ এই request আগেই approve করা হয়েছিল। Session আবার যাচাই করে approve নিশ্চিত করা হয়েছে। User এখন account তৈরি করতে পারবেন।");
+                    return interaction.editReply(`✅ এই request আগেই ${whoReviewed(existing)} approve করেছেন${reviewedWhen(existing)}। আপনি (${actorTag}) আবার যাচাই করে approve নিশ্চিত করেছেন — User এখন account তৈরি করতে পারবেন।`);
                 }
-                return interaction.editReply("⚠️ Request approve আছে, কিন্তু checkout session আর মেলেনি। Admin-কে Firebase-এ session যাচাই করতে হবে।");
+                return interaction.editReply(`ℹ️ এই request আগেই ${whoReviewed(existing)} approve করেছেন${reviewedWhen(existing)}। তবে checkout session আর মেলেনি, তাই নতুন করে credit হয়নি — Firebase-এ \`pending_payments/${existing.checkoutKey}\` যাচাই করুন।`);
             }
             await interaction.message.edit({ components: [] }).catch(() => {});
-            return interaction.editReply("⚠️ এই request আগেই approve করা হয়েছে, এখন reject করা যাবে না।");
+            return interaction.editReply(`⛔ এই request আগেই ${whoReviewed(existing)} approve করেছেন${reviewedWhen(existing)}। তাই এখন reject করা যাবে না। কিছু ভুল হলে ওই Admin-এর সঙ্গে যোগাযোগ করুন।`);
         }
         if (existing.status === "rejected") {
             await interaction.message.edit({ components: [] }).catch(() => {});
-            return interaction.editReply("⚠️ এই request আগেই reject করা হয়েছে।");
+            if (action === "reject") return interaction.editReply(`ℹ️ এই request আগেই ${whoReviewed(existing)} reject করেছেন${reviewedWhen(existing)}।`);
+            return interaction.editReply(`⛔ এই request আগেই ${whoReviewed(existing)} reject করেছেন${reviewedWhen(existing)}। তাই এখন approve করা যাবে না — User-কে নতুন করে request দিতে বলুন।`);
         }
-        if (existing.status === "needs_staff_channel") {
-            return interaction.editReply("⚠️ এই request-এর staff channel পাওয়া যায়নি। Admin-কে STAFF_ADMIN_LOG_ID যাচাই করতে হবে।");
+        if (existing.status === "expired") {
+            await interaction.message.edit({ components: [] }).catch(() => {});
+            return interaction.editReply("⌛ এই request-এর মেয়াদ শেষ হয়ে গেছে (checkout deadline পার হয়েছে)। approve/reject করা যাবে না — User-কে Shop থেকে নতুন checkout করতে বলুন।");
         }
-        if (existing.status !== "pending") {
+        if (isOpenOfflineReviewStatus(existing.status)) {
+            // Approve করার আগে checkout session-এর মেয়াদ যাচাই — expired হলে credit হবে না।
+            if (await expireStaleOfflineRequest(requestId, existing)) {
+                await interaction.message.edit({ components: [] }).catch(() => {});
+                return interaction.editReply("⌛ এই checkout-এর মেয়াদ শেষ হয়ে গেছে, তাই request টি বাতিল (expired) হয়েছে। approve করা যাবে না — User-কে নতুন checkout করতে বলুন।");
+            }
+        }
+        if (!isOpenOfflineReviewStatus(existing.status)) {
             console.error(`[offlinepay] Unexpected status: ${existing.status} requestId=${requestId} action=${action}`);
             return interaction.editReply(`⚠️ এই request-এর status \`${existing.status}\` — review করা যাচ্ছে না।`);
         }
         const claim = await reqRef.transaction(current => {
-            if (!current || current.status !== "pending") return;
-            return { ...current, status: action === "approve" ? "approved" : "rejected", reviewedBy: interaction.user.id, reviewedAt: Date.now() };
+            if (!current || !isOpenOfflineReviewStatus(String(current.status || ""))) return;
+            return { ...current, status: action === "approve" ? "approved" : "rejected", reviewedBy: interaction.user.id,
+                reviewedByUsername: interaction.user.username, reviewedAt: Date.now() };
         }, undefined, false);
         if (!claim.committed) {
             const retrySnap = await reqRef.once("value");
             const retryVal = retrySnap.val();
             console.error(`[offlinepay] Claim race: requestId=${requestId} status=${retryVal?.status} action=${action}`);
-            if (retryVal?.status === "approved" || retryVal?.status === "approved_but_session_changed") {
+            if (!retryVal) return interaction.editReply(`⚠️ এই request আর পাওয়া যাচ্ছে না (Request ID: \`${requestId}\`)।`);
+            if (retryVal.status === "approved" || retryVal.status === "approved_but_session_changed") {
                 if (action === "approve") {
                     const healed = await approveSession(retryVal.checkoutKey);
                     if (healed) {
                         if (retryVal.status === "approved_but_session_changed") await reqRef.update({ status: "approved", updatedAt: Date.now() });
                         await interaction.message.edit({ components: [] }).catch(() => {});
-                        return interaction.editReply("✅ এই request আগেই approve করা হয়েছিল। Session আবার যাচাই করে approve নিশ্চিত করা হয়েছে। User এখন account তৈরি করতে পারবেন।");
+                        return interaction.editReply(`✅ এই request আগেই ${whoReviewed(retryVal)} approve করেছেন${reviewedWhen(retryVal)}। আপনি (${actorTag}) আবার যাচাই করে approve নিশ্চিত করেছেন।`);
                     }
-                } else {
-                    await interaction.message.edit({ components: [] }).catch(() => {});
-                    return interaction.editReply("⚠️ এই request আগেই approve করা হয়েছে, এখন reject করা যাবে না।");
                 }
-            }
-            if (retryVal?.status === "rejected") {
                 await interaction.message.edit({ components: [] }).catch(() => {});
-                return interaction.editReply("⚠️ এই request একই সময়ে আরেকজন reject করেছে।");
+                return interaction.editReply(`⛔ এই request এইমাত্র ${whoReviewed(retryVal)} approve করেছেন${reviewedWhen(retryVal)}। তাই এখন reject করা যাবে না।`);
             }
-            return interaction.editReply("⚠️ এই request একই সময়ে আরেকজন review করেছে। Status আপডেট হয়েছে।");
+            if (retryVal.status === "rejected") {
+                await interaction.message.edit({ components: [] }).catch(() => {});
+                return interaction.editReply(`ℹ️ এই request এইমাত্র ${whoReviewed(retryVal)} reject করেছেন${reviewedWhen(retryVal)}।`);
+            }
+            if (retryVal.status === "expired") {
+                await interaction.message.edit({ components: [] }).catch(() => {});
+                return interaction.editReply("⌛ এই request-এর মেয়াদ শেষ (expired)। approve/reject করা যাবে না।");
+            }
+            return interaction.editReply(`⚠️ এই request এইমাত্র ${whoReviewed(retryVal)} review করেছেন (status: \`${retryVal.status}\`)। Discord-এ একবারই ক্লিক করুন।`);
         }
         const request = claim.snapshot.val();
         const sessionRef = db.ref(`pending_payments/${request.checkoutKey}`);
@@ -2477,13 +2531,14 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             const approved = await approveSession(request.checkoutKey);
             if (!approved) {
                 await reqRef.update({ status: "approved_but_session_changed", updatedAt: Date.now() });
-                return interaction.editReply("⚠️ Request approve হয়েছে, কিন্তু checkout session আর মেলেনি। Account credit করা হয়নি; Admin-কে session যাচাই করতে হবে।");
+                const currentStatus = String((await sessionRef.once("value")).val()?.status || "missing");
+                return interaction.editReply(`⚠️ Request approve হয়েছে (${actorTag}), কিন্তু checkout session আর মেলেনি — session টি এখন \`${currentStatus}\`। Account credit করা হয়নি; Firebase-এ যাচাই করুন।`);
             }
-            await interaction.editReply("✅ Offline payment request approve করা হয়েছে। User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।");
+            await interaction.editReply(`✅ Offline payment request approve করা হয়েছে (${actorTag})। User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।`);
         } else {
             await sessionRef.transaction(current => current?.offlinePaymentRequestId === requestId && current.status === "offline_payment_requested"
                 ? { ...current, status: "offline_payment_rejected", offlineRejectedBy: interaction.user.id, offlineRejectedAt: Date.now() } : undefined, undefined, false);
-            await interaction.editReply("❌ Offline payment request reject করা হয়েছে।");
+            await interaction.editReply(`❌ Offline payment request reject করা হয়েছে (${actorTag})।`);
         }
         await interaction.message.edit({ components: [] }).catch(() => {});
         return;
@@ -2690,6 +2745,12 @@ Approve করার আগে official bKash/Nagad transaction history নি�
             const checkoutSettings = getCheckoutSettings();
             const createdAt = Number(initialSession.createdAt) || 0;
             if (createdAt > 0 && (Number(initialSession.totalPaid) || 0) <= 0 && Date.now() - createdAt > checkoutSettings.sessionExpiryHours * 60 * 60 * 1000) {
+                if (initialSession.offlinePaymentRequestId) {
+                    await db.ref(`offline_payment_requests/${initialSession.offlinePaymentRequestId}`).transaction(current =>
+                        current && isOpenOfflineReviewStatus(String(current.status || ""))
+                            ? { ...current, status: "expired", expiredAt: Date.now(), updatedAt: Date.now() }
+                            : undefined, undefined, false).catch(() => {});
+                }
                 await sessionRef.update({ status: "expired", expiredAt: Date.now(), lastUpdated: Date.now() }).catch(() => {});
                 return interaction.editReply(`⌛ এই checkout session-এর মেয়াদ শেষ (${checkoutSettings.sessionExpiryHours} ঘণ্টা)। Shop থেকে নতুন checkout শুরু করুন।`);
             }
