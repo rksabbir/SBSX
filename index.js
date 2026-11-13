@@ -35,6 +35,7 @@ const { normalizeTxnId, normalizeSenderNumber, parseAmount, canUserCreateOffline
     normalizeRejectReason, describeOfflineOutcome } = require("./offline-payment");
 const { isOpenOfflineReviewStatus, shouldExpireOfflineRequest, describeReviewer, describeReviewedAt } = require("./offline-payment-review");
 const { findReaderEventByTxnId, evaluateReaderMatch, evaluateStrikeGate, nextStrikeState, describeAutoApproval } = require("./offline-payment-auto");
+const { ticketLockKey, buildTicketLockRecord, evaluateTicketOpenGate, buildTicketReleasePatch, shouldReleaseStaleLock, describeTicketLockBlock, describeTicketType, describeTicketCategory } = require("./ticket-lock");
 const { OFFLINE_FRAUD_REASONS, normalizeFraudReason, buildSessionRevokePatch, buildTxnFlagPatch, buildBanPlan, buildUnbanPlan, describeRevokeOutcome } = require("./offline-payment-fraud");
 const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
 const { readDiscordServerRules } = require("./discord-server-rules");
@@ -201,6 +202,11 @@ const OFFLINE_AUTO_VERIFY_INTERVAL_MS = Math.max(30_000, Number(process.env.OFFL
 // কতবার ফেক ধরলে ইউজারের নতুন offline request বন্ধ হবে।
 const OFFLINE_MAX_STRIKES = Math.max(1, Number(process.env.OFFLINE_MAX_STRIKES || 3));
 const OFFLINE_FRAUD_BAN_ENABLED = String(process.env.OFFLINE_FRAUD_BAN_ENABLED || "true").toLowerCase() !== "false";
+// টিকিট বন্ধ হওয়ার পর কতক্ষণ অপেক্ষা করে আবার খোলা যাবে।
+const TICKET_REOPEN_COOLDOWN_MS = Math.max(0, Number(process.env.TICKET_REOPEN_COOLDOWN_MS || 5 * 60 * 1000));
+const TICKET_LOCK_SWEEP_INTERVAL_MS = Math.max(60_000, Number(process.env.TICKET_LOCK_SWEEP_INTERVAL_MS || 10 * 60 * 1000));
+const TICKET_LOCK_MAX_AGE_MS = Math.max(60 * 60 * 1000, Number(process.env.TICKET_LOCK_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000));
+let ticketLockSweepTimer = null;
 let offlineSweepTimer = null;
 let offlineAutoVerifyTimer = null;
 const READER_RECHECK_COOLDOWN_MS = Math.max(10_000, Number(process.env.READER_RECHECK_COOLDOWN_MS || 15_000));
@@ -639,6 +645,87 @@ app.get("/api/admin/offline-payment/overview", async (req, res) => {
 });
 
 // Admin Panel → Discord panel: validate + preview + save. bot নিজে থেকেই `panels` listener-এ sync করে।
+// Admin Panel: কোন ইউজারের কোন ক্যাটাগরিতে টিকিট খোলা আছে।
+app.get("/api/admin/tickets/locks", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        await verifyAdminApiRequest(req);
+        const snap = await db.ref(`open_tickets/${ALLOWED_GUILD_ID}`).once("value");
+        const now = Date.now();
+        const rows = [];
+        for (const [userId, locks] of Object.entries(snap.val() || {})) {
+            for (const [key, lock] of Object.entries(locks || {})) {
+                if (!lock || typeof lock !== "object") continue;
+                const releasedAt = Number(lock.releasedAt) || 0;
+                rows.push({
+                    userId, key,
+                    type: String(lock.type || key.split(":")[0] || "ticket"),
+                    category: String(lock.category || key.split(":")[1] || ""),
+                    channelId: String(lock.channelId || ""),
+                    status: String(lock.status || "open"),
+                    openedAt: Number(lock.openedAt) || 0,
+                    releasedAt, releasedReason: String(lock.releasedReason || ""),
+                    inCooldown: releasedAt > 0 && now - releasedAt < TICKET_REOPEN_COOLDOWN_MS,
+                    cooldownLeftMs: releasedAt > 0 ? Math.max(0, TICKET_REOPEN_COOLDOWN_MS - (now - releasedAt)) : 0
+                });
+            }
+        }
+        rows.sort((a, b) => (b.status === "open" ? 1 : 0) - (a.status === "open" ? 1 : 0) || b.openedAt - a.openedAt);
+        return res.json({
+            ok: true, locks: rows.slice(0, 500),
+            settings: { reopenCooldownMs: TICKET_REOPEN_COOLDOWN_MS, sweepIntervalMs: TICKET_LOCK_SWEEP_INTERVAL_MS, maxAgeMs: TICKET_LOCK_MAX_AGE_MS },
+            version: require("./package.json").version
+        });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Ticket locks API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "locks_failed" });
+    }
+});
+
+// Admin Panel: কোনো ইউজারের লক জোর করে ছেড়ে দেওয়া (যেমন ভুল করে আটকে গেলে)।
+app.post("/api/admin/tickets/release", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const userId = String(req.body?.userId || "").trim();
+        const key = String(req.body?.key || "").trim();
+        const clearCooldown = req.body?.clearCooldown === true;
+        if (!/^\d{15,25}$/.test(userId) || !/^[a-z_]+:[a-z0-9_]+$/i.test(key)) {
+            return res.status(400).json({ ok: false, error: "invalid_lock_target" });
+        }
+        const ref = db.ref(`open_tickets/${ALLOWED_GUILD_ID}/${userId}/${key}`);
+        const result = await ref.transaction(current => {
+            if (!current) return;
+            if (clearCooldown) return null; // সম্পূর্ণ মুছে ফেলা — cooldown-ও থাকবে না
+            if (String(current.status || "open") !== "open") return;
+            return buildTicketReleasePatch(current, { now: Date.now(), reason: "admin_release", closedBy: actor.uid });
+        }, undefined, false);
+        if (!result.committed) return res.status(404).json({ ok: false, error: "lock_not_found" });
+        const channelId = String(result.snapshot?.val()?.channelId || "");
+        if (channelId) {
+            const resolved = String(userId);
+            ticketLockChannelIndex.delete(channelId);
+            console.log(`[ticketlock] Admin ${actor.uid} released ${key} for ${resolved}`);
+        }
+        await db.ref("auditLog").push({
+            adminUid: actor.uid, actionType: "ticket_lock_release", timestamp: Date.now(),
+            summary: `Released ticket lock ${key} for ${userId}${clearCooldown ? " (cooldown cleared)" : ""}`
+        }).catch(() => {});
+        return res.json({ ok: true, cleared: clearCooldown, version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Ticket lock release API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "release_failed" });
+    }
+});
+
 app.post("/api/admin/panels/preview", async (req, res) => {
     const origin = String(req.get("origin") || "");
     if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
@@ -1910,6 +1997,16 @@ client.on("messageDelete", async (message) => {
 });
 
 // Automod + Activity XP System
+// টিকিট চ্যানেল মুছে গেলে লক ছেড়ে দাও (cooldown শুরু হবে)।
+client.on("channelDelete", async (channel) => {
+    try {
+        if (!channel?.guild || channel.guild.id !== ALLOWED_GUILD_ID) return;
+        await onTicketChannelDeleted(channel);
+    } catch (err) {
+        console.error("Ticket lock channelDelete handling failed:", err.message);
+    }
+});
+
 client.on("messageCreate", async (message) => {
     if (message.author.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
     if (message.member.permissions.has(PermissionFlagsBits.Administrator) || message.member.roles.cache.has(getConfiguredRoleId("admin"))) return;
@@ -4350,29 +4447,33 @@ client.on("interactionCreate", async (interaction) => {
         const parts = interaction.customId.split("_");
         const type = parts[1]; const category = parts.slice(2).join("_");
 
-        const randomCode = Math.floor(1000 + Math.random() * 9000);
-        const policy = ticketModeratorConfig(type);
-        const supportRoleIds = getModeratorRoleIds(policy.key, policy.fallback);
-        let supportRoleId = supportRoleIds[0] || getConfiguredRoleId("supportTicketReport");
-        let channelPrefix = `${type}-${randomCode}`;
-
-        if (type === "customer") supportRoleId = supportRoleIds[0] || getConfiguredRoleId("supportCustomer");
-
-        const permissionOverwrites = [
-            { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: getConfiguredRoleId("verified"), deny: [PermissionFlagsBits.ViewChannel] },
-            { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
-        ];
-
-        for (const roleId of supportRoleIds) if (interaction.guild.roles.cache.has(roleId)) permissionOverwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-        if (interaction.guild.roles.cache.has(getConfiguredRoleId("admin"))) permissionOverwrites.push({ id: getConfiguredRoleId("admin"), allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-
-        const privateChannel = await interaction.guild.channels.create({
-            name: channelPrefix,
-            type: ChannelType.GuildText,
-            ...(getSourceParentCategoryId(interaction) ? { parent: getSourceParentCategoryId(interaction) } : {}),
-            permissionOverwrites
-        });
+        // একই ইউজার একই ক্যাটাগরিতে একটির বেশি টিকিট খুলতে পারবে না।
+        // একই ইউজার একই ক্যাটাগরিতে একটির বেশি টিকিট খুলতে পারবে না।
+        const ticketLockSlot = ["ticket", "report", "customer"].includes(type)
+            ? await claimTicketSlot({ guildId: interaction.guild.id, userId: interaction.user.id, type, category })
+            : { allowed: true, guard: false };
+        if (!ticketLockSlot.allowed) {
+            return interaction.editReply({ content: describeTicketLockBlock(ticketLockSlot.gate) || "🎫 আপনার ইতিমধ্যে একটি টিকিট খোলা আছে।" });
+        }
+        let privateChannel = null;
+        try {
+            privateChannel = await interaction.guild.channels.create({
+                name: channelPrefix,
+                type: ChannelType.GuildText,
+                ...(getSourceParentCategoryId(interaction) ? { parent: getSourceParentCategoryId(interaction) } : {}),
+                permissionOverwrites
+            });
+        } catch (channelErr) {
+            console.error("❌ Ticket channel creation failed:", channelErr.message);
+            // চ্যানেল না হলে লক ছেড়ে দিতে হবে, নাহলে ইউজার আটকে যাবে।
+            if (ticketLockSlot.ref) await ticketLockSlot.ref.remove().catch(() => {});
+            return interaction.editReply("❌ টিকিট চ্যানেল তৈরি করা যায়নি (Bot-এর Manage Channels permission দেখুন)। আবার চেষ্টা করুন।");
+        }
+        // লকে চ্যানেলের id বসানো — এরপর ওই চ্যানেল বন্ধ/ডিলিট হলে লক ছাড়া যাবে।
+        if (ticketLockSlot.ref) {
+            await finalizeTicketLock({ ref: ticketLockSlot.ref, channelId: privateChannel.id, userId: interaction.user.id, key: ticketLockSlot.key })
+                .catch(err => console.warn("Ticket lock finalize failed:", err.message));
+        }
 
         await saveTicketArchiveOpened(privateChannel, interaction.user, category, type, "pending").catch(err => {
             console.error("❌ Could not create Admin Panel backup index for new support ticket:", privateChannel.id, err.message);
@@ -4521,6 +4622,9 @@ client.on("interactionCreate", async (interaction) => {
             }
         }
 
+        // টিকিট বন্ধ — লক ছেড়ে দাও (cooldown শুরু হবে), যাতে ইউজার পরে আবার খুলতে পারে।
+        await releaseTicketLock({ channelId: interaction.channel.id, reason: "closed", closedBy: interaction.user.id })
+            .catch(err => console.warn("Ticket lock release failed:", err.message));
         await interaction.editReply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
         setTimeout(async () => {
             await interaction.channel.delete().catch(() => {});
@@ -4745,6 +4849,132 @@ function describeBotPanelOptions(panelType) {
         return [{ value: "generate_1time_key", label: "🔑 Generate 1TIME KEY (Dev Only)" }];
     }
     return null;
+}
+
+
+// ── Ticket lock: একই ক্যাটাগরিতে একটির বেশি খোলা টিকিট নয় ────────────────────
+const ticketLockChannelIndex = new Map(); // channelId → { userId, key }
+async function releaseTicketLock({ channelId = "", userId = "", key = "", reason = "closed", closedBy = "" } = {}) {
+    const resolved = channelId ? ticketLockChannelIndex.get(String(channelId)) : null;
+    const ownerId = String(resolved?.userId || userId || "");
+    const lockKey = String(resolved?.key || key || "");
+    if (!ownerId || !lockKey) return false;
+    const now = Date.now();
+    const ref = db.ref(`open_tickets/${ALLOWED_GUILD_ID}/${ownerId}/${lockKey}`);
+    const result = await ref.transaction(current => buildTicketReleasePatch(current, { now, reason, closedBy }), undefined, false);
+    if (channelId) ticketLockChannelIndex.delete(String(channelId));
+    if (result.committed) console.log(`[ticketlock] Released ${lockKey} for ${ownerId} (${reason})`);
+    return Boolean(result.committed);
+}
+
+// নতুন টিকিট তৈরি হওয়ার আগে লক নেওয়া হয়। transaction-এ হয়, তাই দুইবার ক্লিক করলেও একটাই টিকিট হবে।
+async function claimTicketSlot({ guildId, userId, type, category, now = Date.now() }) {
+    const key = ticketLockKey(type, category);
+    const ref = db.ref(`open_tickets/${guildId}/${userId}/${key}`);
+    const result = await ref.transaction(current => {
+        const gate = evaluateTicketOpenGate({ lock: current, now, cooldownMs: TICKET_REOPEN_COOLDOWN_MS });
+        if (!gate.allowed) return;
+        return buildTicketLockRecord({ channelId: "", category, type, ownerId: userId, now });
+    }, undefined, false);
+    if (result.committed) return { allowed: true, key, ref };
+    const current = result.snapshot?.val() || (await ref.once("value")).val();
+    const gate = evaluateTicketOpenGate({ lock: current, now, cooldownMs: TICKET_REOPEN_COOLDOWN_MS });
+    return { allowed: false, key, gate: { ...gate, type, category } };
+}
+
+async function finalizeTicketLock({ ref, channelId, userId, key }) {
+    if (!ref) return false;
+    const result = await ref.transaction(current => {
+        if (!current || String(current.status || "") !== "open") return;
+        if (current.channelId) return; // অন্য কেউ আগেই চ্যানেল বসিয়ে দিয়েছে
+        return { ...current, channelId: String(channelId), updatedAt: Date.now() };
+    }, undefined, false);
+    if (result.committed && channelId) ticketLockChannelIndex.set(String(channelId), { userId: String(userId), key: String(key) });
+    return Boolean(result.committed);
+}
+
+// চ্যানেল ডিলিট হয়ে গেলে লক ছেড়ে দেওয়া।
+async function onTicketChannelDeleted(channel) {
+    const name = String(channel?.name || "");
+    if (!/^(ticket|report|customer)-\d{4}$/i.test(name)) return;
+    await releaseTicketLock({ channelId: channel.id, reason: "channel_deleted" }).catch(() => {});
+    // index-এ থাকলে সেটাও closed করে দিই
+    await db.ref(`ticketTranscriptIndex/${channel.id}`).update({ channelDeletedAt: Date.now() }).catch(() => {});
+}
+
+// মৃত লক পরিষ্কার: চ্যানেল আর নেই বা অনেক পুরোনো।
+async function sweepTicketLocks() {
+    if (!client.isReady()) return { checked: 0, released: 0 };
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (!guild) return { checked: 0, released: 0 };
+    const snap = await db.ref(`open_tickets/${ALLOWED_GUILD_ID}`).once("value").catch(() => null);
+    const now = Date.now();
+    let checked = 0; let released = 0;
+    for (const [userId, locks] of Object.entries(snap?.val() || {})) {
+        for (const [key, lock] of Object.entries(locks || {})) {
+            if (!lock || String(lock.status || "open") !== "open") continue;
+            checked++;
+            const channelId = String(lock.channelId || "");
+            let channelExists = null;
+            if (channelId) {
+                const cached = guild.channels.cache.get(channelId);
+                if (cached) channelExists = true;
+                else channelExists = Boolean(await guild.channels.fetch(channelId).catch(() => null));
+            }
+            if (!shouldReleaseStaleLock({ lock, channelExists, now, maxAgeMs: TICKET_LOCK_MAX_AGE_MS })) continue;
+            await releaseTicketLock({
+                channelId, userId, key,
+                reason: channelExists === false ? "channel_missing" : "lock_too_old"
+            }).catch(() => {});
+            released++;
+        }
+    }
+    if (released) console.log(`[ticketlock] Sweep released ${released}/${checked} stale lock(s)`);
+    return { checked, released };
+}
+
+function startTicketLockSweepTimer() {
+    if (ticketLockSweepTimer) clearInterval(ticketLockSweepTimer);
+    ticketLockSweepTimer = setInterval(() => {
+        sweepTicketLocks().catch(err => console.error("Ticket lock sweep failed:", err.message));
+    }, TICKET_LOCK_SWEEP_INTERVAL_MS);
+    if (typeof ticketLockSweepTimer.unref === "function") ticketLockSweepTimer.unref();
+}
+
+// Bot restart হলে আগের খোলা টিকিটগুলোর জন্য লক তৈরি করে — নাহলে পুরোনো টিকিট
+// থাকা ইউজারও নতুন টিকিট খুলতে পারত।
+async function backfillTicketLocks() {
+    if (!client.isReady()) return { created: 0 };
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+    if (!guild) return { created: 0 };
+    const snap = await db.ref("ticketTranscriptIndex").once("value").catch(() => null);
+    const now = Date.now();
+    let created = 0;
+    for (const [channelId, record] of Object.entries(snap?.val() || {})) {
+        if (!record || String(record.status || "open") === "closed") continue;
+        const ownerId = String(record.ownerId || "");
+        const type = String(record.ticketType || "").toLowerCase();
+        if (!/^\d{15,25}$/.test(ownerId) || !["ticket", "report", "customer"].includes(type)) continue;
+        const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+        if (!channel) {
+            await db.ref(`ticketTranscriptIndex/${channelId}`).update({ channelDeletedAt: now }).catch(() => {});
+            continue;
+        }
+        const key = ticketLockKey(type, record.category || record.categoryName || channel.name.slice(0, 40));
+        const ref = db.ref(`open_tickets/${ALLOWED_GUILD_ID}/${ownerId}/${key}`);
+        const result = await ref.transaction(current => {
+            if (current && String(current.status || "open") === "open") {
+                // ইতিমধ্যে লক আছে — channelId বসিয়ে দিই
+                if (!current.channelId) return { ...current, channelId, updatedAt: now };
+                return;
+            }
+            return buildTicketLockRecord({ channelId, category: record.category || channel.name, type, ownerId, now });
+        }, undefined, false);
+        ticketLockChannelIndex.set(channelId, { userId: ownerId, key });
+        if (result.committed) created++;
+    }
+    if (created) console.log(`[ticketlock] Backfilled ${created} open ticket lock(s)`);
+    return { created };
 }
 
 // panel dropdown-এর selection খালি করে panel আগের অবস্থায় ফিরিয়ে আনে।
@@ -5482,6 +5712,10 @@ client.on("ready", async () => {
     registerCouponRequestListener();
     registerOfflinePaymentRequestListener();
     registerReaderEventAutoVerifyListeners();
+    // পুরোনো খোলা টিকিটের lock তৈরি + মৃত lock পরিষ্কার।
+    backfillTicketLocks().catch(err => console.error("Ticket lock backfill failed:", err.message));
+    sweepTicketLocks().catch(() => {});
+    startTicketLockSweepTimer();
     if (offlineSweepTimer) clearInterval(offlineSweepTimer);
     offlineSweepTimer = setInterval(() => sweepOfflinePaymentRequests().catch(err => console.error("Offline sweep failed:", err.message)), 15 * 60 * 1000);
     setTimeout(() => sweepOfflinePaymentRequests().catch(() => {}), 60_000);
@@ -5620,6 +5854,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
         if (weeklyReportTimer) clearInterval(weeklyReportTimer);
         if (offlineAutoVerifyTimer) clearInterval(offlineAutoVerifyTimer);
         if (offlineSweepTimer) clearInterval(offlineSweepTimer);
+        if (ticketLockSweepTimer) clearInterval(ticketLockSweepTimer);
         try { await db.ref("runtime/bot").update({ online: false, lastHeartbeatAt: Date.now(), offlineReason: signal }); } catch (_) {}
         try { client.destroy(); } catch (_) {}
         process.exit(0);
