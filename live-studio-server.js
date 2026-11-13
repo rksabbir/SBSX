@@ -6,7 +6,7 @@ const { normalizeAiPlan, buildOverwriteEdit, bitfieldToRestorePayload, overwrite
 const { readDiscordServerRules } = require("./discord-server-rules");
 const { classifyBusinessRoles } = require("./discord-business-role-classifier");
 
-function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiRequest, checkCppRateLimit, ChannelType, allowedOrigins, setLivePresence = () => {}, getChannelAdminRoleIds = () => [], getCompensationConfig = () => ({}) }) {
+function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiRequest, checkCppRateLimit, ChannelType, allowedOrigins, setLivePresence = () => {}, getChannelAdminRoleIds = () => [], getCompensationConfig = () => ({}), aiChat = null }) {
   const sessions = new Map();
   const invites = new Map();
   const activity = [];
@@ -399,6 +399,18 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
     const session = sessions.get(guildId);
     return session && !session.endedAt && session.expiresAt > Date.now() ? session : null;
   }
+  // ---- AKMAFIA YT AI Management (বেস্ট-existing panel-এর ভেতরেই, নতুন প্যানেল নয়) ----
+  function aiChatRuntime() { return aiChat; }
+  function aiRouterRuntime() { return aiChat?.router || null; }
+  function requireAiRouter() {
+    const router = aiRouterRuntime();
+    if (!router) throw Object.assign(new Error("AI router এখনো চালু হয়নি; বট restart করার পর আবার চেষ্টা করুন"), { statusCode: 503, apiError: "ai_router_unavailable" });
+    return router;
+  }
+  async function writeAiAudit(actor, actionType, summary) {
+    await db.ref("auditLog").push({ adminUid: actor?.uid || "unknown", actionType, timestamp: Date.now(), summary: String(summary).slice(0, 300) }).catch(() => {});
+  }
+
   function apiError(res, err, fallback = "live_studio_error") {
     const status = Number(err?.statusCode) || 500;
     if (status >= 500) console.error("Live Studio API error:", String(err?.apiError || fallback), String(err?.message || "unknown").replace(/[\r\n\0]+/g, " ").slice(0, 220));
@@ -1288,13 +1300,31 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
   const PRIVATE_INTEGRATION_SECRET_PATH = "serverSecrets/adminIntegrations";
   const INTEGRATION_SECRET_LIMITS = {
     discordBotToken: 240, discordClientId: 40, discordClientSecret: 300, openAiApiKey: 500,
-    liveKitUrl: 500, liveKitApiKey: 300, liveKitApiSecret: 500, facebookAppId: 80, facebookAppSecret: 300
+    liveKitUrl: 500, liveKitApiKey: 300, liveKitApiSecret: 500, facebookAppId: 80, facebookAppSecret: 300,
+    //আলাদা AI provider key — প্রতিটির নিজের ঘর, কখনো OPENAI_API_KEY শেয়ার করে না।
+    geminiApiKey: 400, groqApiKey: 400, cerebrasApiKey: 400, openrouterApiKey: 400,
+    cloudflareApiToken: 400, cloudflareAccountId: 80, nvidiaApiKey: 400,
+    cohereApiKey: 400, huggingfaceApiKey: 400
   };
   const INTEGRATION_ENV_NAMES = {
     discordBotToken: "TOKEN", discordClientId: "DISCORD_CLIENT_ID", discordClientSecret: "DISCORD_CLIENT_SECRET",
     openAiApiKey: "OPENAI_API_KEY", liveKitUrl: "LIVEKIT_URL", liveKitApiKey: "LIVEKIT_API_KEY",
-    liveKitApiSecret: "LIVEKIT_API_SECRET", facebookAppId: "FACEBOOK_APP_ID", facebookAppSecret: "FACEBOOK_APP_SECRET"
+    liveKitApiSecret: "LIVEKIT_API_SECRET", facebookAppId: "FACEBOOK_APP_ID", facebookAppSecret: "FACEBOOK_APP_SECRET",
+    geminiApiKey: "GEMINI_API_KEY", groqApiKey: "GROQ_API_KEY", cerebrasApiKey: "CEREBRAS_API_KEY",
+    openrouterApiKey: "OPENROUTER_API_KEY", cloudflareApiToken: "CLOUDFLARE_API_TOKEN", cloudflareAccountId: "CLOUDFLARE_ACCOUNT_ID",
+    nvidiaApiKey: "NVIDIA_API_KEY", cohereApiKey: "COHERE_API_KEY", huggingfaceApiKey: "HF_TOKEN"
   };
+  // প্যানেলে দেখানো হয় provider → secret key mapping, যাতে প্রতিটি AI-এর আলাদা সেকশন থাকে।
+  const AI_SECRET_SECTIONS = [
+    { providerId: "gemini", label: "Google Gemini", fields: [{ key: "geminiApiKey", label: "Gemini API key", placeholder: "AIza..." }] },
+    { providerId: "groq", label: "Groq", fields: [{ key: "groqApiKey", label: "Groq API key", placeholder: "gsk_..." }] },
+    { providerId: "cerebras", label: "Cerebras", fields: [{ key: "cerebrasApiKey", label: "Cerebras API key", placeholder: "csk-..." }] },
+    { providerId: "openrouter", label: "OpenRouter", fields: [{ key: "openrouterApiKey", label: "OpenRouter API key", placeholder: "sk-or-v1-..." }] },
+    { providerId: "cloudflare", label: "Cloudflare Workers AI", fields: [{ key: "cloudflareAccountId", label: "Cloudflare account id", placeholder: "023e105f4ecef8ad9ca31a8372d0c353" }, { key: "cloudflareApiToken", label: "Cloudflare API token", placeholder: "Workers AI permission token" }] },
+    { providerId: "nvidia", label: "NVIDIA NIM", fields: [{ key: "nvidiaApiKey", label: "NVIDIA API key", placeholder: "nvapi-..." }] },
+    { providerId: "cohere", label: "Cohere", fields: [{ key: "cohereApiKey", label: "Cohere trial key", placeholder: "trial key" }] },
+    { providerId: "huggingface", label: "Hugging Face", fields: [{ key: "huggingfaceApiKey", label: "Hugging Face token", placeholder: "hf_..." }] }
+  ];
   app.get("/api/admin/integrations/secrets/status", async (req, res) => {
     try {
       await verifyAdminApiRequest(req);
@@ -1334,6 +1364,207 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "integration_secrets_updated", timestamp: Date.now(), summary: `Updated integration settings (${Object.keys(patch).length} key fields; values hidden)` }).catch(() => {});
       return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.56", changed: true, updatedKeys: Object.keys(patch), restartRequired: Object.keys(patch).includes("discordBotToken") ? ["discordBotToken"] : [] });
     } catch (err) { return apiError(res, err, "integration_secrets_save_failed"); }
+  });
+
+  // ================= AI Management routes =================
+  // এই routes গুলো existing admin auth (verifyAdminApiRequest) ব্যবহার করে, তাই login আলাদা কিছু নয়।
+  app.get("/api/admin/ai/status", async (req, res) => {
+    try {
+      await verifyAdminApiRequest(req);
+      const chat = aiChatRuntime();
+      const router = aiRouterRuntime();
+      const snapshot = router ? router.snapshot() : { ok: false, providers: [], totals: { requests: 0, successes: 0, failures: 0, switches: 0 }, history: [], errors: [] };
+      const memoryStats = chat?.memory?.stats ? await chat.memory.stats().catch(() => ({ users: 0 })) : { users: 0 };
+      return res.set("Cache-Control", "no-store").json({
+        ok: true,
+        version: "1.5.62",
+        botOnline: Boolean(client?.user),
+        autoReply: { enabled: Boolean(chat?.enabled), channels: chat ? [...chat.channels] : [], stats: chat?.stats || {}, noticeChannelId: chat?.noticeChannelId || "", pendingQueues: chat?.userQueues?.size || 0 },
+        memory: memoryStats,
+        freeTierOnly: true,
+        ...snapshot
+      });
+    } catch (err) { return apiError(res, err, "ai_status_failed"); }
+  });
+
+  app.post("/api/admin/ai/provider", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "ai-provider-update", 20, 60_000)) return;
+      const router = requireAiRouter();
+      const providerId = String(req.body?.providerId || "");
+      if (!router.providers[providerId]) throw Object.assign(new Error("Unknown AI provider"), { statusCode: 400, apiError: "invalid_ai_provider" });
+      const changes = [];
+      if (typeof req.body?.enabled === "boolean") { router.setEnabled(providerId, req.body.enabled); changes.push(req.body.enabled ? "enabled" : "disabled"); }
+      if (req.body?.priority !== undefined) { router.setPriority(providerId, req.body.priority); changes.push("priority"); }
+      if (req.body?.model !== undefined) { router.setModel(providerId, req.body.model); changes.push("model"); }
+      if (req.body?.clearCooldown === true) { router.clearCooldown(providerId); changes.push("cooldown_cleared"); }
+      await router.flush();
+      await writeAiAudit(actor, "ai_provider_updated", `AI provider ${providerId}: ${changes.join(", ") || "no change"}`);
+      return res.json({ ok: true, version: "1.5.62", changed: changes, ...router.snapshot() });
+    } catch (err) { return apiError(res, err, "ai_provider_update_failed"); }
+  });
+
+  app.post("/api/admin/ai/channels", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "ai-channels-update", 20, 60_000)) return;
+      const chat = aiChatRuntime();
+      if (!chat) throw Object.assign(new Error("AI chat module এখনো চালু হয়নি"), { statusCode: 503, apiError: "ai_chat_unavailable" });
+      const rawChannels = Array.isArray(req.body?.channels) ? req.body.channels : null;
+      const channels = rawChannels ? rawChannels.map(id => String(id).replace(/[^\d]/g, "")).filter(id => /^\d{15,25}$/.test(id)).slice(0, 25) : undefined;
+      const enabled = typeof req.body?.enabled === "boolean" ? req.body.enabled : undefined;
+      const noticeChannelId = req.body?.noticeChannelId !== undefined ? String(req.body.noticeChannelId).replace(/[^\d]/g, "") : undefined;
+      const saved = await chat.saveConfig({ channels, enabled, noticeChannelId });
+      if (!saved) throw Object.assign(new Error("AI chat config সংরক্ষণ করা যায়নি"), { statusCode: 500, apiError: "ai_channels_save_failed" });
+      await writeAiAudit(actor, "ai_channels_updated", `Auto-reply channels: ${[...chat.channels].join(", ") || "none"}; enabled=${chat.enabled}`);
+      return res.json({ ok: true, version: "1.5.62", enabled: chat.enabled, channels: [...chat.channels], noticeChannelId: chat.noticeChannelId });
+    } catch (err) { return apiError(res, err, "ai_channels_update_failed"); }
+  });
+
+  app.post("/api/admin/ai/test", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "ai-provider-test", 6, 60_000)) return;
+      const router = requireAiRouter();
+      const providerId = String(req.body?.providerId || "");
+      const spec = require("./ai-providers").getProviderSpec(providerId);
+      if (!spec) throw Object.assign(new Error("Unknown AI provider"), { statusCode: 400, apiError: "invalid_ai_provider" });
+      const state = router.providers[providerId];
+      const apiKey = String(process.env[spec.env] || "").trim();
+      if (!apiKey) throw Object.assign(new Error(`${spec.label} এর API key এখনো সেভ করা হয়নি`), { statusCode: 400, apiError: "ai_provider_not_configured" });
+      const accountId = spec.accountEnv ? String(process.env[spec.accountEnv] || "").trim() : "";
+      if (spec.accountEnv && !accountId) throw Object.assign(new Error("Cloudflare account id প্রয়োজন"), { statusCode: 400, apiError: "ai_provider_not_configured" });
+      const startedAt = Date.now();
+      try {
+        const result = await require("./ai-providers").callProvider({ providerId, apiKey, accountId, model: state.model, system: "শুধু একটি ছোট বাংলা বাক্যে উত্তর দাও।", history: [], userText: "তুমি ঠিক আছো?", timeoutMs: 20_000 });
+        router.recordSuccess(providerId, result?.usage);
+        router.pushHistory({ providerId, reason: "admin_test_ok" });
+        await router.flush();
+        await writeAiAudit(actor, "ai_provider_tested", `AI provider ${providerId} test succeeded`);
+        return res.json({ ok: true, version: "1.5.62", providerId, latencyMs: Date.now() - startedAt, model: result.model, sample: String(result.text || "").slice(0, 300) });
+      } catch (err) {
+        router.recordFailure(providerId, err);
+        await router.flush();
+        await writeAiAudit(actor, "ai_provider_tested", `AI provider ${providerId} test failed: ${String(err?.message || err).slice(0, 160)}`);
+        return res.status(502).json({ ok: false, version: "1.5.62", error: "ai_provider_test_failed", message: String(err?.message || "provider test failed").slice(0, 260), kind: err?.kind || "unknown" });
+      }
+    } catch (err) { return apiError(res, err, "ai_provider_test_failed"); }
+  });
+
+  app.get("/api/admin/ai/memory", async (req, res) => {
+    try {
+      await verifyAdminApiRequest(req);
+      const chat = aiChatRuntime();
+      if (!chat?.db) throw Object.assign(new Error("Database সংযোগ নেই"), { statusCode: 503, apiError: "ai_memory_unavailable" });
+      const userId = String(req.query?.userId || "").replace(/[^\w-]/g, "");
+      if (userId) {
+        const record = await chat.memory.load(userId);
+        return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", userId, record: { name: record.name, facts: record.facts, history: record.history.slice(-20), updatedAt: record.updatedAt }, config: chat.memory.config });
+      }
+      const snap = await chat.db.ref("ai_memory/users").limitToLast(50).once("value");
+      const users = Object.entries(snap.val() || {}).map(([id, value]) => ({ userId: id, name: String(value?.name || "").slice(0, 60), facts: Array.isArray(value?.facts) ? value.facts.length : 0, turns: Array.isArray(value?.history) ? Math.ceil(value.history.length / 2) : 0, updatedAt: Number(value?.updatedAt) || 0 })).sort((a, b) => b.updatedAt - a.updatedAt);
+      const stats = await chat.memory.stats();
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", users, stats, config: chat.memory.config });
+    } catch (err) { return apiError(res, err, "ai_memory_read_failed"); }
+  });
+
+  app.post("/api/admin/ai/memory", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "ai-memory-update", 20, 60_000)) return;
+      const chat = aiChatRuntime();
+      if (!chat?.db) throw Object.assign(new Error("Database সংযোগ নেই"), { statusCode: 503, apiError: "ai_memory_unavailable" });
+      const action = String(req.body?.action || "");
+      const userId = String(req.body?.userId || "").replace(/[^\w-]/g, "");
+      if (action === "forget") {
+        if (!userId) throw Object.assign(new Error("userId প্রয়োজন"), { statusCode: 400, apiError: "invalid_ai_memory_request" });
+        await chat.memory.forget(userId);
+        await writeAiAudit(actor, "ai_memory_forgotten", `AI memory cleared for user ${userId}`);
+        return res.json({ ok: true, version: "1.5.62", userId, forgotten: true });
+      }
+      if (action === "addFact") {
+        const fact = String(req.body?.fact || "").trim().slice(0, 220);
+        if (!userId || !fact) throw Object.assign(new Error("userId ও fact প্রয়োজন"), { statusCode: 400, apiError: "invalid_ai_memory_request" });
+        await chat.memory.addFact(userId, fact);
+        await writeAiAudit(actor, "ai_memory_fact_added", `AI memory fact added for user ${userId}`);
+        return res.json({ ok: true, version: "1.5.62", userId, added: true });
+      }
+      if (action === "config") {
+        const patch = {};
+        if (typeof req.body?.enabled === "boolean") patch.enabled = req.body.enabled;
+        if (req.body?.maxTurns !== undefined) patch.maxTurns = Math.max(2, Math.min(20, Math.round(Number(req.body.maxTurns) || 8)));
+        if (req.body?.maxFacts !== undefined) patch.maxFacts = Math.max(0, Math.min(30, Math.round(Number(req.body.maxFacts) || 8)));
+        if (req.body?.retentionDays !== undefined) patch.retentionDays = Math.max(1, Math.min(365, Math.round(Number(req.body.retentionDays) || 30)));
+        if (!Object.keys(patch).length) throw Object.assign(new Error("কোনো config দেওয়া হয়নি"), { statusCode: 400, apiError: "invalid_ai_memory_request" });
+        await chat.db.ref("ai_memory/config").update({ ...patch, updatedAt: Date.now() });
+        await chat.memory.loadConfig();
+        await writeAiAudit(actor, "ai_memory_config_updated", `AI memory config: ${Object.keys(patch).join(", ")}`);
+        return res.json({ ok: true, version: "1.5.62", config: chat.memory.config });
+      }
+      if (action === "prune") {
+        const result = await chat.memory.prune();
+        await writeAiAudit(actor, "ai_memory_pruned", `AI memory pruned: ${result.removed} users`);
+        return res.json({ ok: true, version: "1.5.62", removed: result.removed });
+      }
+      throw Object.assign(new Error("অজানা action"), { statusCode: 400, apiError: "invalid_ai_memory_request" });
+    } catch (err) { return apiError(res, err, "ai_memory_update_failed"); }
+  });
+
+  // প্রতিটি AI-এর key আলাদা সেকশনে — শুধু configured হ্যাঁ/না দেখা যায়, key কখনো ফেরত যায় না।
+  app.get("/api/admin/ai/keys", async (req, res) => {
+    try {
+      await verifyAdminApiRequest(req);
+      const saved = (await db.ref(PRIVATE_INTEGRATION_SECRET_PATH).once("value").catch(() => null))?.val() || {};
+      const sections = AI_SECRET_SECTIONS.map(section => ({
+        providerId: section.providerId,
+        label: section.label,
+        fields: section.fields.map(field => ({
+          key: field.key,
+          label: field.label,
+          placeholder: field.placeholder,
+          maxLength: INTEGRATION_SECRET_LIMITS[field.key] || 400,
+          env: INTEGRATION_ENV_NAMES[field.key] || "",
+          configured: Boolean(String(process.env[INTEGRATION_ENV_NAMES[field.key]] || saved[field.key] || "").trim()),
+          source: String(process.env[INTEGRATION_ENV_NAMES[field.key]] || "").trim() ? "environment" : String(saved[field.key] || "").trim() ? "admin_panel" : ""
+        }))
+      }));
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", sections });
+    } catch (err) { return apiError(res, err, "ai_keys_read_failed"); }
+  });
+
+  app.post("/api/admin/ai/keys", async (req, res) => {
+    try {
+      const actor = await verifyAdminApiRequest(req);
+      if (!checkCppRateLimit(req, res, "ai-keys-save", 12, 60_000)) return;
+      const allowedKeys = new Set(AI_SECRET_SECTIONS.flatMap(section => section.fields.map(field => field.key)));
+      const values = req.body?.secrets && typeof req.body.secrets === "object" ? req.body.secrets : {};
+      const clearKeys = Array.isArray(req.body?.clearKeys) ? req.body.clearKeys.map(String) : [];
+      const patch = {};
+      for (const key of clearKeys) {
+        if (!allowedKeys.has(key)) continue;
+        patch[key] = null;
+      }
+      for (const [key, raw] of Object.entries(values)) {
+        if (!allowedKeys.has(key)) continue;
+        const value = String(raw || "").trim();
+        if (!value) continue;
+        if (value.length > (INTEGRATION_SECRET_LIMITS[key] || 400)) throw Object.assign(new Error(`${key} অনেক বড়`), { statusCode: 400, apiError: "invalid_ai_key" });
+        if (/[\s]/.test(value)) throw Object.assign(new Error(`${key} এ ফাঁকা জায়গা থাকতে পারবে না`), { statusCode: 400, apiError: "invalid_ai_key" });
+        if (key === "cloudflareAccountId" && !/^[a-f0-9]{32}$/i.test(value)) throw Object.assign(new Error("Cloudflare account id 32 অক্ষরের hex হতে হবে"), { statusCode: 400, apiError: "invalid_ai_key" });
+        patch[key] = value;
+      }
+      if (!Object.keys(patch).length) return res.json({ ok: true, version: "1.5.62", changed: false });
+      await db.ref(PRIVATE_INTEGRATION_SECRET_PATH).update(patch);
+      for (const [key, value] of Object.entries(patch)) {
+        const envName = INTEGRATION_ENV_NAMES[key];
+        if (!envName) continue;
+        if (value === null) delete process.env[envName]; else process.env[envName] = value;
+      }
+      aiRouterRuntime()?.refreshAll?.();
+      await writeAiAudit(actor, "ai_keys_updated", `AI provider keys updated (${Object.keys(patch).length} fields; values hidden)`);
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", changed: true, updatedKeys: Object.keys(patch) });
+    } catch (err) { return apiError(res, err, "ai_keys_save_failed"); }
   });
 
   function roleAutomationPolicy(raw = {}) {

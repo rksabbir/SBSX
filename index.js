@@ -39,6 +39,8 @@ const { ticketLockKey, buildTicketLockRecord, evaluateTicketOpenGate, buildTicke
 const { OFFLINE_FRAUD_REASONS, normalizeFraudReason, buildSessionRevokePatch, buildTxnFlagPatch, buildBanPlan, buildUnbanPlan, describeRevokeOutcome } = require("./offline-payment-fraud");
 const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
 const { readDiscordServerRules } = require("./discord-server-rules");
+const { AiChat, DEFAULT_CHANNEL_ID: AI_DEFAULT_CHANNEL_ID } = require("./ai-chat");
+const { AI_PROVIDERS: AKMAFIA_AI_PROVIDERS, providerConfigured: akmafiaAiProviderConfigured } = require("./ai-providers");
 const { classifyBusinessRoles } = require("./discord-business-role-classifier");
 
 // রেনডার Environment Variable থেকে অবজেক্ট লোড করার লজিক
@@ -1501,12 +1503,33 @@ const client = new Client({
 // Invite-based LiveKit room, channel-wide persistent live pins, realtime Radar and secure moderation.
 // Live Studio temporarily overrides only the Bot's profile activity; the configured status returns when it ends.
 let liveStudioPresenceActive = false;
+// ================================
+// 🤖 AKMAFIA YT — স্বয়ংক্রিয় বাংলা AI chat (কোনো command নেই)
+// ================================
+// একাধিক free AI provider, নিজে থেকেই failover/cooldown/recovery — admin প্যানেল থেকে নিয়ন্ত্রিত।
+const AI_CHAT_ENABLED = String(process.env.AI_CHAT_ENABLED || "true").toLowerCase() !== "false";
+const AI_CHAT_CHANNELS = String(process.env.AI_CHAT_CHANNEL_ID || AI_DEFAULT_CHANNEL_ID || "")
+    .split(",").map(value => value.replace(/[^\d]/g, "")).filter(Boolean);
+const aiChat = new AiChat({
+    db,
+    client,
+    enabled: AI_CHAT_ENABLED,
+    guildId: ALLOWED_GUILD_ID,
+    channels: AI_CHAT_CHANNELS.length ? AI_CHAT_CHANNELS : [AI_DEFAULT_CHANNEL_ID],
+    log: message => console.warn("[AI]", message)
+});
+aiChat.setDb(db);
+client.on("messageCreate", message => {
+    aiChat.handleMessage(message).catch(err => console.error("AI auto chat failed:", err?.message || err));
+});
+
 const { attachLiveStudioServer } = require("./live-studio-server");
 attachLiveStudioServer({
     app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit,
     ChannelType, allowedOrigins: ADMIN_PANEL_ORIGINS,
     getChannelAdminRoleIds: () => [getConfiguredRoleId("admin"), getConfiguredRoleId("developer"), getConfiguredRoleId("supportTicketReport"), getConfiguredRoleId("supportCustomer"), ...Object.values(ADMIN_BOT_CONFIG.moderators || {}).flatMap(value => Array.isArray(value) ? value : [])],
     getCompensationConfig: () => ({ ...(ADMIN_BOT_CONFIG.compensation || {}) }),
+    aiChat,
     setLivePresence: (active) => { liveStudioPresenceActive = Boolean(active); setBotPresence(); }
 });
 
@@ -5729,6 +5752,15 @@ client.on("ready", async () => {
     maybePublishWeeklyReport().catch(err => console.error("Weekly report check failed:", err.message));
     weeklyReportTimer = setInterval(() => maybePublishWeeklyReport().catch(err => console.error("Weekly report check failed:", err.message)), 60 * 60 * 1000);
 
+    // AI router + per-user memory আগের অবস্থা থেকে ফিরিয়ে আনা হয়, যাতে restart-এ cooldown হারায় না।
+    aiChat.router.restore()
+        .then(() => aiChat.memory.loadConfig())
+        .then(() => {
+            const configured = AKMAFIA_AI_PROVIDERS.filter(spec => akmafiaAiProviderConfigured(spec, {})).map(spec => spec.id);
+            console.log(`🤖 AKMAFIA AI ready · providers: ${configured.length ? configured.join(", ") : "none configured"} · channels: ${[...aiChat.channels].join(", ") || "none"}`);
+        })
+        .catch(err => console.error("AI chat init failed:", err?.message || err));
+
     if (realtimeListenersRegistered) return;
     realtimeListenersRegistered = true;
     db.ref("panels").on("value", () => {
@@ -5830,7 +5862,12 @@ async function startBot() {
     const secretEnvNames = {
         discordBotToken: "TOKEN", discordClientId: "DISCORD_CLIENT_ID", discordClientSecret: "DISCORD_CLIENT_SECRET",
         openAiApiKey: "OPENAI_API_KEY", liveKitUrl: "LIVEKIT_URL", liveKitApiKey: "LIVEKIT_API_KEY",
-        liveKitApiSecret: "LIVEKIT_API_SECRET", facebookAppId: "FACEBOOK_APP_ID", facebookAppSecret: "FACEBOOK_APP_SECRET"
+        liveKitApiSecret: "LIVEKIT_API_SECRET", facebookAppId: "FACEBOOK_APP_ID", facebookAppSecret: "FACEBOOK_APP_SECRET",
+        // AKMAFIA YT AI providers — প্রতিটির আলাদা key, কখনো একটার বদলে আরেকটা নয়।
+        geminiApiKey: "GEMINI_API_KEY", groqApiKey: "GROQ_API_KEY", cerebrasApiKey: "CEREBRAS_API_KEY",
+        openrouterApiKey: "OPENROUTER_API_KEY", cloudflareApiToken: "CLOUDFLARE_API_TOKEN",
+        cloudflareAccountId: "CLOUDFLARE_ACCOUNT_ID", nvidiaApiKey: "NVIDIA_API_KEY",
+        cohereApiKey: "COHERE_API_KEY", huggingfaceApiKey: "HF_TOKEN"
     };
     for (const [key, envName] of Object.entries(secretEnvNames)) {
         if (typeof privateSecrets[key] === "string" && privateSecrets[key].trim()) process.env[envName] = privateSecrets[key].trim();
@@ -5855,6 +5892,7 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
         if (offlineAutoVerifyTimer) clearInterval(offlineAutoVerifyTimer);
         if (offlineSweepTimer) clearInterval(offlineSweepTimer);
         if (ticketLockSweepTimer) clearInterval(ticketLockSweepTimer);
+        try { await aiChat.shutdown(); } catch (_) {}
         try { await db.ref("runtime/bot").update({ online: false, lastHeartbeatAt: Date.now(), offlineReason: signal }); } catch (_) {}
         try { client.destroy(); } catch (_) {}
         process.exit(0);
