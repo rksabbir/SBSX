@@ -3,8 +3,9 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const {
-  AI_PROVIDERS, PROVIDER_IDS, getProviderSpec, providerModel, resolveProviderKey, providerConfigured,
-  buildChatMessages, geminiBody, geminiText, openAiText, cloudflareText, classifyHttpStatus, parseRetryAfterMs
+  AI_PROVIDERS, PROVIDER_IDS, getProviderSpec, providerModel, providerModelChain, isModelGoneError,
+  resolveProviderKey, providerConfigured, buildChatMessages, geminiBody, geminiText, openAiText,
+  cloudflareText, classifyHttpStatus, classifyError, parseRetryAfterMs
 } = require("../ai-providers");
 
 test("all eight requested providers exist with their own key + endpoint", () => {
@@ -55,8 +56,8 @@ test("env key wins and stored secret is only a fallback", () => {
 
 test("provider model override falls back to the real default", () => {
   const spec = getProviderSpec("gemini");
-  assert.equal(providerModel(spec, {}), "gemini-2.5-flash");
-  assert.equal(providerModel(spec, { gemini: "  gemini-2.5-flash-lite " }), "gemini-2.5-flash-lite");
+  assert.equal(providerModel(spec, {}), "gemini-3.8-flash");
+  assert.equal(providerModel(spec, { gemini: "  gemini-3.5-flash-lite " }), "gemini-3.5-flash-lite");
 });
 
 test("chat messages keep the system prompt first and cap long turns", () => {
@@ -114,4 +115,58 @@ test("Retry-After and X-RateLimit-Reset headers are understood", () => {
   const resetHeader = new Map([["x-ratelimit-reset", String(Math.floor(now / 1000) + 40)]]);
   assert.equal(parseRetryAfterMs(resetHeader, now), 40_000);
   assert.equal(parseRetryAfterMs(new Map([["retry-after", "999999999"]]), now), 24 * 60 * 60 * 1000);
+});
+
+// ---- v1.5.63: বন্ধ হয়ে যাওয়া মডেলের বিরুদ্ধে সুরক্ষা ----
+
+test("no default model is one the provider already retired", () => {
+  // ২০২৬-১১-এ যাচাই করা মৃত্যুতালিকা — এগুলো আর কোনো free key-তে চলে না।
+  const retired = [
+    "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.5-pro",
+    "llama-3.3-70b-versatile", "llama-3.1-8b-instant",
+    "meta-llama/llama-4-scout-17b-16e-instruct", "qwen/qwen3-32b",
+    "llama3.1-70b", "llama-4-scout-17b-16e-instruct", "qwen-3-32b",
+    "meta/llama-3.1-70b-instruct", "@cf/meta/llama-3.2-3b-instruct"
+  ];
+  for (const spec of AI_PROVIDERS) {
+    const chain = providerModelChain(spec, "", 10);
+    for (const model of chain) {
+      assert.ok(!retired.includes(model), `${spec.id} must not default to retired model ${model}`);
+    }
+    assert.ok(chain.length >= 1);
+  }
+});
+
+test("every provider ships at least one fallback model", () => {
+  for (const spec of AI_PROVIDERS) {
+    assert.ok(Array.isArray(spec.fallbackModels) && spec.fallbackModels.length >= 1, `${spec.id} needs a fallback model`);
+    const chain = providerModelChain(spec);
+    assert.ok(chain.length >= 2, `${spec.id} chain must have a spare model`);
+    assert.equal(new Set(chain).size, chain.length, `${spec.id} chain must not repeat`);
+  }
+});
+
+test("an admin-chosen model is tried first, then the provider fallbacks", () => {
+  const spec = getProviderSpec("groq");
+  assert.deepEqual(providerModelChain(spec, "openai/gpt-oss-20b"), ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]);
+  assert.deepEqual(providerModelChain(spec, "openai/gpt-oss-20b", 1), ["openai/gpt-oss-20b"]);
+  assert.equal(providerModelChain(spec, "").length, 2);
+});
+
+test("'model gone' errors are recognised from both status and message", () => {
+  assert.equal(isModelGoneError({ status: 404, message: "models/gemini-2.5-flash is no longer available to new users" }), true);
+  assert.equal(isModelGoneError({ status: 404, message: "model_not_found" }), true);
+  assert.equal(isModelGoneError({ status: 400, message: "The model `x` has been deprecated" }), true);
+  assert.equal(isModelGoneError({ status: 404, message: "provider returned error" }), false);
+  assert.equal(isModelGoneError({ status: 429, message: "rate limited" }), false);
+  assert.equal(isModelGoneError({ status: 503, message: "high demand" }), false);
+});
+
+test("503 high demand is an overload, not a rate limit", () => {
+  assert.equal(classifyError(503, "This model is currently experiencing high demand. Spikes in demand are usually temporary."), "overloaded");
+  assert.equal(classifyError(529, "overloaded"), "overloaded");
+  assert.equal(classifyError(500, "internal server error"), "server");
+  assert.equal(classifyError(429, "Too many requests"), "rate_limit");
+  assert.equal(classifyError(402, "quota exceeded"), "quota");
+  assert.equal(classifyError(404, "model x has been retired"), "model_unavailable");
 });

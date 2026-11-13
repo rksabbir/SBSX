@@ -5,7 +5,7 @@
 //  * cooldown + counters + history সব Firebase-এ যায়, তাই restart-এও টেকে।
 //  * cooldown-এ থাকা provider-কে একবারও ডাকা হয় না (wasteful retry নেই)।
 
-const { AI_PROVIDERS, getProviderSpec, callProvider, parseRetryAfterMs } = require("./ai-providers");
+const { AI_PROVIDERS, getProviderSpec, callProvider, parseRetryAfterMs, providerModelChain, isModelGoneError } = require("./ai-providers");
 
 const STATUS = {
   ACTIVE: "active",
@@ -20,6 +20,10 @@ const BASE_COOLDOWN_MS = 60_000;
 const MAX_COOLDOWN_MS = 60 * 60 * 1000;
 const AUTH_COOLDOWN_MS = 30 * 60 * 1000;
 const QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
+// 5xx / "high demand" কয়েক সেকেন্ডেই ঠিক হয়ে যায়, তাই লম্বা cooldown নয়।
+const OVERLOAD_COOLDOWN_MS = 15_000;
+const MODEL_GONE_COOLDOWN_MS = 10 * 60 * 1000;
+const STREAK_FORGIVE_MS = 30 * 60 * 1000;
 const STATE_SAVE_DEBOUNCE_MS = 4_000;
 const MAX_HISTORY = 60;
 const MAX_ERROR_LOG = 40;
@@ -27,13 +31,13 @@ const MAX_ATTEMPTS = 4;
 
 // প্রতিটি provider-এর free tier-এর আনুমানিক দৈনিক সীমা (শুধুই estimation, বিলিং নয়)।
 const FREE_DAILY_LIMITS = {
-  gemini: 1500,
+  gemini: 500,     // Flash-Lite ~৫০০/দিন; Flash ~২০/দিন
   groq: 1000,
   cerebras: 900,
   openrouter: 50,
   cloudflare: 300,
   nvidia: 1000,
-  cohere: 33, // 1000/মাস ≈ 33/দিন
+  cohere: 33,      // 1000/মাস ≈ 33/দিন
   huggingface: 200
 };
 
@@ -64,7 +68,9 @@ function freshProviderState(spec, index) {
     lastUsedAt: 0,
     lastSwitchAt: 0,
     dailyDate: dayKey(),
-    dailyRequests: 0
+    dailyRequests: 0,
+    autoFallback: true,
+    modelMigratedAt: 0
   };
 }
 
@@ -103,6 +109,13 @@ class AiRouter {
       current.enabled = saved.enabled !== false;
       current.priority = clampNumber(saved.priority, 1, 9999, current.priority);
       if (typeof saved.model === "string" && saved.model.trim()) current.model = saved.model.trim().slice(0, 120);
+      // পুরোনো (এখন বন্ধ) ডিফল্ট মডেল সেভ করা থাকলে নতুন ডিফল্টে মাইগ্রেট করা হয় —
+      // নাহলে restart-এর পরেও বট মরা মডেলেই আটকে থাকবে।
+      if (this.isStaleModel(id, current.model)) {
+        current.model = getProviderSpec(id).defaultModel;
+        current.modelMigratedAt = this.now();
+      }
+      current.autoFallback = saved.autoFallback !== false;
       current.consecutiveFailures = clampNumber(saved.consecutiveFailures, 0, 100, 0);
       current.cooldownUntil = clampNumber(saved.cooldownUntil, 0, Number.MAX_SAFE_INTEGER, 0);
       current.requests = clampNumber(saved.requests, 0, 10_000_000, 0);
@@ -148,7 +161,9 @@ class AiRouter {
         lastUsedAt: p.lastUsedAt,
         lastSwitchAt: p.lastSwitchAt,
         dailyDate: p.dailyDate,
-        dailyRequests: p.dailyRequests
+        dailyRequests: p.dailyRequests,
+        autoFallback: p.autoFallback !== false,
+        modelMigratedAt: p.modelMigratedAt || 0
       };
     }
     return {
@@ -210,7 +225,15 @@ class AiRouter {
     return Math.max(0, p.cooldownUntil - this.now());
   }
 
-  // cooldown শেষ হলে provider স্বয়ংক্রিয়ভাবে আবার eligible — কোনো admin action লাগে না।
+  // সেভ করা মডেলটি কি এই provider-এর আর কোনো ব্যবহারযোগ্য মডেলের তালিকায় নেই?
+  // (অর্থাৎ provider সেটি বন্ধ করে দিয়েছে) — হলে নতুন ডিফল্টে মাইগ্রেট করা হয়।
+  isStaleModel(id, model) {
+    const spec = getProviderSpec(id);
+    const value = String(model || "").trim();
+    if (!spec || !value) return false;
+    return !providerModelChain(spec, "", 10).includes(value);
+  }
+
   // কোনো side effect ছাড়া শুধু status হিসাব — restore-এর সময় ব্যবহার হয়।
   computeStatus(id) {
     const p = this.providers[id];
@@ -225,6 +248,7 @@ class AiRouter {
     return this.activeProviderId === id ? STATUS.ACTIVE : STATUS.AVAILABLE;
   }
 
+  // cooldown শেষ হলে provider স্বয়ংক্রিয়ভাবে আবার eligible — কোনো admin action লাগে না।
   refresh(id) {
     const p = this.providers[id];
     if (!p) return null;
@@ -238,9 +262,11 @@ class AiRouter {
       return p;
     }
     if (p.cooldownUntil && p.cooldownUntil <= this.now()) {
-      // cooldown থেকে সেরে উঠেছে — failure streak ধীরে ধীরে রিসেট, priority অপরিবর্তিত।
+      // cooldown শেষ। streak ইচ্ছাকৃতভাবে রাখা হয় (শূন্য নয়), যাতে সত্যিই বারবার ব্যর্থ provider-এর
+      // cooldown ধাপে ধাপে বাড়ে — একবার সফল হলেই streak পুরো শূন্য হয়।
+      // ৩০ মিনিট কোনো ব্যর্থতা না থাকলে streak ক্ষমা করা হয়, যাতে পুরোনো ভুল চিরকাল বহন না করে।
       p.cooldownUntil = 0;
-      p.consecutiveFailures = 0;
+      if (p.lastErrorAt && this.now() - p.lastErrorAt > STREAK_FORGIVE_MS) p.consecutiveFailures = 0;
       p.lastErrorKind = "";
       this.onEvent({ type: "recovered", providerId: id, at: this.now() });
       this.pushHistory({ providerId: id, reason: "recovered" });
@@ -288,13 +314,18 @@ class AiRouter {
     p.lastErrorKind = kind;
     p.status = STATUS.COOLDOWN;
 
-    let cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(p.consecutiveFailures - 1, 5));
-    if (kind === "auth") cooldown = AUTH_COOLDOWN_MS;
-    if (kind === "quota") cooldown = QUOTA_COOLDOWN_MS;
-    if (kind === "rate_limit") cooldown = Math.max(cooldown, 90_000);
+    // ধরন অনুযায়ী cooldown: সার্ভার ব্যস্ত হলে ছোট, কোটা/মডেল বন্ধ হলে বড়।
+    let cooldown;
+    if (kind === "overloaded") cooldown = OVERLOAD_COOLDOWN_MS;
+    else if (kind === "server") cooldown = Math.min(BASE_COOLDOWN_MS, OVERLOAD_COOLDOWN_MS * 2);
+    else if (kind === "auth") cooldown = AUTH_COOLDOWN_MS;
+    else if (kind === "quota") cooldown = QUOTA_COOLDOWN_MS;
+    else if (kind === "model_unavailable") cooldown = MODEL_GONE_COOLDOWN_MS;
+    else if (kind === "rate_limit") cooldown = Math.max(BASE_COOLDOWN_MS * Math.pow(2, Math.min(Math.max(p.consecutiveFailures, 1) - 1, 4)), 90_000);
+    else cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(Math.max(p.consecutiveFailures, 1) - 1, 5));
     const headerWait = parseRetryAfterMs(error?.headers, this.now());
     if (headerWait && headerWait > 0) cooldown = Math.max(cooldown, headerWait);
-    cooldown = clampNumber(cooldown, 30_000, MAX_COOLDOWN_MS, BASE_COOLDOWN_MS);
+    cooldown = clampNumber(cooldown, OVERLOAD_COOLDOWN_MS, MAX_COOLDOWN_MS, BASE_COOLDOWN_MS);
 
     p.cooldownUntil = this.now() + cooldown;
     p.status = kind === "rate_limit" || kind === "quota" ? STATUS.RATE_LIMITED : STATUS.COOLDOWN;
@@ -365,6 +396,7 @@ class AiRouter {
     if (!p) return false;
     const spec = getProviderSpec(id);
     p.model = String(model || "").trim().slice(0, 120) || spec?.defaultModel || p.model;
+    p.autoFallback = p.autoFallback !== false;
     this.queueSave();
     return true;
   }
@@ -423,29 +455,59 @@ class AiRouter {
       if (p.dailyDate !== today) { p.dailyDate = today; p.dailyRequests = 0; }
       p.dailyRequests += 1;
 
-      try {
-        const result = await this.call({
-          providerId: p.id,
-          apiKey,
-          accountId,
-          model: p.model || spec.defaultModel,
-          system,
-          history,
-          userText,
-          timeoutMs: timeoutMs || this.timeoutMs
-        });
-        this.recordSuccess(p.id, result?.usage);
-        return { ...result, attempted: tried.concat(p.id), switched: tried.length > 0 };
-      } catch (err) {
-        lastError = err;
-        this.recordFailure(p.id, err);
-        this.totals.failures += 1;
-        tried.push(p.id);
-        this.log(`AI provider ${p.id} failed (${err?.kind || "unknown"}): ${err?.message || err}`);
-        // auth/bad_request হলে ওই provider পরের বারও ব্যর্থ হবে, তবু বাকিরা চেষ্টা পাবে।
-        previous = p.id;
-        if (err?.kind === "bad_request" && /empty response/i.test(String(err?.message))) continue;
+      // একই provider-এর মডেল চেইন: প্রাথমিক মডেল বন্ধ/404 হলে স্বয়ংক্রিয়ভাবে পরের মডেল।
+      const chain = p.autoFallback === false
+        ? [p.model || spec.defaultModel]
+        : providerModelChain(spec, p.model, 3);
+
+      let providerError = null;
+      let modelSwitched = false;
+      for (const [index, model] of chain.entries()) {
+        try {
+          const result = await this.call({
+            providerId: p.id,
+            apiKey,
+            accountId,
+            model,
+            system,
+            history,
+            userText,
+            timeoutMs: timeoutMs || this.timeoutMs
+          });
+          if (model !== p.model) {
+            // মডেল বদলেছে — admin প্যানেলে দেখা যাবে, আর পরের বার সরাসরি এটাই ব্যবহার হবে।
+            const previousModel = p.model;
+            p.model = model;
+            modelSwitched = true;
+            this.pushHistory({ providerId: p.id, reason: "model_fallback", message: `${previousModel} → ${model}` });
+            this.errors.unshift({ at: this.now(), providerId: p.id, kind: "model_fallback", status: 404, message: `${previousModel} বন্ধ, এখন ${model} ব্যবহার হচ্ছে`, cooldownMs: 0 });
+            if (this.errors.length > MAX_ERROR_LOG) this.errors.length = MAX_ERROR_LOG;
+            this.log(`AI ${p.id} model switched ${previousModel} → ${model}`);
+          }
+          this.recordSuccess(p.id, result?.usage);
+          return { ...result, attempted: tried.concat(p.id), switched: tried.length > 0 };
+        } catch (err) {
+          providerError = err;
+          // মডেলটাই বন্ধ হলে পরের মডেল চেষ্টা করা হয়; অন্য error হলে provider ছেড়ে দেওয়া হয়।
+          const hasNextModel = index < chain.length - 1;
+          if (p.autoFallback !== false && isModelGoneError(err) && hasNextModel) {
+            this.pushHistory({ providerId: p.id, reason: "model_gone", message: `${model}: ${String(err?.message || "").slice(0, 120)}` });
+            continue;
+          }
+          break;
+        }
       }
+
+      const err = providerError || Object.assign(new Error(`${spec.label} failed`), { kind: "unknown" });
+      // সব মডেলই অচল হলে এটা provider-level সমস্যা, কেবল মডেল বদলে ঠিক হবে না।
+      if (isModelGoneError(err)) err.kind = "model_unavailable";
+      if (modelSwitched) err.modelSwitched = true;
+      lastError = err;
+      this.recordFailure(p.id, err);
+      this.totals.failures += 1;
+      tried.push(p.id);
+      this.log(`AI provider ${p.id} failed (${err?.kind || "unknown"}): ${err?.message || err}`);
+      previous = p.id;
     }
 
     const err = new Error(lastError ? `সব provider ব্যর্থ: ${lastError.message}` : "কোনো provider উত্তর দিতে পারেনি");
@@ -481,6 +543,9 @@ class AiRouter {
         cooldownMs,
         cooldownUntil: p.cooldownUntil || 0,
         consecutiveFailures: p.consecutiveFailures,
+        autoFallback: p.autoFallback !== false,
+        fallbackModels: Array.isArray(spec.fallbackModels) ? spec.fallbackModels : [],
+        modelMigratedAt: p.modelMigratedAt || 0,
         requests: p.requests,
         successes: p.successes,
         failures: p.failures,
@@ -514,6 +579,7 @@ module.exports = {
   MAX_COOLDOWN_MS,
   MAX_HISTORY,
   MAX_ATTEMPTS,
+  STREAK_FORGIVE_MS,
   dayKey,
   freshProviderState
 };
