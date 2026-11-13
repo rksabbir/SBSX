@@ -209,6 +209,8 @@ const READER_AUTO_WATCH_TIMEOUT_MS = Math.max(60_000, Number(process.env.READER_
 const readerWatchLocks = new Set();
 const readerCheckLocks = new Set();
 const readerCheckLastAt = new Map();
+// একই panel message বারবার edit না করার জন্য শেষ reset-এর সময়।
+const panelMenuResetAt = new Map();
 // Firebase-backed lease prevents a crashed/stale checkout from remaining "checking_reader" forever.
 const READER_CHECK_LEASE_MS = Math.max(30_000, Number(process.env.READER_CHECK_LEASE_MS || 60_000));
 
@@ -2614,8 +2616,12 @@ client.on("interactionCreate", async (interaction) => {
     if (interaction.isButton() || interaction.isStringSelectMenu()) {
         const cooldownKey = `${interaction.user.id}-${interaction.customId}`;
         const paymentOnlineControl = interaction.customId.startsWith("pay_provider_") || interaction.customId.startsWith("check_reader_");
+        // Component interaction-এ সবসময় উত্তর দিতে হয়। Fire-and-forget reply দিলে Discord 3s timeout-এ
+        // "This interaction failed" দেখায় এবং dropdown selection খালি হয় না — তাই এখানে promise ধরা হয়।
         if (cooldowns.has(cooldownKey) && !paymentOnlineControl && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_")) {
-            return interaction.reply({ content: "⚠️ অনুরোধটি ইতোমধ্যে নেওয়া হয়েছে। কয়েক সেকেন্ড অপেক্ষা করুন।", flags: [MessageFlags.Ephemeral] });
+            await interaction.reply({ content: "⏳ ঠামুন — আপনার আগের ক্লিকটি এখনো প্রক্রিয়া হচ্ছে। ২–৩ সেকেন্ড পর আবার চেষ্টা করুন।", flags: [MessageFlags.Ephemeral] })
+                .catch(err => console.warn("Cooldown reply failed:", err.message));
+            return;
         }
         if (!paymentOnlineControl) {
             cooldowns.set(cooldownKey, true);
@@ -2736,6 +2742,13 @@ client.on("interactionCreate", async (interaction) => {
             await reviewChannel.send({ embeds: [reviewEmbed] });
         }
         return interaction.editReply("❤️ আপনার সুন্দর ফিডব্যাকটি দেওয়ার জন্য অসংখ্য ধন্যবাদ!");
+    }
+
+    // ── Panel dropdown: selection যেন আটকে না থাকে ────────────────────────────
+    // Discord component-এ selected value নিজে থেকে খালি হয় না। panel message-কে আবার আগের
+    // অবস্থায় edit করে দিলে ইউজার একই অপশন আবার বেছে নিতে পারে (অথবা অন্য অপশন)।
+    if (interaction.isStringSelectMenu() && /^select_(buy|product|report|customer|key)_/.test(interaction.customId)) {
+        resetPanelSelectMenu(interaction).catch(err => console.warn("Panel select reset failed:", err.message));
     }
 
     // 🌟 ড্রপডাউন সিলেকশন হ্যান্ডলার (1TIME KEY + TICKET HANDLING + BUY/PAYMENT PANEL)
@@ -4582,6 +4595,33 @@ async function getDynamicCustomerPanel() {
 
     const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder(getPanelPlaceholder(fullData, "❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...")).addOptions(options);
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
+}
+
+// panel dropdown-এর selection খালি করে panel আগের অবস্থায় ফিরিয়ে আনে।
+// নাহলে Discord "1 of 1 selected" দেখিয়ে থাকে এবং একই অপশন আবার বেছে নেওয়া যায় না।
+async function resetPanelSelectMenu(interaction) {
+    if (!interaction.message || interaction.message.author?.id !== client.user?.id) return;
+    const messageId = interaction.message.id;
+    const now = Date.now();
+    const last = panelMenuResetAt.get(messageId) || 0;
+    // বেশ কয়েকজন একসাথে একই panel ব্যবহার করলে বারবার edit না করে ২ সেকেন্ডে একবার করে।
+    if (now - last < 2000) return;
+    panelMenuResetAt.set(messageId, now);
+    if (panelMenuResetAt.size > 500) {
+        const cutoff = now - 10 * 60 * 1000;
+        for (const [id, at] of panelMenuResetAt) if (at < cutoff) panelMenuResetAt.delete(id);
+    }
+    const builders = {
+        select_product_ticket: getDynamicTicketPanel,
+        select_report_category: getDynamicReportPanel,
+        select_customer_category: getDynamicCustomerPanel,
+        select_buy_category: getDynamicPaymentPanel,
+        select_key_category: getDynamicOneTimeKeyPanel
+    };
+    const builder = builders[interaction.customId];
+    if (!builder) return;
+    const payload = await builder();
+    await interaction.message.edit(payload).catch(err => console.warn("Panel select reset edit failed:", err.message));
 }
 
 async function getDynamicPaymentPanel() {
