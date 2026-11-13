@@ -170,3 +170,36 @@ test("503 high demand is an overload, not a rate limit", () => {
   assert.equal(classifyError(402, "quota exceeded"), "quota");
   assert.equal(classifyError(404, "model x has been retired"), "model_unavailable");
 });
+
+// ---- v1.5.64: Gemini thinking / timeout ----
+
+test("Gemini thinking is off and the output budget is large enough for a real answer", () => {
+  const { geminiBody, GEMINI_MAX_OUTPUT_TOKENS } = require("../ai-providers");
+  const config = geminiBody({ system: "নিয়ম", history: [{ role: "user", content: "আগে" }], userText: "বলো" }).generationConfig;
+  // thinking বন্ধ — নাহলে থিংকিং টোকেন output budget খেয়ে উত্তর খালি আসে
+  assert.deepEqual(config.thinkingConfig, { thinkingBudget: 0 });
+  assert.ok(config.maxOutputTokens >= 512, "budget must leave room for the actual reply");
+  assert.equal(config.maxOutputTokens, GEMINI_MAX_OUTPUT_TOKENS);
+  assert.ok(GEMINI_MAX_OUTPUT_TOKENS > 400, "old 400-token ceiling was inside the thinking range");
+});
+
+test("thinking parts are never shown to the user", () => {
+  const { geminiText } = require("../ai-providers");
+  const data = { candidates: [{ content: { parts: [{ text: "গোপন ভাবনা", thought: true }, { text: "আসল উত্তর" }] } }] };
+  assert.equal(geminiText(data), "আসল উত্তর");
+  assert.equal(geminiText({ candidates: [{ content: { parts: [{ text: "শুধু ভাবনা", thought: true }] } }] }), "");
+});
+
+test("an empty Gemini reply explains why", () => {
+  const { geminiEmptyReason } = require("../ai-providers");
+  assert.equal(geminiEmptyReason({ candidates: [{ finishReason: "MAX_TOKENS" }], usageMetadata: { thoughtsTokenCount: 900 } }), "thinking_used_all_tokens");
+  assert.equal(geminiEmptyReason({ candidates: [{ finishReason: "MAX_TOKENS" }] }), "max_tokens");
+  assert.equal(geminiEmptyReason({ promptFeedback: { blockReason: "SAFETY" } }), "blocked:SAFETY");
+  assert.equal(geminiEmptyReason({ candidates: [{ finishReason: "SAFETY" }] }), "safety");
+  assert.equal(geminiEmptyReason({}), "empty");
+});
+
+test("a thinking-only reply fails over instead of posting a blank message", async () => {
+  const { geminiText } = require("../ai-providers");
+  assert.equal(geminiText({ candidates: [{ content: { parts: [{ text: "ভাবনা", thought: true }] }, finishReason: "MAX_TOKENS" }] }), "");
+});

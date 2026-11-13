@@ -1518,6 +1518,14 @@ const aiChat = new AiChat({
     channels: AI_CHAT_CHANNELS.length ? AI_CHAT_CHANNELS : [AI_DEFAULT_CHANNEL_ID],
     log: message => console.warn("[AI]", message)
 });
+// প্রতিটি switch / ব্যর্থতা স্টাফ লগে যায়, যাতে admin পরে কার্যকর কারণ জানতে পারে।
+aiChat.router.onEvent = event => {
+    if (event?.type === "switch") {
+        console.warn(`[AI] switch ${event.from} → ${event.to} (${event.reason})`);
+    } else if (event?.type === "failure") {
+        console.warn(`[AI] ${event.providerId} failed: ${event.kind} · cooldown ${Math.round((event.cooldownMs || 0) / 1000)}s`);
+    }
+};
 aiChat.setDb(db);
 client.on("messageCreate", message => {
     aiChat.handleMessage(message).catch(err => console.error("AI auto chat failed:", err?.message || err));

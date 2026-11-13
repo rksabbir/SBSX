@@ -11,6 +11,8 @@ const USER_COOLDOWN_MS = Math.max(0, Number(process.env.AI_CHAT_USER_COOLDOWN_MS
 const FAILURE_NOTICE_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_DEDUPE = 400;
 const MIN_LENGTH = 2;
+// প্রতি AI কলে সর্বোচ্চ এত সময়। ছোট রাখায় এক provider আটকে গেলেও দ্রুত পরেরটি উত্তর দেয়।
+const AI_REPLY_TIMEOUT_MS = Math.max(8_000, Math.min(60_000, Number(process.env.AI_REPLY_TIMEOUT_MS) || 15_000));
 
 function normalizeChannelId(value) {
   return String(value || "").replace(/[^\d]/g, "");
@@ -217,11 +219,13 @@ class AiChat {
           userName: message.member?.displayName || message.author.username || ""
         });
 
+        // মোট সময়সীমা: একক provider-এর timeout ছোট রাখা হয়, যাতে একজন ব্যর্থ provider
+        // পুরো উত্তরের জন্য ২০+ সেকেন্ড আটকে না রাখে। ধীর উত্তর দরকার হলে দীর্ঘ timeout।
         const result = await this.router.ask({
           system,
           history: recall.history.slice(-8),
           userText: text,
-          timeoutMs: 22_000
+          timeoutMs: AI_REPLY_TIMEOUT_MS
         });
 
         const reply = clampForDiscord(normalizeReply(result.text));
@@ -289,5 +293,6 @@ module.exports = {
   MAX_DEDUPE,
   normalizeChannelId,
   MIN_LENGTH,
+  AI_REPLY_TIMEOUT_MS,
   MAX_OUTPUT_TOKENS
 };
