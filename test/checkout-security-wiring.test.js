@@ -20,7 +20,9 @@ test('free coupon sessions require successful coupon consumption before proof is
 });
 
 test('ticket and order channel creation applies the panel channel category as parent', () => {
-  assert.equal((source.match(/parent: getSourceParentCategoryId\(interaction\)/g) || []).length, 2);
+  // v1.5.67: parent এখন shared planner দিয়ে যায় — দুই জায়গাতেই ক্যাটাগরি একই থাকে।
+  assert.equal((source.match(/parentId: getSourceParentCategoryId\(interaction\)/g) || []).length, 2);
+  assert.equal((source.match(/\.\.\.\(\w+\.parentId \? \{ parent: \w+\.parentId \} : \{\}\)/g) || []).length, 2);
   assert.match(source, /function getSourceParentCategoryId\(interaction\)/);
 });
 

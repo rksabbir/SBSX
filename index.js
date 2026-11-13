@@ -7,6 +7,7 @@ const express = require("express");
 const fs = require("fs");
 const crypto = require("crypto");
 const { promisify } = require("util");
+const ticketChannelTools = require("./ticket-channel");
 const os = require("os");
 const admin = require("firebase-admin"); // Firebase Admin SDK
 
@@ -27,6 +28,9 @@ const {
     TextInputBuilder,
     TextInputStyle
 } = require("discord.js");
+
+// টিকিট helper-কে Discord-এর আসল permission flag দিন (pure module, Discord ছাড়াও টেস্ট হয়)।
+ticketChannelTools.configurePermissions(PermissionFlagsBits);
 
 // html-transcripts ইম্পোর্ট
 const discordTranscripts = require("discord-html-transcripts");
@@ -4359,25 +4363,26 @@ client.on("interactionCreate", async (interaction) => {
                 creationStartedAt: null
             });
 
-            const randomCode = Math.floor(1000 + Math.random() * 9000);
-            let supportRoleId = getConfiguredRoleId("supportCustomer");
-            const supportRoleIds = getModeratorRoleIds("orders", [supportRoleId]);
-            let channelPrefix = `order-${randomCode}`;
-
-            const permissionOverwrites = [
-                { id: interaction.guild.id, deny: [PermissionFlagsBits.ViewChannel] },
-                { id: getConfiguredRoleId("verified"), deny: [PermissionFlagsBits.ViewChannel] },
-                { id: interaction.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] }
-            ];
-
-            for (const roleId of supportRoleIds) if (interaction.guild.roles.cache.has(roleId)) permissionOverwrites.push({ id: roleId, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
-            if (interaction.guild.roles.cache.has(getConfiguredRoleId("admin"))) permissionOverwrites.push({ id: getConfiguredRoleId("admin"), allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.SendMessages, PermissionFlagsBits.ReadMessageHistory] });
+            // অর্ডার চ্যানেলও টিকিটের মতো একই helper থেকে তৈরি হয় — দুই জায়গায় আলাদা
+            // কোড রাখলে একটায় বাগ থেকে যায় (v1.5.66 পর্যন্ত ঠিক এটাই হয়েছিল)।
+            const orderPlan = ticketChannelTools.planTicketChannel({
+                type: "order",
+                category,
+                order: true,
+                guildId: interaction.guild.id,
+                userId: interaction.user.id,
+                parentId: getSourceParentCategoryId(interaction),
+                configuredRole: getConfiguredRoleId,
+                moderatorRoles: getModeratorRoleIds,
+                roleExists: roleId => Boolean(roleId) && interaction.guild.roles.cache.has(roleId)
+            });
+            const supportRoleId = orderPlan.supportRoleId;
 
             const privateChannel = await interaction.guild.channels.create({
-                name: channelPrefix,
+                name: orderPlan.name,
                 type: ChannelType.GuildText,
-                ...(getSourceParentCategoryId(interaction) ? { parent: getSourceParentCategoryId(interaction) } : {}),
-                permissionOverwrites
+                ...(orderPlan.parentId ? { parent: orderPlan.parentId } : {}),
+                permissionOverwrites: orderPlan.permissionOverwrites
             });
 
             await saveTicketArchiveOpened(privateChannel, interaction.user, category, "order", "approved").catch(err => {
@@ -4478,7 +4483,20 @@ client.on("interactionCreate", async (interaction) => {
         const parts = interaction.customId.split("_");
         const type = parts[1]; const category = parts.slice(2).join("_");
 
-        // একই ইউজার একই ক্যাটাগরিতে একটির বেশি টিকিট খুলতে পারবে না।
+        // ⚠️ channelPrefix / permissionOverwrites আগে শুধু "অর্ডার কনফার্ম" অংশে তৈরি হতো,
+        // তাই এখানে ReferenceError হয়ে চ্যানেল তৈরি ব্যর্থ হতো — অথচ এরর মেসেজে
+        // "Manage Channels permission দেখুন" লেখা থাকত, ফলে আসল কারণ হারিয়ে যেত।
+        const ticketPlan = ticketChannelTools.planTicketChannel({
+            type,
+            category,
+            guildId: interaction.guild.id,
+            userId: interaction.user.id,
+            parentId: getSourceParentCategoryId(interaction),
+            configuredRole: getConfiguredRoleId,
+            moderatorRoles: getModeratorRoleIds,
+            roleExists: roleId => Boolean(roleId) && interaction.guild.roles.cache.has(roleId)
+        });
+
         // একই ইউজার একই ক্যাটাগরিতে একটির বেশি টিকিট খুলতে পারবে না।
         const ticketLockSlot = ["ticket", "report", "customer"].includes(type)
             ? await claimTicketSlot({ guildId: interaction.guild.id, userId: interaction.user.id, type, category })
@@ -4489,16 +4507,16 @@ client.on("interactionCreate", async (interaction) => {
         let privateChannel = null;
         try {
             privateChannel = await interaction.guild.channels.create({
-                name: channelPrefix,
+                name: ticketPlan.name,
                 type: ChannelType.GuildText,
-                ...(getSourceParentCategoryId(interaction) ? { parent: getSourceParentCategoryId(interaction) } : {}),
-                permissionOverwrites
+                ...(ticketPlan.parentId ? { parent: ticketPlan.parentId } : {}),
+                permissionOverwrites: ticketPlan.permissionOverwrites
             });
         } catch (channelErr) {
             console.error("❌ Ticket channel creation failed:", channelErr.message);
             // চ্যানেল না হলে লক ছেড়ে দিতে হবে, নাহলে ইউজার আটকে যাবে।
             if (ticketLockSlot.ref) await ticketLockSlot.ref.remove().catch(() => {});
-            return interaction.editReply("❌ টিকিট চ্যানেল তৈরি করা যায়নি (Bot-এর Manage Channels permission দেখুন)। আবার চেষ্টা করুন।");
+            return interaction.editReply(ticketChannelTools.describeChannelCreateError(channelErr));
         }
         // লকে চ্যানেলের id বসানো — এরপর ওই চ্যানেল বন্ধ/ডিলিট হলে লক ছাড়া যাবে।
         if (ticketLockSlot.ref) {
@@ -4516,7 +4534,7 @@ client.on("interactionCreate", async (interaction) => {
             new ButtonBuilder().setCustomId(`close_${type}`).setLabel("🔒 Close").setStyle(ButtonStyle.Secondary)
         );
 
-        await privateChannel.send({ content: `${interaction.user} <@&${supportRoleId}>`, embeds: [panelEmbed], components: [actionRow] });
+        await privateChannel.send({ content: `${interaction.user}${ticketPlan.supportRoleId ? ` <@&${ticketPlan.supportRoleId}>` : ""}`, embeds: [panelEmbed], components: [actionRow] });
 
         const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
         if (trackingChannel) {
