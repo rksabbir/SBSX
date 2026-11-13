@@ -175,7 +175,8 @@ test("503 high demand is an overload, not a rate limit", () => {
 
 test("Gemini thinking is off and the output budget is large enough for a real answer", () => {
   const { geminiBody, GEMINI_MAX_OUTPUT_TOKENS } = require("../ai-providers");
-  const config = geminiBody({ system: "নিয়ম", history: [{ role: "user", content: "আগে" }], userText: "বলো" }).generationConfig;
+  // ৩.৮ Flash: thinkingBudget: 0 কাজ করে
+  const config = geminiBody({ system: "নিয়ম", history: [{ role: "user", content: "আগে" }], userText: "বলো", model: "gemini-3.8-flash" }).generationConfig;
   // thinking বন্ধ — নাহলে থিংকিং টোকেন output budget খেয়ে উত্তর খালি আসে
   assert.deepEqual(config.thinkingConfig, { thinkingBudget: 0 });
   assert.ok(config.maxOutputTokens >= 512, "budget must leave room for the actual reply");
@@ -202,4 +203,41 @@ test("an empty Gemini reply explains why", () => {
 test("a thinking-only reply fails over instead of posting a blank message", async () => {
   const { geminiText } = require("../ai-providers");
   assert.equal(geminiText({ candidates: [{ content: { parts: [{ text: "ভাবনা", thought: true }] }, finishReason: "MAX_TOKENS" }] }), "");
+});
+
+// ---- v1.5.66: Gemini ৩.x-এ thinking বন্ধ করার ফরম্যাট মডেল-ভেদে আলাদা ----
+
+test("each Gemini generation gets the thinking shape Google actually accepts", () => {
+  const { geminiThinkingShape } = require("../ai-providers");
+  // 2026-11 যাচাই: 3.8-flash = thinkingBudget:0, 3.5-flash-lite = thinkingLevel:minimal
+  assert.deepEqual(geminiThinkingShape("gemini-3.8-flash"), { thinkingBudget: 0 });
+  assert.deepEqual(geminiThinkingShape("gemini-3.5-flash-lite"), { thinkingLevel: "minimal" });
+  assert.deepEqual(geminiThinkingShape("gemini-3.6-flash"), { thinkingLevel: "minimal" });
+  // অজানা মডেলে "minimal" পাঠানো ৪০০ ডাকে — নিরাপদ ডিফল্ট
+  assert.deepEqual(geminiThinkingShape("gemini-2.5-flash"), { thinkingLevel: "low" });
+  assert.deepEqual(geminiThinkingShape(""), { thinkingLevel: "low" });
+  // models/ প্রিফিক্সও কাজ করে
+  assert.deepEqual(geminiThinkingShape("models/gemini-3.8-flash"), { thinkingBudget: 0 });
+});
+
+test("the flash-lite fallback no longer gets a request shape that returns 400", () => {
+  const { geminiBody } = require("../ai-providers");
+  const body = geminiBody({ userText: "হাই", model: "gemini-3.5-flash-lite" });
+  assert.equal(body.generationConfig.thinkingConfig.thinkingBudget, undefined);
+  assert.equal(body.generationConfig.thinkingConfig.thinkingLevel, "minimal");
+});
+
+test("thinkingConfig can be dropped entirely for the 400 recovery retry", () => {
+  const { geminiBody, geminiText } = require("../ai-providers");
+  const body = geminiBody({ userText: "হাই", model: "gemini-3.5-flash-lite", includeThinking: false });
+  assert.equal(body.generationConfig.thinkingConfig, undefined);
+  assert.ok(body.generationConfig.maxOutputTokens >= 1024);
+  // thought অংশ কখনো উত্তর হিসেবে যায় না
+  assert.equal(geminiText({ candidates: [{ content: { parts: [{ text: "ভাবছি", thought: true }, { text: "উত্তর" }] } }] }), "উত্তর");
+});
+
+test("a Gemini 400 caused by the thinking shape is not treated as a dead model", () => {
+  const { classifyError } = require("../ai-providers");
+  assert.equal(classifyError(400, "Thinking level MINIMAL is not supported for this model"), "bad_request");
+  assert.equal(classifyError(400, "Request contains an invalid argument."), "bad_request");
 });

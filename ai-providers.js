@@ -134,7 +134,25 @@ function buildChatMessages({ system, history = [], userText }) {
 // Gemini ৩.x মডেলে ডিফল্টে "থিংকিং" চালু থাকে এবং thinking টোকেন maxOutputTokens-এর
 // ভেতরেই গোনা হয়। ফলে ছোট budget-এ উত্তর খালি আসে আর latency অনেক বেড়ে যায়।
 // তাই চ্যাটের জন্য thinking বন্ধ/সর্বনিম্ন রাখা হয় এবং output budget আলাদা রাখা হয়।
-function geminiBody({ system, history = [], userText, maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS, thinking = "off" }) {
+// ⚠️ Gemini ৩.x-এ "থিংকিং বন্ধ" করার ফরম্যাট মডেল-ভেদে আলাদা (২০২৬-১১-এ যাচাই করা):
+//   gemini-3.8-flash     → thinkingBudget: 0        (200 OK)
+//   gemini-3.5-flash-lite → thinkingLevel: "minimal" (thinkingBudget: 0 দিলে ৪০০!)
+//   অজানা ৩.x মডেল       → thinkingLevel: "low"    ("minimal" 3.7+ এ অবৈধ)
+// ভুল ফরম্যাট পাঠালে Google 400 INVALID_ARGUMENT দেয় — তাই মডেল দেখে বেছে নেওয়া হয়।
+function geminiThinkingShape(model, thinking = "off") {
+  const name = String(model || "").replace(/^models\//, "").toLowerCase();
+  if (thinking !== "off" && thinking !== "minimal") {
+    return thinking === "low" ? { thinkingLevel: "low" } : null;
+  }
+  // ৩.৮+ flash / ৩.৭+ সিরিজ: thinkingBudget পুরোপুরি সমর্থিত
+  if (/gemini-3\.[89]/.test(name) || /gemini-3\.1[0-9]/.test(name)) return { thinkingBudget: 0 };
+  // ৩.৫ / ৩.৬ সিরিজ (ফ্ল্যাশ-লাইট সহ): কেবল thinkingLevel শুধু "minimal" গ্রহণ করে
+  if (/gemini-3\.[4-7]/.test(name)) return { thinkingLevel: "minimal" };
+  // অজানা/পুরোনো মডেল — নিরাপদ ডিফল্ট
+  return { thinkingLevel: "low" };
+}
+
+function geminiBody({ system, history = [], userText, maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS, thinking = "off", model = "", includeThinking = true }) {
   const contents = [];
   for (const turn of history || []) {
     const text = String(turn?.content || "").trim().slice(0, 1200);
@@ -143,8 +161,10 @@ function geminiBody({ system, history = [], userText, maxOutputTokens = GEMINI_M
   }
   contents.push({ role: "user", parts: [{ text: String(userText || "").slice(0, 2000) }] });
   const generationConfig = { temperature: 0.85, maxOutputTokens: Math.max(64, Math.min(8192, Number(maxOutputTokens) || GEMINI_MAX_OUTPUT_TOKENS)) };
-  if (thinking === "off") generationConfig.thinkingConfig = { thinkingBudget: 0 };
-  else if (thinking === "low") generationConfig.thinkingConfig = { thinkingLevel: "low" };
+  if (includeThinking) {
+    const shape = geminiThinkingShape(model, thinking);
+    if (shape) generationConfig.thinkingConfig = shape;
+  }
   const body = { contents, generationConfig };
   if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, 6000) }] };
   return body;
@@ -206,7 +226,7 @@ async function callProvider({ providerId, apiKey, accountId, model, system, hist
     const modelId = String(model || spec.defaultModel).replace(/^models\//, "");
     url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent`;
     headers = { "Content-Type": "application/json", "x-goog-api-key": apiKey };
-    body = geminiBody({ system, history, userText, maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS, thinking: thinkingMode });
+    body = geminiBody({ system, history, userText, maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS, thinking: thinkingMode, model: modelId });
   } else if (spec.kind === "cloudflare") {
     if (!accountId) throw Object.assign(new Error("Cloudflare account id missing"), { kind: "auth" });
     const modelId = String(model || spec.defaultModel);
@@ -245,6 +265,24 @@ async function callProvider({ providerId, apiKey, accountId, model, system, hist
 
   if (!response.ok) {
     const detail = String(data?.error?.message || data?.message || data?.errors?.[0]?.message || raw || "").slice(0, 300);
+    // Gemini 400-এর সবচেয়ে সাধারণ কারণ thinking ফরম্যাট — একবার thinkingConfig ছাড়াই চেষ্টা করা হয়,
+    // তাহলে ভুল ফরম্যাটের জন্য পুরো provider হারাতে হয় না।
+    if (spec.kind === "gemini" && response.status === 400 && body?.generationConfig?.thinkingConfig) {
+      const retryBody = { ...body, generationConfig: { ...body.generationConfig } };
+      delete retryBody.generationConfig.thinkingConfig;
+      const retry = await fetch(url, {
+        method: "POST", headers, body: JSON.stringify(retryBody), signal: AbortSignal.timeout(timeoutMs)
+      }).catch(() => null);
+      if (retry && retry.ok) {
+        const retryRaw = await retry.text().catch(() => "");
+        let retryData = null;
+        try { retryData = retryRaw ? JSON.parse(retryRaw) : null; } catch (_) { retryData = null; }
+        const retryText = geminiText(retryData);
+        if (retryText) {
+          return { providerId, model: model || spec.defaultModel, text: retryText, usage: providerUsage(providerId, retryData), thinkingDropped: true };
+        }
+      }
+    }
     throw Object.assign(new Error(`${spec.label} HTTP ${response.status}: ${detail}`), {
       kind: classifyError(response.status, detail),
       status: response.status,
@@ -276,6 +314,8 @@ function classifyHttpStatus(status) {
 // `model_unavailable` = মডেলটাই বন্ধ → পরের মডেল বা পরের provider।
 function classifyError(status, detail = "") {
   const text = String(detail || "");
+  // thinking ফরম্যাট ভুল হলে মডেল বদলালে লাভ নেই — এটা request-shape সমস্যা (kind: bad_request)।
+  if (status === 400 && /thinking/i.test(text)) return "bad_request";
   if (MODEL_GONE_PATTERN.test(text)) return "model_unavailable";
   if (status === 503 || status === 529) return "overloaded";
   if (status >= 500 && /high demand|overloaded|temporarily unavailable|try again later|capacity/i.test(text)) return "overloaded";
@@ -322,6 +362,7 @@ module.exports = {
   buildChatMessages,
   geminiBody,
   geminiText,
+  geminiThinkingShape,
   geminiEmptyReason,
   GEMINI_MAX_OUTPUT_TOKENS,
   openAiText,

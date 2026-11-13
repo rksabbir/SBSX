@@ -27,7 +27,14 @@ const MODEL_GONE_COOLDOWN_MS = 10 * 60 * 1000;
 const STREAK_FORGIVE_MS = 10 * 60 * 1000;
 // টাইমআউট: একবার হলে দ্রুত আবার চেষ্টা, বারবার হলে ক্রমবর্ধমান।
 const TIMEOUT_COOLDOWN_MS = 20_000;
+// একই সমস্যা পরপর এতবার হলে ছোট cooldown আর কাজে দেয় না — লম্বা বিশ্রাম।
+const PROBE_FAILURE_THRESHOLD = 3;
+const PROBE_COOLDOWN_MS = 5 * 60 * 1000;
 const DEFAULT_PROVIDER_TIMEOUT_MS = 20_000;
+// কোনো একক চেষ্টা এর চেয়ে কম সময় পাবে না — নাহলে উত্তর আসার আগেই কেটে যাবে।
+const MIN_PROVIDER_TIMEOUT_MS = 6_000;
+// এক ইউজারের উত্তরের মোট সময়সীমা (সব provider মিলিয়ে)।
+const DEFAULT_GIVE_UP_MS = 35_000;
 const STATE_SAVE_DEBOUNCE_MS = 4_000;
 const MAX_HISTORY = 60;
 const MAX_ERROR_LOG = 40;
@@ -51,8 +58,14 @@ function clampNumber(value, min, max, fallback) {
   return Math.min(max, Math.max(min, n));
 }
 
+// "আজ" মানে বাংলাদেশের দিন। সার্ভার UTC-তে চললেও কোটার হিসাব ঢাকার তারিখে হয়,
+// নাহলে রাত ২টায়ও আগের দিনের সংখ্যা দেখিয়ে ইউজারকে বিভ্রান্ত করে।
+const DHAKA_DAY_FORMAT = new Intl.DateTimeFormat("en-CA", {
+  timeZone: "Asia/Dhaka", year: "numeric", month: "2-digit", day: "2-digit"
+});
+
 function dayKey(ts = Date.now()) {
-  return new Date(ts).toISOString().slice(0, 10);
+  return DHAKA_DAY_FORMAT.format(new Date(ts));
 }
 
 function freshProviderState(spec, index) {
@@ -90,6 +103,8 @@ class AiRouter {
     this.timeoutMs = options.timeoutMs;
     // প্রতি provider-এ কতবার চেষ্টা (১–২)। 기본 ২ — একবার timeout হলে দ্বিতীয় সুযোগ।
     this.providerAttempts = clampNumber(options.providerAttempts ?? 2, 1, 2, 2);
+    // পুরো উত্তরের জন্য সর্বোচ্চ সময় (সব provider মিলিয়ে) — এক ধীর provider সব খেতে পারবে না।
+    this.giveUpMs = clampNumber(options.giveUpMs ?? DEFAULT_GIVE_UP_MS, 5_000, 120_000, DEFAULT_GIVE_UP_MS);
     this.wait = options.wait || null;
 
     this.providers = {};
@@ -127,6 +142,8 @@ class AiRouter {
       current.cooldownUntil = clampNumber(saved.cooldownUntil, 0, Number.MAX_SAFE_INTEGER, 0);
       current.requests = clampNumber(saved.requests, 0, 10_000_000, 0);
       current.successes = clampNumber(saved.successes, 0, 10_000_000, 0);
+      // successes কখনো requests-এর বেশি নয় — পুরোনো বাগে জমে যাওয়া ডেটা এখানেই সারানো হয়।
+      if (current.successes > current.requests) current.requests = current.successes;
       current.failures = clampNumber(saved.failures, 0, 10_000_000, 0);
       current.lastError = typeof saved.lastError === "string" ? saved.lastError.slice(0, 300) : "";
       current.lastErrorAt = clampNumber(saved.lastErrorAt, 0, Number.MAX_SAFE_INTEGER, 0);
@@ -331,6 +348,11 @@ class AiRouter {
     else if (kind === "model_unavailable") cooldown = MODEL_GONE_COOLDOWN_MS;
     else if (kind === "rate_limit") cooldown = Math.max(BASE_COOLDOWN_MS * Math.pow(2, Math.min(Math.max(p.consecutiveFailures, 1) - 1, 4)), 90_000);
     else cooldown = BASE_COOLDOWN_MS * Math.pow(2, Math.min(Math.max(p.consecutiveFailures, 1) - 1, 5));
+    // পরপর ৩+ ব্যর্থতা: ২০ সেকেন্ডে বারবার চেষ্টা করে শুধু কোটা নষ্ট হয় — ৫ মিনিট বিশ্রাম।
+    if (p.consecutiveFailures >= PROBE_FAILURE_THRESHOLD &&
+        ["timeout", "overloaded", "server", "empty", "unknown"].includes(kind)) {
+      cooldown = Math.max(cooldown || 0, PROBE_COOLDOWN_MS);
+    }
     const headerWait = parseRetryAfterMs(error?.headers, this.now());
     if (headerWait && headerWait > 0) cooldown = Math.max(cooldown, headerWait);
     cooldown = clampNumber(cooldown, OVERLOAD_COOLDOWN_MS, MAX_COOLDOWN_MS, BASE_COOLDOWN_MS);
@@ -354,10 +376,25 @@ class AiRouter {
     return { cooldownMs: cooldown, kind };
   }
 
-  recordSuccess(provider, usage) {
+  // `source: "test"` হলে প্যানেলের টেস্ট বাটন থেকে আসা ফল — একে চ্যাটের পরিসংখ্যানে
+  // গোনা হয় না, নাহলে "Request 4 · success 5 (125%)"-এর মতো অসম্ভব সংখ্যা দেখায়।
+  recordSuccess(provider, usage, options = {}) {
     const p = this.providers[provider];
     if (!p) return;
+    const testOnly = options.source === "test";
     const today = dayKey(this.now());
+    if (testOnly) {
+      if (options.countRequest !== false) p.requests += 1;
+      if (p.dailyDate !== today) { p.dailyDate = today; p.dailyRequests = 0; }
+      if (options.countDaily !== false) p.dailyRequests += 1;
+      p.lastUsedAt = this.now();
+      p.consecutiveFailures = 0;
+      p.cooldownUntil = 0;
+      p.lastErrorKind = "";
+      p.status = STATUS.AVAILABLE;
+      this.queueSave();
+      return;
+    }
     if (p.dailyDate !== today) { p.dailyDate = today; p.dailyRequests = 0; }
     p.successes += 1;
     p.lastUsedAt = this.now();
@@ -431,21 +468,34 @@ class AiRouter {
   async callWithRetry(args, options = {}) {
     const maxAttempts = clampNumber(options.maxAttempts ?? this.providerAttempts, 1, 2, 1);
     const delays = options.delays || [300, 900];
+    // এই provider-এর জন্য বরাদ্দ সময়। বাকি provider-দের ভাগ আলাদা রাখা হয়।
+    const allowanceMs = Number(options.remainingMs);
     let lastError = null;
-    let timeoutMs = Number(args.timeoutMs) || DEFAULT_PROVIDER_TIMEOUT_MS;
+    const baseTimeout = Number(args.timeoutMs) || DEFAULT_PROVIDER_TIMEOUT_MS;
+    let spent = 0;
     for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      const attemptsLeft = maxAttempts - attempt;
+      let timeoutMs = baseTimeout;
+      if (Number.isFinite(allowanceMs)) {
+        const usable = Math.max(0, allowanceMs - spent);
+        // প্রতিটি চেষ্টা বাকি বরাদ্দের সমান ভাগ পায় — দ্বিতীয় চেষ্টা প্রথমটির চেয়ে বড় নয়।
+        timeoutMs = Math.min(baseTimeout, Math.floor(usable / attemptsLeft));
+        if (usable < MIN_PROVIDER_TIMEOUT_MS) break;
+        timeoutMs = Math.max(MIN_PROVIDER_TIMEOUT_MS, timeoutMs);
+      }
+      const startedAt = this.now();
       try {
         return await this.call({ ...args, timeoutMs });
       } catch (err) {
+        spent += Math.max(0, this.now() - startedAt) || timeoutMs;
         lastError = err;
         const retryable = ["overloaded", "server", "timeout", "network"].includes(String(err?.kind || ""));
         if (!retryable || attempt === maxAttempts - 1) break;
         // পরে আসা model-gone/auth/quota ভুলগুলো retry করে লাভ নেই।
         await this.sleep(delays[Math.min(attempt, delays.length - 1)]);
-        timeoutMs = Math.round(timeoutMs * 1.5);
       }
     }
-    throw lastError;
+    throw lastError || Object.assign(new Error("provider attempt skipped"), { kind: "unknown" });
   }
 
   sleep(ms) {
@@ -458,7 +508,7 @@ class AiRouter {
   }
 
   // একাধিক provider চেষ্টা করে প্রথম সফল উত্তর দেয়। প্রতিটি switch history-তে যায়।
-  async ask({ system, history = [], userText, attempts = MAX_ATTEMPTS, timeoutMs }) {
+  async ask({ system, history = [], userText, attempts = MAX_ATTEMPTS, timeoutMs, giveUpMs }) {
     const order = this.order();
     if (!order.length) {
       const anyConfigured = Object.values(this.providers).some(p => p.enabled && p.status !== STATUS.UNCONFIGURED);
@@ -471,8 +521,19 @@ class AiRouter {
     let previous = "";
     let lastError = null;
     const tried = [];
+    // মোট সময়সীমা: এর ভেতরে উত্তর না এলে আর provider ঘুরিয়ে কোটা নষ্ট করা হয় না।
+    const totalBudget = clampNumber(giveUpMs ?? this.giveUpMs, 5_000, 120_000, this.giveUpMs);
+    const startedAt = this.now();
+    const remaining = () => totalBudget - (this.now() - startedAt);
 
-    for (const p of order.slice(0, Math.max(1, Math.min(attempts, order.length)))) {
+    const queue = order.slice(0, Math.max(1, Math.min(attempts, order.length)));
+    for (const [index, p] of queue.entries()) {
+      // বাকি সবাই সমান ভাগ পায় — এক ধীর provider পুরো বাজেট খেতে পারে না।
+      const allowance = Math.max(MIN_PROVIDER_TIMEOUT_MS, Math.floor(remaining() / (queue.length - index)));
+      if (tried.length && remaining() <= MIN_PROVIDER_TIMEOUT_MS) {
+        this.pushHistory({ providerId: p.id, reason: "time_budget_exhausted", message: `মোট ${Math.round(totalBudget / 1000)}s শেষ` });
+        break;
+      }
       const spec = getProviderSpec(p.id);
       if (!spec) continue;
       const apiKey = String(process.env[spec.env] || "").trim();
@@ -514,7 +575,7 @@ class AiRouter {
             history,
             userText,
             timeoutMs: timeoutMs || this.timeoutMs
-          });
+          }, { remainingMs: allowance });
           if (model !== p.model) {
             // মডেল বদলেছে — admin প্যানেলে দেখা যাবে, আর পরের বার সরাসরি এটাই ব্যবহার হবে।
             const previousModel = p.model;
@@ -553,6 +614,7 @@ class AiRouter {
 
     const err = new Error(lastError ? `সব provider ব্যর্থ: ${lastError.message}` : "কোনো provider উত্তর দিতে পারেনি");
     err.kind = "all_failed";
+    err.elapsedMs = this.now() - startedAt;
     err.attempted = tried;
     throw err;
   }
@@ -590,7 +652,9 @@ class AiRouter {
         requests: p.requests,
         successes: p.successes,
         failures: p.failures,
-        successRate: p.requests ? Math.round((p.successes / p.requests) * 100) : 0,
+        successRate: p.requests ? Math.max(0, Math.min(100, Math.round((p.successes / p.requests) * 100))) : 0,
+        // প্যানেলের টেস্ট বাটনও successes বাড়ায় — তাই অসম্ভব শতাংশ (১৫০%) আসত।
+        statsPending: Math.max(0, p.successes - p.requests),
         lastError: p.lastError,
         lastErrorAt: p.lastErrorAt,
         lastUsedAt: p.lastUsedAt,
