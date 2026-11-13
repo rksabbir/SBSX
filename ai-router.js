@@ -23,7 +23,11 @@ const QUOTA_COOLDOWN_MS = 60 * 60 * 1000;
 // 5xx / "high demand" কয়েক সেকেন্ডেই ঠিক হয়ে যায়, তাই লম্বা cooldown নয়।
 const OVERLOAD_COOLDOWN_MS = 15_000;
 const MODEL_GONE_COOLDOWN_MS = 10 * 60 * 1000;
-const STREAK_FORGIVE_MS = 30 * 60 * 1000;
+// এই সময় কোনো ব্যর্থতা না হলে failure streak ক্ষমা করা হয় (cooldown-এ গোনা হয় না)।
+const STREAK_FORGIVE_MS = 10 * 60 * 1000;
+// টাইমআউট: একবার হলে দ্রুত আবার চেষ্টা, বারবার হলে ক্রমবর্ধমান।
+const TIMEOUT_COOLDOWN_MS = 20_000;
+const DEFAULT_PROVIDER_TIMEOUT_MS = 20_000;
 const STATE_SAVE_DEBOUNCE_MS = 4_000;
 const MAX_HISTORY = 60;
 const MAX_ERROR_LOG = 40;
@@ -84,6 +88,9 @@ class AiRouter {
     this.loadState = options.loadState || (async () => null);
     this.log = options.log || (() => {});
     this.timeoutMs = options.timeoutMs;
+    // প্রতি provider-এ কতবার চেষ্টা (১–২)। 기본 ২ — একবার timeout হলে দ্বিতীয় সুযোগ।
+    this.providerAttempts = clampNumber(options.providerAttempts ?? 2, 1, 2, 2);
+    this.wait = options.wait || null;
 
     this.providers = {};
     for (const [index, spec] of AI_PROVIDERS.entries()) {
@@ -317,6 +324,7 @@ class AiRouter {
     // ধরন অনুযায়ী cooldown: সার্ভার ব্যস্ত হলে ছোট, কোটা/মডেল বন্ধ হলে বড়।
     let cooldown;
     if (kind === "overloaded") cooldown = OVERLOAD_COOLDOWN_MS;
+    else if (kind === "timeout") cooldown = TIMEOUT_COOLDOWN_MS * Math.pow(2, Math.min(Math.max(p.consecutiveFailures, 1) - 1, 3));
     else if (kind === "server") cooldown = Math.min(BASE_COOLDOWN_MS, OVERLOAD_COOLDOWN_MS * 2);
     else if (kind === "auth") cooldown = AUTH_COOLDOWN_MS;
     else if (kind === "quota") cooldown = QUOTA_COOLDOWN_MS;
@@ -416,6 +424,39 @@ class AiRouter {
 
   // ---- the actual ask ----------------------------------------------------
 
+  // একই provider-এর ভেতরে ছোট retry সিঁড়ি।
+  // হালকা provider (Gemini) একবার ব্যস্ত থাকলে বা সময় শেষ হলে সাথে সাথে পুরো provider
+  // বাদ দেওয়া wasteful — তাই maxAttempts-এর মধ্যে ছোট বিরতি দিয়ে আবার চেষ্টা করা হয়।
+  // ধীর provider-এর জন্য বেশি retry নয়; timeout-ও ক্রমবর্ধমান।
+  async callWithRetry(args, options = {}) {
+    const maxAttempts = clampNumber(options.maxAttempts ?? this.providerAttempts, 1, 2, 1);
+    const delays = options.delays || [300, 900];
+    let lastError = null;
+    let timeoutMs = Number(args.timeoutMs) || DEFAULT_PROVIDER_TIMEOUT_MS;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      try {
+        return await this.call({ ...args, timeoutMs });
+      } catch (err) {
+        lastError = err;
+        const retryable = ["overloaded", "server", "timeout", "network"].includes(String(err?.kind || ""));
+        if (!retryable || attempt === maxAttempts - 1) break;
+        // পরে আসা model-gone/auth/quota ভুলগুলো retry করে লাভ নেই।
+        await this.sleep(delays[Math.min(attempt, delays.length - 1)]);
+        timeoutMs = Math.round(timeoutMs * 1.5);
+      }
+    }
+    throw lastError;
+  }
+
+  sleep(ms) {
+    if (!ms || ms <= 0) return Promise.resolve();
+    if (this.wait) return this.wait(ms);
+    return new Promise(resolve => {
+      const timer = setTimeout(resolve, ms);
+      if (typeof timer.unref === "function") timer.unref();
+    });
+  }
+
   // একাধিক provider চেষ্টা করে প্রথম সফল উত্তর দেয়। প্রতিটি switch history-তে যায়।
   async ask({ system, history = [], userText, attempts = MAX_ATTEMPTS, timeoutMs }) {
     const order = this.order();
@@ -464,7 +505,7 @@ class AiRouter {
       let modelSwitched = false;
       for (const [index, model] of chain.entries()) {
         try {
-          const result = await this.call({
+          const result = await this.callWithRetry({
             providerId: p.id,
             apiKey,
             accountId,
@@ -580,6 +621,8 @@ module.exports = {
   MAX_HISTORY,
   MAX_ATTEMPTS,
   STREAK_FORGIVE_MS,
+  TIMEOUT_COOLDOWN_MS,
+  DEFAULT_PROVIDER_TIMEOUT_MS,
   dayKey,
   freshProviderState
 };

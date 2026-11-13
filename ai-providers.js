@@ -5,6 +5,8 @@
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_OUTPUT_TOKENS = 400;
+// Gemini-র নিজস্ব budget — thinking টোকেন এখান থেকেই খায়, তাই আলাদা ও বড় রাখা হয়।
+const GEMINI_MAX_OUTPUT_TOKENS = 1024;
 
 // provider id → কীভাবে ডাকা হবে। `env` হলো API key-এর environment variable নাম।
 // ⚠️ মডেল তালিকা ২০২৬-১১-এ যাচাই করা: provider-রা পুরোনো মডেল বন্ধ করছে, তাই প্রতিটির
@@ -129,23 +131,43 @@ function buildChatMessages({ system, history = [], userText }) {
   return messages;
 }
 
-function geminiBody({ system, history, userText }) {
+// Gemini ৩.x মডেলে ডিফল্টে "থিংকিং" চালু থাকে এবং thinking টোকেন maxOutputTokens-এর
+// ভেতরেই গোনা হয়। ফলে ছোট budget-এ উত্তর খালি আসে আর latency অনেক বেড়ে যায়।
+// তাই চ্যাটের জন্য thinking বন্ধ/সর্বনিম্ন রাখা হয় এবং output budget আলাদা রাখা হয়।
+function geminiBody({ system, history = [], userText, maxOutputTokens = GEMINI_MAX_OUTPUT_TOKENS, thinking = "off" }) {
   const contents = [];
-  for (const turn of history) {
+  for (const turn of history || []) {
     const text = String(turn?.content || "").trim().slice(0, 1200);
     if (!text) continue;
     contents.push({ role: turn?.role === "assistant" ? "model" : "user", parts: [{ text }] });
   }
   contents.push({ role: "user", parts: [{ text: String(userText || "").slice(0, 2000) }] });
-  const body = { contents, generationConfig: { temperature: 0.85, maxOutputTokens: MAX_OUTPUT_TOKENS } };
+  const generationConfig = { temperature: 0.85, maxOutputTokens: Math.max(64, Math.min(8192, Number(maxOutputTokens) || GEMINI_MAX_OUTPUT_TOKENS)) };
+  if (thinking === "off") generationConfig.thinkingConfig = { thinkingBudget: 0 };
+  else if (thinking === "low") generationConfig.thinkingConfig = { thinkingLevel: "low" };
+  const body = { contents, generationConfig };
   if (system) body.systemInstruction = { parts: [{ text: String(system).slice(0, 6000) }] };
   return body;
 }
 
+// থিংকিং-এর অংশ কখনোই ইউজারকে দেখানো হয় না (part.thought === true হলে বাদ)।
 function geminiText(data) {
   const parts = data?.candidates?.[0]?.content?.parts;
   if (!Array.isArray(parts)) return "";
-  return parts.map(part => part?.text || "").join("").trim();
+  return parts.filter(part => part?.thought !== true).map(part => part?.text || "").join("").trim();
+}
+
+// উত্তর খালি এলে কারণটা বোঝা যায়: নিরাপত্তা ব্লক, token শেষ, নাকি থিংকিং খেয়ে ফেলেছে।
+function geminiEmptyReason(data) {
+  const candidate = data?.candidates?.[0];
+  const finish = String(candidate?.finishReason || "");
+  const block = String(data?.promptFeedback?.blockReason || "");
+  const thoughts = Number(data?.usageMetadata?.thoughtsTokenCount) || 0;
+  if (block) return `blocked:${block}`;
+  if (finish === "MAX_TOKENS") return thoughts > 0 ? "thinking_used_all_tokens" : "max_tokens";
+  if (finish === "SAFETY") return "safety";
+  if (finish) return `finish:${finish}`;
+  return "empty";
 }
 
 function openAiText(data) {
@@ -172,7 +194,7 @@ function providerUsage(providerId, data) {
 }
 
 // এক request তৈরি করে POST করে। network/HTTP ব্যর্থতা throw করে `classifyProviderError` দিয়ে।
-async function callProvider({ providerId, apiKey, accountId, model, system, history, userText, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+async function callProvider({ providerId, apiKey, accountId, model, system, history, userText, timeoutMs = DEFAULT_TIMEOUT_MS, thinkingMode = "off" }) {
   const spec = getProviderSpec(providerId);
   if (!spec) throw Object.assign(new Error(`Unknown AI provider: ${providerId}`), { kind: "bad_request" });
   if (!apiKey) throw Object.assign(new Error(`${spec.label} API key missing`), { kind: "auth" });
@@ -184,7 +206,7 @@ async function callProvider({ providerId, apiKey, accountId, model, system, hist
     const modelId = String(model || spec.defaultModel).replace(/^models\//, "");
     url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(modelId)}:generateContent`;
     headers = { "Content-Type": "application/json", "x-goog-api-key": apiKey };
-    body = geminiBody({ system, history, userText });
+    body = geminiBody({ system, history, userText, maxOutputTokens: GEMINI_MAX_OUTPUT_TOKENS, thinking: thinkingMode });
   } else if (spec.kind === "cloudflare") {
     if (!accountId) throw Object.assign(new Error("Cloudflare account id missing"), { kind: "auth" });
     const modelId = String(model || spec.defaultModel);
@@ -234,7 +256,8 @@ async function callProvider({ providerId, apiKey, accountId, model, system, hist
 
   const text = spec.kind === "gemini" ? geminiText(data) : spec.kind === "cloudflare" ? cloudflareText(data) : openAiText(data);
   if (!text) {
-    throw Object.assign(new Error(`${spec.label} returned an empty response`), { kind: "empty", providerId });
+    const reason = spec.kind === "gemini" ? geminiEmptyReason(data) : "empty";
+    throw Object.assign(new Error(`${spec.label} returned an empty response (${reason})`), { kind: "empty", providerId, reason });
   }
   return { providerId, model: model || spec.defaultModel, text, usage: providerUsage(providerId, data) };
 }
@@ -299,6 +322,8 @@ module.exports = {
   buildChatMessages,
   geminiBody,
   geminiText,
+  geminiEmptyReason,
+  GEMINI_MAX_OUTPUT_TOKENS,
   openAiText,
   cloudflareText,
   providerUsage,

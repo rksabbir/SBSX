@@ -11,6 +11,9 @@ function configuredRouter(overrides = {}) {
     callProvider: overrides.callProvider,
     saveState: async state => { saves.push(state); },
     loadState: async () => overrides.state || null,
+    // টেস্টে আসল অপেক্ষা নয় — retry আলাদা টেস্টে যাচাই করা হয়।
+    providerAttempts: overrides.providerAttempts ?? 1,
+    wait: async () => {},
     log: () => {}
   });
   return { router, saves };
@@ -408,5 +411,92 @@ test("snapshot reports the live model plus whether auto fallback is on", async (
     assert.equal(gemini.defaultModel, "gemini-3.8-flash");
     assert.equal(gemini.autoFallback, true);
     assert.ok(Array.isArray(gemini.fallbackModels) && gemini.fallbackModels.length >= 1);
+  } finally { restore(); }
+});
+
+// ---- v1.5.64: টাইমআউট ও থিংকিং ----
+
+test("a timeout is retried inside the same provider before giving up", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    let geminiCalls = 0;
+    const waits = [];
+    const calls = [];
+    const router = new AiRouter({
+      now: () => 1_000_000,
+      providerAttempts: 2,
+      wait: async ms => { waits.push(ms); },
+      saveState: async () => {},
+      log: () => {},
+      callProvider: async ({ providerId }) => {
+        calls.push(providerId);
+        if (providerId === "gemini") {
+          geminiCalls += 1;
+          if (geminiCalls === 1) throw Object.assign(new Error("Google Gemini timeout: aborted"), { kind: "timeout" });
+          return { text: "দ্বিতীয় চেষ্টায় উত্তর", providerId };
+        }
+        return { text: "অন্য provider", providerId };
+      }
+    });
+    const result = await router.ask({ userText: "প্রশ্ন" });
+    assert.equal(result.providerId, "gemini");
+    assert.deepEqual(calls, ["gemini", "gemini"], "same provider is retried, no switch needed");
+    assert.equal(waits.length, 1);
+  } finally { restore(); }
+});
+
+test("only timeouts and overloads are retried, never auth or quota errors", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    for (const [kind, expectedCalls] of [["auth", 1], ["quota", 1], ["bad_request", 1], ["overloaded", 2], ["server", 2], ["network", 2]]) {
+      let geminiCalls = 0;
+      const router = new AiRouter({
+        now: () => 1_000_000, providerAttempts: 2, wait: async () => {}, saveState: async () => {}, log: () => {},
+        callProvider: async ({ providerId }) => {
+          if (providerId === "gemini") {
+            geminiCalls += 1;
+            throw Object.assign(new Error(kind), { kind, status: kind === "auth" ? 401 : kind === "quota" ? 402 : 503 });
+          }
+          return { text: "ok", providerId };
+        }
+      });
+      await router.ask({ userText: "প্রশ্ন" });
+      assert.equal(geminiCalls, expectedCalls, `${kind} retry count`);
+    }
+  } finally { restore(); }
+});
+
+test("repeated timeouts grow the cooldown, a single one stays short", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    let now = 1_000_000;
+    const router = new AiRouter({
+      now: () => now, providerAttempts: 1, wait: async () => {}, saveState: async () => {}, log: () => {},
+      callProvider: async ({ providerId }) => {
+        if (providerId === "gemini") throw Object.assign(new Error("timeout"), { kind: "timeout" });
+        return { text: "ok", providerId };
+      }
+    });
+    await router.ask({ userText: "১" });
+    const first = router.providers.gemini.cooldownUntil - now;
+    assert.ok(first >= 20_000 && first <= 21_000, `first timeout cooldown ${first}`);
+  } finally { restore(); }
+});
+
+test("the provider timeout never becomes a dead end: 2 attempts then the next provider answers", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    const calls = [];
+    const router = new AiRouter({
+      now: () => 1_000_000, providerAttempts: 2, wait: async () => {}, saveState: async () => {}, log: () => {},
+      callProvider: async ({ providerId }) => {
+        calls.push(providerId);
+        if (providerId === "gemini") throw Object.assign(new Error("timeout"), { kind: "timeout" });
+        return { text: "উত্তর", providerId };
+      }
+    });
+    const result = await router.ask({ userText: "প্রশ্ন" });
+    assert.equal(result.providerId, "groq");
+    assert.deepEqual(calls, ["gemini", "gemini", "groq"]);
   } finally { restore(); }
 });

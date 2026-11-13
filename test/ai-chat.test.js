@@ -41,6 +41,8 @@ function buildChat(overrides = {}) {
     now: overrides.now || (() => 1_000_000),
     callProvider: overrides.callProvider || (async ({ providerId }) => ({ text: "ভালো আছি, তুমি কেমন?", providerId })),
     saveState: async () => {},
+    providerAttempts: 1, // retry আলাদা টেস্টে যাচাই করা হয়
+    wait: async () => {},
     log: () => {}
   });
   const savedTurns = [];
