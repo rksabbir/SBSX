@@ -638,6 +638,78 @@ app.get("/api/admin/offline-payment/overview", async (req, res) => {
     }
 });
 
+// Admin Panel → Discord panel: validate + preview + save. bot নিজে থেকেই `panels` listener-এ sync করে।
+app.post("/api/admin/panels/preview", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        await verifyAdminApiRequest(req);
+        const panelType = String(req.body?.type || "").trim().toLowerCase();
+        if (!PANEL_TYPES.includes(panelType)) return res.status(400).json({ ok: false, error: "invalid_panel_type" });
+        const previous = (await db.ref(`panels/${panelType}`).once("value")).val();
+        const options = normalizePanelOptions(req.body?.options);
+        const next = { ...(req.body || {}), options };
+        const analysis = analyzePanelConfig(panelType, previous, next);
+        return res.json({ ok: true, analysis, botOptions: describeBotPanelOptions(panelType), version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Panel preview API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "preview_failed" });
+    }
+});
+
+app.post("/api/admin/panels/save", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const panelType = String(req.body?.type || "").trim().toLowerCase();
+        if (!PANEL_TYPES.includes(panelType)) return res.status(400).json({ ok: false, error: "invalid_panel_type" });
+        const text = {
+            title: String(req.body?.title || "").trim(),
+            description: String(req.body?.description || "").trim(),
+            image: String(req.body?.image || "").trim(),
+            color: String(req.body?.color || "").trim(),
+            footer: String(req.body?.footer || "").trim(),
+            placeholder: String(req.body?.placeholder || "").trim()
+        };
+        if (text.title.length > 256) return res.status(400).json({ ok: false, error: "title_too_long" });
+        if (text.description.length > 4000) return res.status(400).json({ ok: false, error: "description_too_long" });
+        if (text.footer.length > 2048) return res.status(400).json({ ok: false, error: "footer_too_long" });
+        if (text.placeholder.length > 150) return res.status(400).json({ ok: false, error: "placeholder_too_long" });
+        if (text.color && !/^#[0-9a-f]{6}$/i.test(text.color)) return res.status(400).json({ ok: false, error: "invalid_color" });
+        if (text.image) {
+            let parsed;
+            try { parsed = new URL(text.image); } catch (_) { return res.status(400).json({ ok: false, error: "invalid_image_url" }); }
+            if (parsed.protocol !== "https:") return res.status(400).json({ ok: false, error: "image_url_must_be_https" });
+        }
+        const options = normalizePanelOptions(req.body?.options);
+        const previous = (await db.ref(`panels/${panelType}`).once("value")).val();
+        const analysis = analyzePanelConfig(panelType, previous, { ...text, options });
+        const now = Date.now();
+        await db.ref(`panels/${panelType}`).set({ ...text, options, updatedAt: now, updatedBy: actor.uid });
+        await db.ref("auditLog").push({
+            adminUid: actor.uid, actionType: "discord_panel_update", timestamp: now,
+            summary: `Updated Discord panel ${panelType} (${analysis.changed.join(", ") || "no change"}); options=${analysis.optionCount}; botOverridesOptions=${analysis.optionsIgnoredByBot}`
+        });
+        // সাথে সাথে sync করার চেষ্টা (listener-ও একই কাজ করবে, তাই double-safe)।
+        syncAllManagedPanels().catch(() => {});
+        return res.json({ ok: true, analysis, botOptions: describeBotPanelOptions(panelType),
+            note: analysis.optionsIgnoredByBot
+                ? "This panel's dropdown is replaced by the bot's own canonical options, so the JSON below does not change what users can pick."
+                : "Options saved. The bot will refresh the managed Discord message.",
+            version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Panel save API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "panel_save_failed" });
+    }
+});
+
 app.post("/api/admin/offline-payment/sweep", async (req, res) => {
     const origin = String(req.get("origin") || "");
     if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "offline_panel_origin_not_allowed" });
@@ -1486,7 +1558,7 @@ async function fetchFirebasePanelData(panelType) {
             .filter(option => option.label && option.value && !usedValues.has(option.value) && usedValues.add(option.value))
             .slice(0, 25);
 
-        const paymentPackageAliases = new Set(["weekly", "weekly_plan", "week", "monthly", "monthly_plan", "month", "2_months", "two_months", "two_months_plan", "two", "2months", "2month"]);
+        const paymentPackageAliases = SHOP_PACKAGE_ALIASES;
         if (panelType === "payment") {
             // Always normalize the shop dropdown to the three supported canonical package keys.
             // A stale/custom label or value must never route a click to the wrong package (e.g. weekly fallback).
@@ -4595,6 +4667,84 @@ async function getDynamicCustomerPanel() {
 
     const menu = new StringSelectMenuBuilder().setCustomId("select_customer_category").setPlaceholder(getPanelPlaceholder(fullData, "❓ আপনার প্রয়োজনীয় অপশন সিলেক্ট করুন...")).addOptions(options);
     return { embeds: [embed], components: [new ActionRowBuilder().addComponents(menu)] };
+}
+
+// ── Panel option normalization (Admin Panel editor ↔ bot share the same rules) ──
+const PANEL_TYPES = ["payment", "ticket", "report", "customer", "onetime_key"];
+const SHOP_PACKAGE_ALIASES = new Set(["weekly", "weekly_plan", "week", "monthly", "monthly_plan", "month", "2_months", "two_months", "two_months_plan", "two", "2months", "2month"]);
+// Admin Panel editor JSON array, পুরোনো object map, অথবা plain string — তিনটাই এক ফরম্যাটে আনা হয়।
+function normalizePanelOptions(raw) {
+    if (!raw) return [];
+    let list = [];
+    if (Array.isArray(raw)) {
+        list = raw.map(item => (item && typeof item === "object")
+            ? { label: item.label, value: item.value, description: item.description }
+            : { label: String(item ?? ""), value: String(item ?? "") });
+    } else if (typeof raw === "object") {
+        list = Object.entries(raw).map(([key, item]) => (item && typeof item === "object")
+            ? { label: item.label ?? key, value: item.value ?? key, description: item.description }
+            : { label: item ?? key, value: key });
+    }
+    const seen = new Set();
+    const options = [];
+    for (const item of list) {
+        const label = String(item.label ?? "").trim().slice(0, 100);
+        const value = String(item.value ?? "").trim().slice(0, 80);
+        if (!label || !value) continue;
+        if (seen.has(value)) continue;
+        seen.add(value);
+        const description = String(item.description ?? "").trim().slice(0, 100);
+        options.push(description ? { label, value, description } : { label, value });
+    }
+    return options.slice(0, 25);
+}
+
+// একটি panel-এর আগে/পরে কী কী বদলেছে (Admin Panel-এর "Impact preview" এখানেই হিসাব হয়)।
+function analyzePanelConfig(panelType, previous, next) {
+    const before = previous || {};
+    const after = next || {};
+    const beforeOptions = normalizePanelOptions(before.options ?? before);
+    const afterOptions = normalizePanelOptions(after.options ?? after);
+    const changed = [];
+    for (const field of ["title", "description", "image", "color", "footer", "placeholder"]) {
+        if (String(before[field] ?? "") !== String(after[field] ?? "")) changed.push(field);
+    }
+    const beforeValues = beforeOptions.map(o => o.value);
+    const afterValues = afterOptions.map(o => o.value);
+    const added = afterValues.filter(v => !beforeValues.includes(v));
+    const removed = beforeValues.filter(v => !afterValues.includes(v));
+    if (added.length || removed.length || beforeValues.join("|") !== afterValues.join("|")) changed.push("options");
+
+    // bot শুধু এই value-গুলো দিয়েই shop checkout চালাতে পারে
+    const unusable = panelType === "payment" ? afterValues.filter(v => !SHOP_PACKAGE_ALIASES.has(v.toLowerCase())) : [];
+    // bot এই panel-গুলোকে নিজের canonical option দিয়ে overwrite করে
+    const overridden = ["payment", "ticket", "onetime_key"].includes(panelType);
+    return {
+        panelType, changed, added, removed,
+        optionCount: afterOptions.length,
+        unusablePaymentValues: unusable,
+        optionsIgnoredByBot: overridden,
+        availablePackages: panelType === "payment"
+            ? ["weekly", "monthly", "2_months"].filter(cat => isPackageEnabled(cat)).map(cat => ({
+                value: cat, price: getPackagePrice(cat)
+            }))
+            : null
+    };
+}
+
+// bot-এর নিজের canonical option (payment/ticket/1time key) — Admin Panel-এ দেখানোর জন্য।
+function describeBotPanelOptions(panelType) {
+    if (panelType === "payment") {
+        return ["weekly", "monthly", "2_months"].filter(cat => isPackageEnabled(cat))
+            .map(cat => ({ value: cat, label: `${cat} — ${getPackagePrice(cat)} BDT` }));
+    }
+    if (panelType === "ticket") {
+        return [{ value: "general_support", label: "💬 General Support Ticket" }];
+    }
+    if (panelType === "onetime_key") {
+        return [{ value: "generate_1time_key", label: "🔑 Generate 1TIME KEY (Dev Only)" }];
+    }
+    return null;
 }
 
 // panel dropdown-এর selection খালি করে panel আগের অবস্থায় ফিরিয়ে আনে।
