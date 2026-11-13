@@ -246,3 +246,167 @@ test("empty provider responses fail over instead of posting a blank message", as
 test("dayKey gives a stable daily bucket for quota estimates", () => {
   assert.match(dayKey(Date.UTC(2026, 0, 2, 3)), /^2026-01-02$/);
 });
+
+// ---- v1.5.63: বন্ধ মডেল, সৎ cooldown, restart-safe migration ----
+
+test("a retired model is replaced by the next model of the same provider, no provider switch", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    const calls = [];
+    const { router } = configuredRouter({
+      callProvider: async ({ providerId, model }) => {
+        calls.push(`${providerId}:${model}`);
+        if (model === "gemini-3.8-flash") {
+          throw Object.assign(new Error("Google Gemini HTTP 404: This model models/gemini-3.8-flash is no longer available to new users"), { kind: "model_unavailable", status: 404 });
+        }
+        return { text: "বাংলা উত্তর", providerId, model };
+      }
+    });
+    const result = await router.ask({ userText: "প্রশ্ন" });
+    assert.equal(result.providerId, "gemini");
+    assert.deepEqual(calls, ["gemini:gemini-3.8-flash", "gemini:gemini-3.5-flash-lite"]);
+    assert.equal(result.model, "gemini-3.5-flash-lite");
+    // মডেল বদল মনে রাখা হয় যাতে পরের বার সরাসরি নতুন মডেলেই যায়
+    assert.equal(router.providers.gemini.model, "gemini-3.5-flash-lite");
+    assert.ok(router.history.some(entry => entry.reason === "model_fallback"));
+    assert.equal(router.providers.gemini.cooldownUntil, 0, "model fallback must not punish the provider");
+  } finally { restore(); }
+});
+
+test("the next message reuses the switched model directly", async () => {
+  const restore = setKeys(["gemini"]);
+  try {
+    const models = [];
+    const { router } = configuredRouter({
+      callProvider: async ({ model }) => {
+        models.push(model);
+        if (model === "gemini-3.8-flash") throw Object.assign(new Error("Google Gemini HTTP 404: model no longer available"), { kind: "model_unavailable", status: 404 });
+        return { text: "উত্তর", providerId: "gemini", model };
+      }
+    });
+    await router.ask({ userText: "১" });
+    await router.ask({ userText: "২" });
+    assert.deepEqual(models, ["gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.5-flash-lite"]);
+  } finally { restore(); }
+});
+
+test("when every model of a provider is retired, the router moves to the next provider", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    const calls = [];
+    const { router } = configuredRouter({
+      callProvider: async ({ providerId }) => {
+        calls.push(providerId);
+        if (providerId === "gemini") throw Object.assign(new Error("HTTP 404: model has been retired"), { kind: "model_unavailable", status: 404 });
+        return { text: "ok", providerId };
+      }
+    });
+    const result = await router.ask({ userText: "প্রশ্ন" });
+    assert.equal(result.providerId, "groq");
+    assert.ok(calls.filter(id => id === "gemini").length >= 2, "at least two gemini models were tried");
+    assert.equal(router.providers.gemini.cooldownUntil > router.now(), true);
+  } finally { restore(); }
+});
+
+test("503 high demand cools a provider for 15s, not a full minute", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    const { router } = configuredRouter({
+      callProvider: async ({ providerId }) => {
+        if (providerId === "gemini") throw Object.assign(new Error("Google Gemini HTTP 503: This model is currently experiencing high demand."), { kind: "overloaded", status: 503 });
+        return { text: "ok", providerId };
+      }
+    });
+    await router.ask({ userText: "প্রশ্ন" });
+    const remaining = router.providers.gemini.cooldownUntil - router.now();
+    assert.equal(remaining, 15_000);
+  } finally { restore(); }
+});
+
+test("repeated rate limits keep growing, but a success resets the streak", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    let now = 1_000_000;
+    let mode = "fail";
+    const { router } = configuredRouter({
+      now: () => now,
+      callProvider: async ({ providerId }) => {
+        if (providerId === "gemini") {
+          if (mode === "fail") throw Object.assign(new Error("limited"), { kind: "rate_limit", status: 429 });
+          return { text: "ok", providerId };
+        }
+        return { text: "ok", providerId };
+      }
+    });
+    await router.ask({ userText: "১" });
+    const first = router.providers.gemini.cooldownUntil - now;
+    now = router.providers.gemini.cooldownUntil + 1;
+    router.refresh("gemini");
+    assert.ok(router.providers.gemini.consecutiveFailures > 0, "streak must survive the cooldown");
+    await router.ask({ userText: "২" });
+    const second = router.providers.gemini.cooldownUntil - now;
+    assert.ok(second >= first, `cooldown must not shrink (${first} → ${second})`);
+    // সফল হলে streak পুরো শূন্য
+    mode = "ok";
+    now = router.providers.gemini.cooldownUntil + 1;
+    await router.ask({ userText: "৩" });
+    assert.equal(router.providers.gemini.consecutiveFailures, 0);
+    assert.equal(router.activeProviderId, "gemini");
+  } finally { restore(); }
+});
+
+test("a saved retired model is migrated to a live model on restore", async () => {
+  const restore = setKeys(["gemini"]);
+  try {
+    const state = {
+      providers: { gemini: { model: "gemini-2.5-flash", enabled: true, priority: 10, requests: 5, successes: 5 } },
+      totals: { requests: 5, successes: 5, failures: 0, switches: 0 }
+    };
+    const { router } = configuredRouter({ state });
+    await router.restore();
+    assert.notEqual(router.providers.gemini.model, "gemini-2.5-flash");
+    assert.equal(router.providers.gemini.model, "gemini-3.8-flash");
+    assert.ok(router.providers.gemini.modelMigratedAt > 0);
+    // আসল聘用 ডেটা হারায় না
+    assert.equal(router.providers.gemini.successes, 5);
+  } finally { restore(); }
+});
+
+test("an admin-entered custom model is never overwritten on restore", async () => {
+  const restore = setKeys(["groq"]);
+  try {
+    const state = { providers: { groq: { model: "openai/gpt-oss-20b", priority: 5 } }, totals: {} };
+    const { router } = configuredRouter({ state });
+    router.applyState(state);
+    assert.equal(router.providers.groq.model, "openai/gpt-oss-20b");
+  } finally { restore(); }
+});
+
+test("autoFallback can be turned off by an admin", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    const calls = [];
+    const { router } = configuredRouter({
+      callProvider: async ({ providerId, model }) => {
+        calls.push(`${providerId}:${model}`);
+        if (providerId === "gemini") throw Object.assign(new Error("HTTP 404: no longer available"), { kind: "model_unavailable", status: 404 });
+        return { text: "ok", providerId, model };
+      }
+    });
+    router.providers.gemini.autoFallback = false;
+    await router.ask({ userText: "প্রশ্ন" });
+    assert.equal(calls.filter(call => call.startsWith("gemini:")).length, 1, "only the configured model may be tried");
+    assert.equal(router.providers.gemini.model, "gemini-3.8-flash");
+  } finally { restore(); }
+});
+
+test("snapshot reports the live model plus whether auto fallback is on", async () => {
+  const restore = setKeys(["gemini"]);
+  try {
+    const { router } = configuredRouter({ callProvider: async ({ providerId }) => ({ text: "ok", providerId }) });
+    const gemini = router.snapshot().providers.find(p => p.id === "gemini");
+    assert.equal(gemini.defaultModel, "gemini-3.8-flash");
+    assert.equal(gemini.autoFallback, true);
+    assert.ok(Array.isArray(gemini.fallbackModels) && gemini.fallbackModels.length >= 1);
+  } finally { restore(); }
+});

@@ -7,50 +7,59 @@ const DEFAULT_TIMEOUT_MS = 20_000;
 const MAX_OUTPUT_TOKENS = 400;
 
 // provider id → কীভাবে ডাকা হবে। `env` হলো API key-এর environment variable নাম।
+// ⚠️ মডেল তালিকা ২০২৬-১১-এ যাচাই করা: provider-রা পুরোনো মডেল বন্ধ করছে, তাই প্রতিটির
+// জন্য প্রাথমিক মডেল + বিকল্প মডেল রাখা হয়। প্রাথমিক মডেল 404/বন্ধ হলে বট নিজে থেকেই
+// বিকল্পে চলে যায়, এবং admin প্যানেলে সেটি দেখতে পাওয়া যায়।
 const AI_PROVIDERS = [
   {
     id: "gemini", label: "Google Gemini", env: "GEMINI_API_KEY",
-    defaultModel: "gemini-2.5-flash", kind: "gemini",
+    // 2.5 সিরিজ নতুন key-এর জন্য বন্ধ — 3.8 Flash/Its Lite-ই বর্তমান ফ্রি মডেল।
+    defaultModel: "gemini-3.8-flash", fallbackModels: ["gemini-3.5-flash-lite", "gemini-3.6-flash"], kind: "gemini",
     docs: "https://ai.google.dev/gemini-api/docs"
   },
   {
     id: "groq", label: "Groq", env: "GROQ_API_KEY",
-    defaultModel: "llama-3.3-70b-versatile", kind: "openai",
+    // Llama 3.x ২০২৬-০৮-১৬-এ free tier থেকে বাদ; gpt-oss-ই এখন ফ্রি।
+    defaultModel: "openai/gpt-oss-120b", fallbackModels: ["openai/gpt-oss-20b"], kind: "openai",
     baseUrl: "https://api.groq.com/openai/v1", docs: "https://console.groq.com/docs"
   },
   {
     id: "cerebras", label: "Cerebras", env: "CEREBRAS_API_KEY",
-    defaultModel: "llama3.1-8b", kind: "openai",
+    defaultModel: "gpt-oss-120b", fallbackModels: ["llama3.1-8b"], kind: "openai",
     baseUrl: "https://api.cerebras.ai/v1", docs: "https://inference-docs.cerebras.ai"
   },
   {
     id: "openrouter", label: "OpenRouter", env: "OPENROUTER_API_KEY",
-    defaultModel: "openrouter/free", kind: "openai",
+    // openrouter/free রাউটার + নির্দিষ্ট :free ফলব্যাক।
+    defaultModel: "openrouter/free", fallbackModels: ["nvidia/nemotron-3.5-lightning:free", "cohere/north-mini-code:free"], kind: "openai",
     baseUrl: "https://openrouter.ai/api/v1", docs: "https://openrouter.ai/docs",
     extraHeaders: { "HTTP-Referer": "https://discord.com", "X-Title": "AKMAFIA YT" }
   },
   {
     id: "cloudflare", label: "Cloudflare Workers AI", env: "CLOUDFLARE_API_TOKEN",
     accountEnv: "CLOUDFLARE_ACCOUNT_ID",
-    defaultModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", kind: "cloudflare",
+    defaultModel: "@cf/meta/llama-3.3-70b-instruct-fp8-fast", fallbackModels: ["@cf/qwen/qwen3.8-27b", "@cf/meta/llama-3.1-8b-instruct-fast"], kind: "cloudflare",
     docs: "https://developers.cloudflare.com/workers-ai/"
   },
   {
     id: "nvidia", label: "NVIDIA NIM", env: "NVIDIA_API_KEY",
-    defaultModel: "meta/llama-3.3-70b-instruct", kind: "openai",
+    defaultModel: "meta/llama-3.3-70b-instruct", fallbackModels: ["meta/llama-3.1-8b-instruct"], kind: "openai",
     baseUrl: "https://integrate.api.nvidia.com/v1", docs: "https://build.nvidia.com"
   },
   {
     id: "cohere", label: "Cohere", env: "COHERE_API_KEY",
-    defaultModel: "command-a-03-2025", kind: "openai",
+    defaultModel: "command-a-03-2025", fallbackModels: ["command-r-plus-08-2024", "command-r-08-2024"], kind: "openai",
     baseUrl: "https://api.cohere.ai/compatibility/v1", docs: "https://docs.cohere.com/docs/compatibility-api"
   },
   {
     id: "huggingface", label: "Hugging Face", env: "HF_TOKEN",
-    defaultModel: "openai/gpt-oss-20b", kind: "openai",
+    defaultModel: "openai/gpt-oss-20b", fallbackModels: ["Qwen/Qwen3-8B", "meta-llama/Llama-3.3-70B-Instruct"], kind: "openai",
     baseUrl: "https://router.huggingface.co/v1", docs: "https://huggingface.co/docs/inference-providers"
   }
 ];
+
+// 404 / "model no longer available" ধরার জন্য — এগুলো হলে মডেল বদলানো হয়।
+const MODEL_GONE_PATTERN = /(no longer available|not found|does not exist|unknown model|model_not_found|has been (deprecated|retired|shut ?down)|no such model|is not supported|decommissioned)/i;
 
 const PROVIDER_IDS = AI_PROVIDERS.map(provider => provider.id);
 
@@ -61,6 +70,27 @@ function getProviderSpec(id) {
 function providerModel(spec, overrides = {}) {
   const custom = String(overrides?.[spec.id] || "").trim();
   return (custom || spec.defaultModel).slice(0, 120);
+}
+
+// একটি provider-এর সব ব্যবহারযোগ্য মডেল — admin-এর নিজের মডেল সবার আগে।
+function providerModelChain(spec, customModel = "", limit = 4) {
+  const chain = [];
+  const push = value => {
+    const clean = String(value || "").trim().slice(0, 120);
+    if (clean && !chain.includes(clean)) chain.push(clean);
+  };
+  push(customModel);
+  push(spec.defaultModel);
+  for (const model of spec.fallbackModels || []) push(model);
+  return chain.slice(0, Math.max(1, limit));
+}
+
+// এই error-টা কি "মডেলটাই আর নেই" ধরনের? হলে একই provider-এ পরের মডেল চেষ্টা করা হয়।
+function isModelGoneError(error) {
+  const status = Number(error?.status) || 0;
+  const message = String(error?.message || "");
+  if (status === 404 && /model/i.test(message)) return true;
+  return MODEL_GONE_PATTERN.test(message);
 }
 
 // API key কোথা থেকে আসবে: প্রথমে env, তারপর Firebase-এ admin-সেভ করা secret।
@@ -194,7 +224,7 @@ async function callProvider({ providerId, apiKey, accountId, model, system, hist
   if (!response.ok) {
     const detail = String(data?.error?.message || data?.message || data?.errors?.[0]?.message || raw || "").slice(0, 300);
     throw Object.assign(new Error(`${spec.label} HTTP ${response.status}: ${detail}`), {
-      kind: classifyHttpStatus(response.status),
+      kind: classifyError(response.status, detail),
       status: response.status,
       providerId,
       headers: response.headers,
@@ -216,6 +246,17 @@ function classifyHttpStatus(status) {
   if (status === 400 || status === 404 || status === 413 || status === 422) return "bad_request";
   if (status >= 500) return "server";
   return "http_error";
+}
+
+// HTTP status + provider-এর বার্তা মিলিয়ে ধরন ঠিক করা হয়।
+// `overloaded` = সার্ভার সাময়িক ব্যস্ত (৫০৩ high demand) → ছোট cooldown, দ্রুত ফিরে আসবে।
+// `model_unavailable` = মডেলটাই বন্ধ → পরের মডেল বা পরের provider।
+function classifyError(status, detail = "") {
+  const text = String(detail || "");
+  if (MODEL_GONE_PATTERN.test(text)) return "model_unavailable";
+  if (status === 503 || status === 529) return "overloaded";
+  if (status >= 500 && /high demand|overloaded|temporarily unavailable|try again later|capacity/i.test(text)) return "overloaded";
+  return classifyHttpStatus(status);
 }
 
 // Retry-After (seconds বা HTTP date) আর X-RateLimit-Reset পড়া হয়।
@@ -249,6 +290,9 @@ module.exports = {
   MAX_OUTPUT_TOKENS,
   getProviderSpec,
   providerModel,
+  providerModelChain,
+  isModelGoneError,
+  MODEL_GONE_PATTERN,
   resolveProviderKey,
   resolveProviderAccount,
   providerConfigured,
@@ -260,5 +304,6 @@ module.exports = {
   providerUsage,
   callProvider,
   classifyHttpStatus,
+  classifyError,
   parseRetryAfterMs
 };

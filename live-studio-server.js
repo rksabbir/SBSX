@@ -1377,7 +1377,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const memoryStats = chat?.memory?.stats ? await chat.memory.stats().catch(() => ({ users: 0 })) : { users: 0 };
       return res.set("Cache-Control", "no-store").json({
         ok: true,
-        version: "1.5.62",
+        version: "1.5.63",
         botOnline: Boolean(client?.user),
         autoReply: { enabled: Boolean(chat?.enabled), channels: chat ? [...chat.channels] : [], stats: chat?.stats || {}, noticeChannelId: chat?.noticeChannelId || "", pendingQueues: chat?.userQueues?.size || 0 },
         memory: memoryStats,
@@ -1398,10 +1398,11 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       if (typeof req.body?.enabled === "boolean") { router.setEnabled(providerId, req.body.enabled); changes.push(req.body.enabled ? "enabled" : "disabled"); }
       if (req.body?.priority !== undefined) { router.setPriority(providerId, req.body.priority); changes.push("priority"); }
       if (req.body?.model !== undefined) { router.setModel(providerId, req.body.model); changes.push("model"); }
+      if (typeof req.body?.autoFallback === "boolean") { router.providers[providerId].autoFallback = req.body.autoFallback; changes.push("auto_fallback"); }
       if (req.body?.clearCooldown === true) { router.clearCooldown(providerId); changes.push("cooldown_cleared"); }
       await router.flush();
       await writeAiAudit(actor, "ai_provider_updated", `AI provider ${providerId}: ${changes.join(", ") || "no change"}`);
-      return res.json({ ok: true, version: "1.5.62", changed: changes, ...router.snapshot() });
+      return res.json({ ok: true, version: "1.5.63", changed: changes, ...router.snapshot() });
     } catch (err) { return apiError(res, err, "ai_provider_update_failed"); }
   });
 
@@ -1418,7 +1419,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const saved = await chat.saveConfig({ channels, enabled, noticeChannelId });
       if (!saved) throw Object.assign(new Error("AI chat config সংরক্ষণ করা যায়নি"), { statusCode: 500, apiError: "ai_channels_save_failed" });
       await writeAiAudit(actor, "ai_channels_updated", `Auto-reply channels: ${[...chat.channels].join(", ") || "none"}; enabled=${chat.enabled}`);
-      return res.json({ ok: true, version: "1.5.62", enabled: chat.enabled, channels: [...chat.channels], noticeChannelId: chat.noticeChannelId });
+      return res.json({ ok: true, version: "1.5.63", enabled: chat.enabled, channels: [...chat.channels], noticeChannelId: chat.noticeChannelId });
     } catch (err) { return apiError(res, err, "ai_channels_update_failed"); }
   });
 
@@ -1437,17 +1438,38 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       if (spec.accountEnv && !accountId) throw Object.assign(new Error("Cloudflare account id প্রয়োজন"), { statusCode: 400, apiError: "ai_provider_not_configured" });
       const startedAt = Date.now();
       try {
-        const result = await require("./ai-providers").callProvider({ providerId, apiKey, accountId, model: state.model, system: "শুধু একটি ছোট বাংলা বাক্যে উত্তর দাও।", history: [], userText: "তুমি ঠিক আছো?", timeoutMs: 20_000 });
+        const providerTools = require("./ai-providers");
+        // টেস্টও বটের মতোই মডেল চেইন ব্যবহার করে — তাই admin যে মডেলই দেখুক,
+        // বন্ধ মডেল হলে টেস্ট নিজেই পরের মডেলে গিয়ে সফল হয় এবং সেই মডেল সেভ হয়ে যায়।
+        const chain = state.autoFallback === false ? [state.model] : providerTools.providerModelChain(spec, state.model, 3);
+        let result = null, lastError = null, usedModel = "";
+        const modelLog = [];
+        for (const model of chain) {
+          try {
+            result = await providerTools.callProvider({ providerId, apiKey, accountId, model, system: "শুধু একটি ছোট বাংলা বাক্যে উত্তর দাও।", history: [], userText: "তুমি ঠিক আছো?", timeoutMs: 20_000 });
+            usedModel = model;
+            break;
+          } catch (err) {
+            lastError = err;
+            modelLog.push(`${model}: ${String(err?.message || err).slice(0, 120)}`);
+            if (!providerTools.isModelGoneError(err)) break;
+          }
+        }
+        if (!result) throw lastError || new Error("provider test failed");
+        if (usedModel && usedModel !== state.model) {
+          router.setModel(providerId, usedModel);
+          router.pushHistory({ providerId, reason: "model_fallback", message: `${state.model} → ${usedModel}` });
+        }
         router.recordSuccess(providerId, result?.usage);
-        router.pushHistory({ providerId, reason: "admin_test_ok" });
+        router.pushHistory({ providerId, reason: "admin_test_ok", message: usedModel || state.model });
         await router.flush();
-        await writeAiAudit(actor, "ai_provider_tested", `AI provider ${providerId} test succeeded`);
-        return res.json({ ok: true, version: "1.5.62", providerId, latencyMs: Date.now() - startedAt, model: result.model, sample: String(result.text || "").slice(0, 300) });
+        await writeAiAudit(actor, "ai_provider_tested", `AI provider ${providerId} test succeeded on ${usedModel || state.model}`);
+        return res.json({ ok: true, version: "1.5.63", providerId, latencyMs: Date.now() - startedAt, model: result.model || usedModel, modelChanged: Boolean(usedModel && usedModel !== state.model), attemptedModels: modelLog, sample: String(result.text || "").slice(0, 300) });
       } catch (err) {
         router.recordFailure(providerId, err);
         await router.flush();
         await writeAiAudit(actor, "ai_provider_tested", `AI provider ${providerId} test failed: ${String(err?.message || err).slice(0, 160)}`);
-        return res.status(502).json({ ok: false, version: "1.5.62", error: "ai_provider_test_failed", message: String(err?.message || "provider test failed").slice(0, 260), kind: err?.kind || "unknown" });
+        return res.status(502).json({ ok: false, version: "1.5.63", error: "ai_provider_test_failed", message: String(err?.message || "provider test failed").slice(0, 260), kind: err?.kind || "unknown" });
       }
     } catch (err) { return apiError(res, err, "ai_provider_test_failed"); }
   });
@@ -1460,12 +1482,12 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       const userId = String(req.query?.userId || "").replace(/[^\w-]/g, "");
       if (userId) {
         const record = await chat.memory.load(userId);
-        return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", userId, record: { name: record.name, facts: record.facts, history: record.history.slice(-20), updatedAt: record.updatedAt }, config: chat.memory.config });
+        return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.63", userId, record: { name: record.name, facts: record.facts, history: record.history.slice(-20), updatedAt: record.updatedAt }, config: chat.memory.config });
       }
       const snap = await chat.db.ref("ai_memory/users").limitToLast(50).once("value");
       const users = Object.entries(snap.val() || {}).map(([id, value]) => ({ userId: id, name: String(value?.name || "").slice(0, 60), facts: Array.isArray(value?.facts) ? value.facts.length : 0, turns: Array.isArray(value?.history) ? Math.ceil(value.history.length / 2) : 0, updatedAt: Number(value?.updatedAt) || 0 })).sort((a, b) => b.updatedAt - a.updatedAt);
       const stats = await chat.memory.stats();
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", users, stats, config: chat.memory.config });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.63", users, stats, config: chat.memory.config });
     } catch (err) { return apiError(res, err, "ai_memory_read_failed"); }
   });
 
@@ -1481,14 +1503,14 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         if (!userId) throw Object.assign(new Error("userId প্রয়োজন"), { statusCode: 400, apiError: "invalid_ai_memory_request" });
         await chat.memory.forget(userId);
         await writeAiAudit(actor, "ai_memory_forgotten", `AI memory cleared for user ${userId}`);
-        return res.json({ ok: true, version: "1.5.62", userId, forgotten: true });
+        return res.json({ ok: true, version: "1.5.63", userId, forgotten: true });
       }
       if (action === "addFact") {
         const fact = String(req.body?.fact || "").trim().slice(0, 220);
         if (!userId || !fact) throw Object.assign(new Error("userId ও fact প্রয়োজন"), { statusCode: 400, apiError: "invalid_ai_memory_request" });
         await chat.memory.addFact(userId, fact);
         await writeAiAudit(actor, "ai_memory_fact_added", `AI memory fact added for user ${userId}`);
-        return res.json({ ok: true, version: "1.5.62", userId, added: true });
+        return res.json({ ok: true, version: "1.5.63", userId, added: true });
       }
       if (action === "config") {
         const patch = {};
@@ -1500,12 +1522,12 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         await chat.db.ref("ai_memory/config").update({ ...patch, updatedAt: Date.now() });
         await chat.memory.loadConfig();
         await writeAiAudit(actor, "ai_memory_config_updated", `AI memory config: ${Object.keys(patch).join(", ")}`);
-        return res.json({ ok: true, version: "1.5.62", config: chat.memory.config });
+        return res.json({ ok: true, version: "1.5.63", config: chat.memory.config });
       }
       if (action === "prune") {
         const result = await chat.memory.prune();
         await writeAiAudit(actor, "ai_memory_pruned", `AI memory pruned: ${result.removed} users`);
-        return res.json({ ok: true, version: "1.5.62", removed: result.removed });
+        return res.json({ ok: true, version: "1.5.63", removed: result.removed });
       }
       throw Object.assign(new Error("অজানা action"), { statusCode: 400, apiError: "invalid_ai_memory_request" });
     } catch (err) { return apiError(res, err, "ai_memory_update_failed"); }
@@ -1529,7 +1551,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
           source: String(process.env[INTEGRATION_ENV_NAMES[field.key]] || "").trim() ? "environment" : String(saved[field.key] || "").trim() ? "admin_panel" : ""
         }))
       }));
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", sections });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.63", sections });
     } catch (err) { return apiError(res, err, "ai_keys_read_failed"); }
   });
 
@@ -1554,7 +1576,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
         if (key === "cloudflareAccountId" && !/^[a-f0-9]{32}$/i.test(value)) throw Object.assign(new Error("Cloudflare account id 32 অক্ষরের hex হতে হবে"), { statusCode: 400, apiError: "invalid_ai_key" });
         patch[key] = value;
       }
-      if (!Object.keys(patch).length) return res.json({ ok: true, version: "1.5.62", changed: false });
+      if (!Object.keys(patch).length) return res.json({ ok: true, version: "1.5.63", changed: false });
       await db.ref(PRIVATE_INTEGRATION_SECRET_PATH).update(patch);
       for (const [key, value] of Object.entries(patch)) {
         const envName = INTEGRATION_ENV_NAMES[key];
@@ -1563,7 +1585,7 @@ function attachLiveStudioServer({ app, client, db, guildId, verifyAdminApiReques
       }
       aiRouterRuntime()?.refreshAll?.();
       await writeAiAudit(actor, "ai_keys_updated", `AI provider keys updated (${Object.keys(patch).length} fields; values hidden)`);
-      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.62", changed: true, updatedKeys: Object.keys(patch) });
+      return res.set("Cache-Control", "no-store").json({ ok: true, version: "1.5.63", changed: true, updatedKeys: Object.keys(patch) });
     } catch (err) { return apiError(res, err, "ai_keys_save_failed"); }
   });
 
