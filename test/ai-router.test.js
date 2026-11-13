@@ -500,3 +500,59 @@ test("the provider timeout never becomes a dead end: 2 attempts then the next pr
     assert.deepEqual(calls, ["gemini", "gemini", "groq"]);
   } finally { restore(); }
 });
+
+// ---- v1.5.66: সময়ের বাজেট, পরিসংখ্যান আর ঢাকার তারিখ ----
+
+test("a permanently slow provider cannot eat the whole budget", async () => {
+  const restore = setKeys(["gemini", "groq"]);
+  try {
+    let clock = 0;
+    const calls = [];
+    const router = new AiRouter({
+      now: () => clock, providerAttempts: 2, giveUpMs: 35_000,
+      wait: async () => {}, saveState: async () => {}, log: () => {},
+      callProvider: async ({ providerId, timeoutMs }) => {
+        calls.push(`${providerId}:${timeoutMs}`);
+        if (providerId === "gemini") {
+          clock += timeoutMs;
+          throw Object.assign(new Error("Gemini timeout"), { kind: "timeout" });
+        }
+        clock += 700;
+        return { text: "উত্তর", providerId };
+      }
+    });
+    const result = await router.ask({ userText: "প্রশ্ন", timeoutMs: 15_000 });
+    assert.equal(result.providerId, "groq", "a healthy provider must still answer");
+    const geminiSpent = calls.filter(c => c.startsWith("gemini:")).reduce((sum, c) => sum + Number(c.split(":")[1]), 0);
+    assert.ok(geminiSpent <= 18_000, `gemini consumed ${geminiSpent}ms of a 35s budget`);
+  } finally { restore(); }
+});
+
+test("success can never exceed requests", () => {
+  const router = new AiRouter({ now: () => 1_000_000, wait: async () => {}, saveState: async () => {}, log: () => {} });
+  router.providers.cerebras.successes = 5;
+  router.providers.cerebras.requests = 4;
+  const row = router.snapshot().providers.find(p => p.id === "cerebras");
+  assert.ok(row.successRate <= 100, `successRate was ${row.successRate}%`);
+  assert.equal(row.statsPending, 1);
+});
+
+test("the admin test button does not inflate the chat success counter", () => {
+  const router = new AiRouter({ now: () => 1_000_000, wait: async () => {}, saveState: async () => {}, log: () => {} });
+  router.providers.cerebras.requests = 4;
+  router.providers.cerebras.successes = 4;
+  router.recordSuccess("cerebras", null, { source: "test", countRequest: false, countDaily: false });
+  const row = router.snapshot().providers.find(p => p.id === "cerebras");
+  assert.equal(row.successes, 4);
+  assert.equal(row.requests, 4);
+  assert.equal(row.successRate, 100);
+});
+
+test("the daily counter follows the Dhaka date, not the UTC date", () => {
+  const beforeMidnightDhaka = Date.UTC(2026, 10, 12, 18, 30, 0); // ঢাকা ১৩ তারিখ ০০:৩০
+  const nextMorningDhaka = Date.UTC(2026, 10, 13, 1, 0, 0);      // ঢাকা ১৩ তারিখ ০৭:০০
+  assert.equal(dayKey(beforeMidnightDhaka), dayKey(nextMorningDhaka));
+  const router = new AiRouter({ now: () => nextMorningDhaka, wait: async () => {}, saveState: async () => {}, log: () => {} });
+  router.applyState({ providers: { cerebras: { dailyDate: dayKey(beforeMidnightDhaka), dailyRequests: 7 } }, totals: {} });
+  assert.equal(router.snapshot().providers.find(p => p.id === "cerebras").dailyRequests, 7);
+});
