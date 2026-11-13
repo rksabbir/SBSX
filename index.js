@@ -8,6 +8,7 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { promisify } = require("util");
 const ticketChannelTools = require("./ticket-channel");
+const orderTracking = require("./order-tracking");
 const os = require("os");
 const admin = require("firebase-admin"); // Firebase Admin SDK
 
@@ -1297,7 +1298,8 @@ const WELCOME_CHANNEL_ID = "1488339169821593731";
 const LOG_CHANNEL_ID = "1488340400673656973";
 
 // অর্ডার ট্র্যাকিং চ্যানেল আইডি
-const ORDER_TRACKING_CHANNEL_ID = "1488340262827855983"; 
+// .env / হোস্টিং প্যানেল থেকে বদলানো যায় — হার্ডকোড করা ID পুরোনো হয়ে গেলে কাজ করত না।
+const ORDER_TRACKING_CHANNEL_ID = String(process.env.ORDER_TRACKING_CHANNEL_ID || "1488340262827855983").replace(/\D/g, "") || "1488340262827855983";
 // নতুন অর্ডার গাইড চ্যানেল আইডি
 const ORDER_GUIDE_CHANNEL_ID = "1488339045602951199";
 
@@ -1953,6 +1955,82 @@ client.on("guildMemberRemove", async (member) => {
 // ================================
 // 🛒 Order Status Embed Builder
 // ================================
+// ── ORDER TRACKING ──────────────────────────────────────────────────────────
+// আগে তিন জায়গায় আলাদা কোড ছিল আর প্রতিটি `.catch(() => {})` দিয়ে এরর গিলে ফেলত —
+// তাই "ট্র্যাকিং চ্যানেলে কিছু আসছে না" বোঝা যেত না। এখন একটাই পথ।
+function resolveOrderTrackingChannel(guild) {
+    if (!guild) return null;
+    if (!isFeatureEnabled("orderTrackingEnabled")) return null;
+    const exists = id => Boolean(guild.channels.cache.get(id));
+    const picked = orderTracking.resolveTrackingChannelId({
+        configuredId: ADMIN_BOT_CONFIG.discord?.channels?.orderTracking || "",
+        fallbackId: getConfiguredChannelId("orderTracking"),
+        exists
+    });
+    if (picked.channelId) return guild.channels.cache.get(picked.channelId) || null;
+    // কনফিগের ID ভুল/পুরোনো হলে নাম দিয়ে খোঁজা হয় (সবচেয়ে সাধারণ কারণ)।
+    const byName = orderTracking.findTrackingChannelByName([...guild.channels.cache.values()]);
+    if (byName) {
+        console.warn(`[order-tracking] configured id ${picked.source} not found — using #${byName.name}`);
+        return byName;
+    }
+    return null;
+}
+
+// ট্র্যাকিং চ্যানেলে একটি স্ট্যাটাস এমবেড পাঠায়/আপডেট করে।
+// ফেরত: { ok, messageId, channelId, reason } — কেউ আর চুপচাপ হারায় না।
+async function publishOrderTracking({ guild, user, category, ticketChannel, status, staff = null, reason = null, txnId = null, extraFields = [], existingMessageId = "", orderId = "" }) {
+    const channel = resolveOrderTrackingChannel(guild);
+    if (!channel) {
+        console.warn(`[order-tracking] no channel for ${category} (orderTrackingEnabled=${isFeatureEnabled("orderTrackingEnabled")})`);
+        return { ok: false, reason: "no_channel" };
+    }
+    try {
+        let embed = buildOrderStatusEmbed(user, category, ticketChannel, status, staff, reason, txnId);
+        if (Array.isArray(extraFields) && extraFields.length) embed = embed.addFields(...extraFields.filter(Boolean).slice(0, 10));
+
+        // আগের মেসেজ থাকলে সেটাই আপডেট — একই অর্ডারের নতুন করে পোস্ট নয়।
+        if (existingMessageId) {
+            const existing = await channel.messages.fetch(existingMessageId).catch(() => null);
+            if (existing) {
+                await existing.edit({ embeds: [embed] });
+                return { ok: true, messageId: existing.id, channelId: channel.id, updated: true };
+            }
+        }
+        const sent = await channel.send({ embeds: [embed] });
+        return { ok: true, messageId: sent.id, channelId: channel.id, updated: false };
+    } catch (err) {
+        console.error(`[order-tracking] publish failed in #${channel.name}:`, err?.message || err);
+        return { ok: false, reason: String(err?.message || err || "unknown"), channelId: channel.id };
+    }
+}
+
+// একটি অর্ডার ট্র্যাকিং রেকর্ড মনে রাখা হয় — তাই Close/Status আপডেটে মেসেজ খুঁজে পাওয়া যায়।
+async function rememberOrderTracking({ guildId, ticketChannelId, userId, category, status, result, orderId = "", username = "", txnId = "" }) {
+    if (!result?.ok) return;
+    try {
+        await db.ref(`order_tracking_map/${ticketChannelId}`).transaction(current =>
+            orderTracking.nextTrackingRecord({
+                previous: current, channelId: result.channelId, messageId: result.messageId,
+                status, at: Date.now()
+            }), undefined, false);
+        await db.ref(`order_tracking_map/${ticketChannelId}`).update({
+            guildId: String(guildId || ""), userId: String(userId || ""), category: String(category || ""),
+            orderId: String(orderId || ""), username: String(username || ""), txnId: String(txnId || ""),
+            status: String(status || ""), channelId: String(result.channelId || ""), messageId: String(result.messageId || "")
+        }).catch(() => {});
+    } catch (err) {
+        console.warn("[order-tracking] could not remember record:", err?.message || err);
+    }
+}
+
+async function lookupOrderTrackingRecord(ticketChannelId) {
+    try {
+        const snap = await db.ref(`order_tracking_map/${ticketChannelId}`).once("value");
+        return snap.val() || null;
+    } catch (_) { return null; }
+}
+
 function buildOrderStatusEmbed(user, category, ticketChannel, status, staff = null, reason = null, txnId = null) {
     let color = "#FFFF00"; let statusString = "⏳ PENDING (অপেক্ষমাণ)";
     
@@ -4431,24 +4509,33 @@ client.on("interactionCreate", async (interaction) => {
                 await privateChannel.send({ content: `⚠️ ${interaction.user} — Discord DM deliver করা যায়নি। Server DM/privacy settings খুলে নিন; নিরাপত্তার জন্য credentials শুধু এই private ticket-এ Admin/Staff-এর সঙ্গে যাচাই করুন।` }).catch(() => {});
             }
 
-            const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
-            if (trackingChannel) {
-                const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "approved", null, null, sessionData.usedTxns ? sessionData.usedTxns.join(", ") : null);
-                trackingEmbed.addFields(
+            const trackingResult = await publishOrderTracking({
+                guild: interaction.guild,
+                user: interaction.user,
+                category,
+                ticketChannel: privateChannel,
+                status: "approved",
+                txnId: sessionData.usedTxns ? sessionData.usedTxns.join(", ") : null,
+                extraFields: [
                     { name: "👤 Registered Username", value: `\`${customUser}\``, inline: true },
                     { name: "💰 Total Paid Amount", value: `\`${sessionData.totalPaid}\` BDT`, inline: true }
-                );
-
-                const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
-                if (trackingMsg) {
-                    saveOrderLog(privateChannel.id, trackingMsg.id, {
-                        userId: interaction.user.id,
-                        category: category,
-                        status: "approved",
-                        txnId: sessionData.usedTxns ? sessionData.usedTxns.join(", ") : "",
-                        username: customUser
-                    });
-                }
+                ]
+            });
+            if (trackingResult.ok) {
+                saveOrderLog(privateChannel.id, trackingResult.messageId, {
+                    userId: interaction.user.id,
+                    category: category,
+                    status: "approved",
+                    txnId: sessionData.usedTxns ? sessionData.usedTxns.join(", ") : "",
+                    username: customUser
+                });
+                await rememberOrderTracking({
+                    guildId: interaction.guild.id, ticketChannelId: privateChannel.id, userId: interaction.user.id,
+                    category, status: "approved", result: trackingResult, username: customUser,
+                    txnId: sessionData.usedTxns ? sessionData.usedTxns.join(", ") : ""
+                }).catch(() => {});
+            } else if (!privateChannel) {
+                console.warn("[order-tracking] approved order has no ticket channel to annotate");
             }
 
             return interaction.editReply({
@@ -4536,20 +4623,33 @@ client.on("interactionCreate", async (interaction) => {
 
         await privateChannel.send({ content: `${interaction.user}${ticketPlan.supportRoleId ? ` <@&${ticketPlan.supportRoleId}>` : ""}`, embeds: [panelEmbed], components: [actionRow] });
 
-        const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
-        if (trackingChannel) {
-            const trackingEmbed = buildOrderStatusEmbed(interaction.user, category, privateChannel, "pending");
-            const trackingMsg = await trackingChannel.send({ embeds: [trackingEmbed] }).catch(() => {});
-            if (trackingMsg) {
-                saveOrderLog(privateChannel.id, trackingMsg.id, {
+        // ⚠️ শুধু অর্ডারই ট্র্যাকিং চ্যানেলে যায় — সাধারণ ticket/report/customer নয়।
+        // (v1.5.67 পর্যন্ত সব ধরনের টিকিটই যেত, তাই ট্র্যাকিং চ্যানেল ভরে যেত।)
+        let trackingNote = "";
+        if (orderTracking.isOrderTicket({ type, category })) {
+            const trackingResult = await publishOrderTracking({
+                guild: interaction.guild,
+                user: interaction.user,
+                category,
+                ticketChannel: privateChannel,
+                status: "pending"
+            });
+            if (trackingResult.ok) {
+                saveOrderLog(privateChannel.id, trackingResult.messageId, {
                     userId: interaction.user.id,
                     category: category,
                     status: "pending"
                 });
+                await rememberOrderTracking({
+                    guildId: interaction.guild.id, ticketChannelId: privateChannel.id,
+                    userId: interaction.user.id, category, status: "pending", result: trackingResult
+                }).catch(() => {});
+            } else {
+                trackingNote = `\n${orderTracking.describeTrackingProblem(trackingResult.reason)}`;
             }
         }
 
-        return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে: ${privateChannel}`);
+        return interaction.editReply(`✅ সফলভাবে তৈরি হয়েছে: ${privateChannel}${trackingNote}`);
     }
 
     if (interaction.isButton() && interaction.customId.startsWith("claim_")) {
@@ -4643,29 +4743,35 @@ client.on("interactionCreate", async (interaction) => {
             await db.ref(`staff_duty/${interaction.user.id}/resolved`).transaction(c => (Number(c) || 0) + 1).catch(() => {});
         }
 
-        if (currentOrder?.trackingMessageId) {
+        // Close করলে ট্র্যাকিং মেসেজ আপডেট — রেকর্ড Firebase-এ থাকায় মেসেজ হারালেও কাজ করে।
+        {
             try {
-                const trackingChannel = isFeatureEnabled("orderTrackingEnabled") ? interaction.guild.channels.cache.get(getConfiguredChannelId("orderTracking")) : null;
-                const trackingMessage = trackingChannel ? await trackingChannel.messages.fetch(currentOrder.trackingMessageId) : null;
-                if (trackingMessage) {
-                    const statusEmbed = buildOrderStatusEmbed(
-                        `<@${currentOrder.userId || interaction.user.id}>`,
-                        currentOrder.category || "unknown",
-                        interaction.channel,
-                        "closed",
-                        interaction.user,
-                        null,
-                        currentOrder.txnId || null
-                    );
-                    await trackingMessage.edit({ embeds: [statusEmbed] });
+                const remembered = await lookupOrderTrackingRecord(interaction.channel.id);
+                const trackingMessageId = currentOrder?.trackingMessageId || remembered?.messageId || "";
+                if (trackingMessageId) {
+                    const closedResult = await publishOrderTracking({
+                        guild: interaction.guild,
+                        user: `<@${remembered?.userId || currentOrder?.userId || interaction.user.id}>`,
+                        category: remembered?.category || currentOrder?.category || "unknown",
+                        ticketChannel: interaction.channel,
+                        status: "closed",
+                        staff: interaction.user,
+                        txnId: remembered?.txnId || currentOrder?.txnId || null,
+                        existingMessageId: trackingMessageId
+                    });
+                    if (!closedResult.ok) {
+                        console.warn("[order-tracking] close update failed:", closedResult.reason);
+                    }
+                    if (currentOrder) {
+                        saveOrderLog(interaction.channel.id, closedResult.ok ? closedResult.messageId : trackingMessageId, {
+                            ...currentOrder,
+                            status: "closed",
+                            closedBy: interaction.user.id,
+                            closedAt: Date.now(),
+                            transcriptSaved
+                        });
+                    }
                 }
-                saveOrderLog(interaction.channel.id, currentOrder.trackingMessageId, {
-                    ...currentOrder,
-                    status: "closed",
-                    closedBy: interaction.user.id,
-                    closedAt: Date.now(),
-                    transcriptSaved
-                });
             } catch (trackingErr) {
                 console.error("❌ Order tracking close update failed:", trackingErr.message);
             }
