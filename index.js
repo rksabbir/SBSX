@@ -48,6 +48,10 @@ const { OFFLINE_FRAUD_REASONS, normalizeFraudReason, buildSessionRevokePatch, bu
 const { normalizeAutomationConfig, findFaqAnswer, matchKeywordRule, classifyTicketIntent, normalizeEvents, dueReminderMinutes, getDailyKey, calculateRankProgress } = require("./community-automation");
 const { readDiscordServerRules } = require("./discord-server-rules");
 const { AiChat, DEFAULT_CHANNEL_ID: AI_DEFAULT_CHANNEL_ID } = require("./ai-chat");
+const {
+    AI_SLASH_COMMANDS, AI_CONTEXT_COMMANDS, AI_THINKING_TEXT, AI_HELP_TEXT,
+    parseAiCommand, parseContextTarget, parseTextCommand
+} = require("./ai-commands");
 const { AI_PROVIDERS: AKMAFIA_AI_PROVIDERS, providerConfigured: akmafiaAiProviderConfigured } = require("./ai-providers");
 const { classifyBusinessRoles } = require("./discord-business-role-classifier");
 
@@ -1777,6 +1781,134 @@ client.on("messageCreate", message => {
     aiChat.handleMessage(message).catch(err => console.error("AI auto chat failed:", err?.message || err));
 });
 
+// ── v1.5.70: AI app commands (slash + context menu) ────────────────────────
+// guild-scoped রেজিস্টার, তাই সাথে সাথে দেখা যায় এবং প্রয়োজনে ঝেড়ে ফেলা যায়।
+async function registerAiCommands() {
+    const guild = client.guilds.cache.get(ALLOWED_GUILD_ID)
+        || await client.guilds.fetch(ALLOWED_GUILD_ID).catch(() => null);
+    if (!guild) return { ok: false, reason: "guild_missing" };
+    try {
+        await guild.commands.set([...AI_SLASH_COMMANDS, ...AI_CONTEXT_COMMANDS]);
+        console.log(`✅ ${AI_SLASH_COMMANDS.length + AI_CONTEXT_COMMANDS.length} AI app command registered in ${ALLOWED_GUILD_ID}`);
+        return { ok: true, count: AI_SLASH_COMMANDS.length + AI_CONTEXT_COMMANDS.length };
+    } catch (err) {
+        console.error("AI command set failed:", err?.message || err);
+        return { ok: false, reason: "set_failed", error: String(err?.message || err) };
+    }
+}
+
+// একবারে AI উত্তর তৈরি (slash, context menu আর !ai — সবাই এটাই ব্যবহার করে)।
+async function answerAiPrompt({ text, userId, username, channelId, guild }) {
+    const recall = await aiChat.memory.load(userId).catch(() => ({ history: [], facts: [] }));
+    const result = await aiChat.router.ask({
+        system: require("./ai-persona").buildSystemPrompt({
+            serious: require("./ai-persona").isSeriousMessage(text),
+            memory: recall.facts,
+            userName: username || ""
+        }),
+        history: (recall.history || []).slice(-8),
+        userText: text,
+        timeoutMs: 9_000,
+        giveUpMs: 22_000
+    });
+    const { normalizeReply, clampForDiscord } = require("./ai-persona");
+    const reply = clampForDiscord(normalizeReply(result.text));
+    if (!reply) throw Object.assign(new Error("empty reply"), { kind: "empty" });
+    await aiChat.memory.appendTurn(userId, text, reply, { channelId }).catch(() => {});
+    return { reply, providerId: result.providerId || null, switched: Boolean(result.switched) };
+}
+
+client.on("interactionCreate", async (interaction) => {
+    const isSlash = interaction.isChatInputCommand?.() === true;
+    const isContext = interaction.isMessageContextMenuCommand?.() === true;
+    if (!isSlash && !isContext) return;
+    const name = String(interaction.commandName || "");
+    const known = AI_SLASH_COMMANDS.some(c => c.name === name) || AI_CONTEXT_COMMANDS.some(c => c.name === name);
+    if (!known) return;
+    try {
+        // Discord-এর ইংরেজি "is thinking…" লুকাতে সাথে সাথে বাংলা প্লেসহোল্ডার দেওয়া হয়।
+        const useEphemeral = isSlash && parseAiCommand(interaction).ephemeral === true;
+        await interaction.deferReply({ flags: useEphemeral ? [MessageFlags.Ephemeral] : [] });
+        await interaction.editReply({ content: AI_THINKING_TEXT, allowedMentions: { parse: [] } });
+
+        if (name === AI_HELP_COMMAND_NAME) {
+            return interaction.editReply({ content: AI_HELP_TEXT, allowedMentions: { parse: [] } });
+        }
+        if (name === AI_STATUS_COMMAND_NAME) {
+            const isStaff = interaction.member?.permissions?.has(PermissionFlagsBits.Administrator)
+                || interaction.member?.roles?.cache?.has(getConfiguredRoleId("admin"))
+                || memberHasModeratorRole(interaction.member, "community", [getConfiguredRoleId("supportTicketReport")]);
+            if (!isStaff) return interaction.editReply({ content: "❌ এই কমান্ড শুধু Admin/Staff-এর জন্য।", allowedMentions: { parse: [] } });
+            return interaction.editReply({ content: aiChat.describeDiagnosis(aiChat.diagnose()), allowedMentions: { parse: [] } });
+        }
+
+        let prompt = null;
+        if (isContext) {
+            const target = await interaction.targetMessage?.fetch?.().catch(() => interaction.targetMessage) || interaction.targetMessage;
+            const parsed = parseContextTarget(target);
+            if (!parsed.ok) return interaction.editReply({ content: parsed.message, allowedMentions: { parse: [] } });
+            prompt = { text: parsed.text, ephemeral: false };
+        } else {
+            prompt = parseAiCommand(interaction);
+            if (!prompt.ok) return interaction.editReply({ content: prompt.message, allowedMentions: { parse: [] } });
+            // অফ-চ্যানেলেও slash কমান্ড কাজ করে — শুধু চ্যানেল-ফিল্টার প্রযোজ্য নয়।
+        }
+
+        const answer = await answerAiPrompt({
+            text: prompt.text,
+            userId: interaction.user.id,
+            username: interaction.member?.displayName || interaction.user.username,
+            channelId: interaction.channelId
+        });
+        return interaction.editReply({
+            content: answer.reply,
+            allowedMentions: { parse: [] }
+        });
+    } catch (err) {
+        console.error("AI app command failed:", err?.message || err);
+        const report = aiChat.diagnose();
+        const payload = errorPayload(err, report);
+        await interaction.editReply({ content: payload, allowedMentions: { parse: [] } }).catch(() => {});
+        if (!report.ok) notifyAiDiagnostic(report).catch(() => {});
+    }
+});
+
+// AI ব্যর্থ হলে চুপচাপ নয় — কারণসহ বাংলা উত্তর।
+function errorPayload(err, report) {
+    const kind = String(err?.kind || "");
+    if (kind === "not_configured" || report?.issues?.some(i => i.code === "no_key")) {
+        return "⚙️ এখনো কোনো AI provider-এর API key সেট করা হয়নি। Admin Panel → AI Management থেকে অন্তত একটি free key দিন, তারপর আবার চেষ্টা করুন।";
+    }
+    if (kind === "all_cooling" || report?.issues?.some(i => i.code === "all_cooling")) {
+        return "😅 এই মুহূর্তে সব AI provider cooldown-এ আছে (free-tier limit)। কয়েক মিনিট পরে আবার চেষ্টা করুন — `/ai-status` দিয়ে অবস্থা দেখা যায়।";
+    }
+    if (kind === "timeout" || /timeout|timed out/i.test(String(err?.message || ""))) {
+        return "⌛ AI সময়মতো উত্তর দিতে পারেনি (provider ধীর ছিল)। আবার চেষ্টা করুন — সাধারণত দ্বিতীয়বার ঠিক হয়ে যায়।";
+    }
+    return `😅 উত্তর তৈরি করা যায়নি।\nকারণ: ${String(err?.message || err).slice(0, 200)}\n\nস্টাফ চাইলে \`/ai-status\` দিয়ে পুরো ডায়াগনস্টিক দেখতে পারেন।`;
+}
+
+// AI প্রস্তুত না হলে স্টাফ চ্যানেলে একবার (কমপক্ষে ৩০ মিনিটে একবার) পরিষ্কার বাংলা সতর্কতা।
+const AI_DIAG_NOTICE_COOLDOWN_MS = 30 * 60 * 1000;
+let aiDiagNoticeAt = 0;
+async function notifyAiDiagnostic(report) {
+    if (!report || report.ok) return false;
+    if (Date.now() - aiDiagNoticeAt < AI_DIAG_NOTICE_COOLDOWN_MS) return false;
+    aiDiagNoticeAt = Date.now();
+    const channelId = aiChat.noticeChannelId || STAFF_ADMIN_LOG_ID || [...aiChat.channels][0];
+    if (!channelId) return false;
+    const channel = client.channels.cache.get(String(channelId)) || await client.channels.fetch(String(channelId)).catch(() => null);
+    if (!channel?.send) return false;
+    const embed = new EmbedBuilder()
+        .setTitle("🤖 AKMAFIA AI — উত্তর আসছে না কেন")
+        .setDescription(aiChat.describeDiagnosis(report).slice(0, 4000))
+        .setColor("#E67E22")
+        .setFooter({ text: "ঠিক হওয়ার পর এই সতর্কতা নিজে থেকে বন্ধ হয়ে যাবে · v1.5.70" })
+        .setTimestamp(new Date());
+    await channel.send({ content: `<@&${getConfiguredRoleId("admin")}> AI auto-reply প্রস্তুত নয়।`, embeds: [embed], allowedMentions: { roles: [getConfiguredRoleId("admin")] } }).catch(() => {});
+    return true;
+}
+
 const { attachLiveStudioServer } = require("./live-studio-server");
 attachLiveStudioServer({
     app, client, db, guildId: ALLOWED_GUILD_ID, verifyAdminApiRequest, checkCppRateLimit,
@@ -3127,8 +3259,32 @@ function registerOfflinePaymentRequestListener() {
 }
 
 
+// ── v1.5.70: "is thinking…" watchdog ───────────────────────────────────────
+// Discord শুধু ৩ সেকেন্ড সময় দেয়। কোনো handler ভেতরে আটকে গেলে বা এরর খেয়ে ফেললে
+// ইন্টারঅ্যাকশন "is thinking…" অবস্থাতেই ঝুলে থাকে — ইউজারের কাছে মনে হয় কিছুই হচ্ছে না।
+// এই watchdog ২.৮ সেকেন্ড পরও উত্তর না গেলে নিজেই পরিষ্কার বাংলা মেসেজ দিয়ে দেয়।
+const interactionAnswered = new WeakSet();
+function markInteractionAnswered(interaction) {
+    try { interactionAnswered.add(interaction); } catch (_) {}
+}
+async function interactionWatchdog(interaction) {
+    await new Promise(resolve => setTimeout(resolve, 2800));
+    if (!interaction || interactionAnswered.has(interaction)) return;
+    if (interaction.deferred || interaction.replied) return;
+    const payload = {
+        content: "⏳ কাজটা প্রত্যাশার চেয়ে বেশি সময় নিচ্ছে। আবার চেষ্টা করুন — বারবার ক্লিক করার দরকার নেই। সমস্যা থাকলে Admin-কে জানান।",
+        flags: [MessageFlags.Ephemeral]
+    };
+    try {
+        await interaction.reply(payload);
+        markInteractionAnswered(interaction);
+        console.warn(`[interaction] watchdog replied for ${interaction.customId || interaction.commandName || "unknown"}`);
+    } catch (_) {}
+}
+
 client.on("interactionCreate", async (interaction) => {
     if (!interaction.guild || interaction.guild.id !== ALLOWED_GUILD_ID) return;
+    interactionWatchdog(interaction).catch(() => {});
 
     try {
     const disabledFeatureMessage = getDisabledFeatureMessage(interaction);
@@ -3136,6 +3292,7 @@ client.on("interactionCreate", async (interaction) => {
         const payload = { content: disabledFeatureMessage, flags: [MessageFlags.Ephemeral] };
         if (interaction.deferred) await interaction.editReply({ content: disabledFeatureMessage });
         else await interaction.reply(payload);
+        markInteractionAnswered(interaction);
         return;
     }
     if (interaction.isStringSelectMenu() && interaction.customId === "select_buy_category" && !isCheckoutAllowed()) {
@@ -3149,6 +3306,7 @@ client.on("interactionCreate", async (interaction) => {
         if (cooldowns.has(cooldownKey) && !paymentOnlineControl && interaction.customId !== "universal_verify_button" && !interaction.customId.startsWith("giveaway_join_") && !interaction.customId.startsWith("star_rating_")) {
             await interaction.reply({ content: "⏳ ঠামুন — আপনার আগের ক্লিকটি এখনো প্রক্রিয়া হচ্ছে। ২–৩ সেকেন্ড পর আবার চেষ্টা করুন।", flags: [MessageFlags.Ephemeral] })
                 .catch(err => console.warn("Cooldown reply failed:", err.message));
+            markInteractionAnswered(interaction);
             return;
         }
         if (!paymentOnlineControl) {
@@ -5147,8 +5305,8 @@ ${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${
         }, 5000);
     }
     } catch (error) {
-        console.error("❌ Interaction handler failed:", error);
-        const payload = { content: "❌ অনুরোধটি সম্পন্ন করা যায়নি। আবার চেষ্টা করুন বা অ্যাডমিনকে জানান।", flags: [MessageFlags.Ephemeral] };
+        console.error(`❌ Interaction handler failed (${interaction.customId || interaction.commandName || "unknown"}):`, error?.message || error);
+        const payload = { content: "❌ অনুরোধটি সম্পন্ন করা যায়নি। আবার চেষ্টা করুন বা অ্যাডমিনকে জানান।", flags: [MessageFlags.Ephemeral] };
         try {
             if (interaction.deferred) await interaction.editReply({ content: payload.content });
             else if (interaction.replied) await interaction.followUp(payload);
@@ -5156,6 +5314,7 @@ ${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${
         } catch (replyError) {
             console.error("❌ Could not send interaction error response:", replyError.message);
         }
+        markInteractionAnswered(interaction);
     }
 });
 
@@ -5962,6 +6121,40 @@ async function handleCommunityAutomationMessage(message) {
         await recordCommunityMetric("keywordReplies");
     } catch (err) { console.warn("Keyword automation reply failed:", err.message); }
 }
+// ── v1.5.70: `!ai <প্রশ্ন>`, `!aistatus`, `!aihelp` — slash ছাড়াও কাজ করে ──
+client.on("messageCreate", async (message) => {
+    if (message.author?.bot || !message.guild || message.guild.id !== ALLOWED_GUILD_ID) return;
+    const parsed = parseTextCommand(message.content);
+    if (!parsed.ok && parsed.reason === "not_ai") return;
+    try {
+        if (parsed.command === "help") return void await message.reply({ content: AI_HELP_TEXT, allowedMentions: { parse: [] } });
+        if (parsed.command === "status") {
+            const isStaff = message.member?.permissions?.has(PermissionFlagsBits.Administrator)
+                || message.member?.roles?.cache?.has(getConfiguredRoleId("admin"));
+            if (!isStaff) return void await message.reply({ content: "❌ `!aistatus` শুধু Admin/Staff-এর জন্য।", allowedMentions: { parse: [] } });
+            return void await message.reply({ content: aiChat.describeDiagnosis(aiChat.diagnose()), allowedMentions: { parse: [] } });
+        }
+        if (parsed.reason === "empty") return void await message.reply({ content: "ব্যবহার: `!ai <তোমার প্রশ্ন>` — যেমন `!ai তুমি কে?`", allowedMentions: { parse: [] } });
+        if (parsed.reason === "too_long") return void await message.reply({ content: "❌ প্রশ্নটি খুব বড় (সর্বোচ্চ ১২০০ অক্ষর)।", allowedMentions: { parse: [] } });
+        const typing = setInterval(() => message.channel?.sendTyping?.().catch(() => {}), 8000);
+        try {
+            const answer = await answerAiPrompt({
+                text: parsed.text,
+                userId: message.author.id,
+                username: message.member?.displayName || message.author.username,
+                channelId: message.channelId
+            });
+            await message.reply({ content: answer.reply, allowedMentions: { repliedUser: true, parse: [] } });
+        } finally {
+            clearInterval(typing);
+        }
+    } catch (err) {
+        console.error("!ai command failed:", err?.message || err);
+        const report = aiChat.diagnose();
+        await message.reply({ content: errorPayload(err, report), allowedMentions: { parse: [] } }).catch(() => {});
+        if (!report.ok) notifyAiDiagnostic(report).catch(() => {});
+    }
+});
 client.on("messageCreate", message => { handleCommunityAutomationMessage(message).catch(err => console.error("Community automation failed:", err.message)); });
 client.on("messageCreate", message => {
     if (!isTrackedTicketChannel(message.channel)) return;
@@ -6268,11 +6461,24 @@ client.on("ready", async () => {
     weeklyReportTimer = setInterval(() => maybePublishWeeklyReport().catch(err => console.error("Weekly report check failed:", err.message)), 60 * 60 * 1000);
 
     // AI router + per-user memory আগের অবস্থা থেকে ফিরিয়ে আনা হয়, যাতে restart-এ cooldown হারায় না।
+    // v1.5.70: app command রেজিস্টার — আগে কোনো slash/context command ছিল না, তাই
+    // Discord-এ "is thinking…" দেখিয়ে কিছুই হতো না।
+    registerAiCommands().catch(err => console.error("AI command registration failed:", err?.message || err));
+
     aiChat.router.restore()
         .then(() => aiChat.memory.loadConfig())
+        // v1.5.70 FIX: aiChat.loadConfig() আগে কখনো ডাকা হতো না — তাই প্যানেল থেকে সেভ করা
+        // auto-reply চ্যানেল/on-off restart-এর পর হারিয়ে যেত এবং bot চুপচাপ উত্তর দেওয়া বন্ধ করত।
+        .then(() => aiChat.loadConfig())
         .then(() => {
             const configured = AKMAFIA_AI_PROVIDERS.filter(spec => akmafiaAiProviderConfigured(spec, {})).map(spec => spec.id);
-            console.log(`🤖 AKMAFIA AI ready · providers: ${configured.length ? configured.join(", ") : "none configured"} · channels: ${[...aiChat.channels].join(", ") || "none"}`);
+            console.log(`🤖 AKMAFIA AI ready · providers: ${configured.length ? configured.join(", ") : "none configured"} · channels: ${[...aiChat.channels].join(", ") || "none"} · enabled: ${aiChat.enabled}`);
+            const report = aiChat.diagnose();
+            if (!report.ok) {
+                // শুধু log নয় — স্টাফ চ্যানেলেও একবার জানানো হয়, যাতে "সারাদিন রিপ্লাই নেই" ধরা পড়ে।
+                for (const issue of report.issues) console.warn(`[AI] সমস্যা (${issue.code}): ${issue.message}`);
+                notifyAiDiagnostic(report).catch(() => {});
+            }
         })
         .catch(err => console.error("AI chat init failed:", err?.message || err));
 
