@@ -26,7 +26,8 @@ class AiChat {
     this.db = options.db || null;
     this.log = options.log || (() => {});
     this.client = options.client || null;
-    this.router = options.router || new AiRouter({ log: this.log });
+    this.secretsProvider = options.secretsProvider || (() => ({}));
+    this.router = options.router || new AiRouter({ log: this.log, secretsProvider: this.secretsProvider });
     this.memory = options.memory || new AiMemory({ db: this.db, log: this.log });
     this.now = options.now || (() => Date.now());
     this.guildId = normalizeChannelId(options.guildId || "");
@@ -46,6 +47,14 @@ class AiChat {
     this.lastFailureNotice = 0;
     this.noticeChannelId = "";
     this.stats = { handled: 0, replied: 0, failed: 0, skipped: 0 };
+  }
+
+  // প্যানেল থেকে key সেভ হলে router যেন সাথে সাথে নতুন key দেখে।
+  setSecretsProvider(fn) {
+    if (typeof fn !== "function") return false;
+    this.secretsProvider = fn;
+    if (this.router) this.router.secretsProvider = fn;
+    return true;
   }
 
   setDb(db) {
@@ -214,7 +223,15 @@ class AiChat {
     return this.enqueue(message.author.id, async () => {
       const channel = message.channel;
       try {
-        if (typeof channel?.sendTyping === "function") channel.sendTyping().catch(() => {});
+        // v1.5.71: একবার sendTyping ~১০ সেকেন্ডেই মিলিয়ে যায় — ধীর provider-এ ইউজার ভাবে কিছুই হচ্ছে না।
+        if (typeof channel?.sendTyping === "function") {
+          channel.sendTyping().catch(() => {});
+          if (this.typingTimers) clearInterval(this.typingTimers.get(message.author.id));
+          this.typingTimers = this.typingTimers || new Map();
+          const timer = setInterval(() => channel.sendTyping?.().catch(() => {}), 8_000);
+          timer.unref?.();
+          this.typingTimers.set(message.author.id, timer);
+        }
 
         // পরিচয়-প্রশ্ন হলে AI-কে জিজ্ঞেস না করেই নিশ্চিত উত্তর।
         const fixed = identityAnswer(text);
@@ -225,6 +242,7 @@ class AiChat {
           return { handled: true, provider: "identity", identity: fixed.id };
         }
 
+        const startedAtReply = Date.now();
         const serious = isSeriousMessage(text);
         const recall = await this.memory.load(message.author.id);
         const system = buildSystemPrompt({
@@ -248,13 +266,19 @@ class AiChat {
 
         await this.sendReply(message, reply);
         this.stats.replied += 1;
+        // v1.5.71: কোন provider উত্তর দিল, কত সময় নিল — লগে সবসময় দেখা যায়।
+        this.log(`AI replied via ${result.providerId || "unknown"}${result.switched ? " (after failover)" : ""} in ${Date.now() - startedAtReply}ms${result.attempted?.length > 1 ? ` · tried ${result.attempted.join(" → ")}` : ""}`);
         await this.memory.appendTurn(message.author.id, text, reply, { channelId: message.channelId });
         return { handled: true, provider: result.providerId, switched: Boolean(result.switched) };
       } catch (err) {
         this.stats.failed += 1;
         this.log(`AI chat reply failed: ${err?.message || err}`);
+        await this.notifyUserFailure(channel, err);
         await this.notifyFailure(err);
         return { handled: true, error: String(err?.message || err) };
+      } finally {
+        const timer = this.typingTimers?.get(message.author.id);
+        if (timer) { clearInterval(timer); this.typingTimers.delete(message.author.id); }
       }
     });
   }
@@ -267,6 +291,38 @@ class AiChat {
       this.log(`AI reply send failed, trying channel.send: ${err?.message || err}`);
       await message.channel.send(payload);
     }
+  }
+
+  // v1.5.71: ব্যর্থ হলে চ্যানেলে কারণ + কী করতে হবে — প্রশ্ন করা ইউজারকে সরাসরি উত্তর।
+  // (আগে শুধু ৫ মিনিটে একবার একটা সাধারণ বার্তা যেত, তাই "কেন উত্তর নেই" বোঝা যেত না।)
+  async notifyUserFailure(channel, err) {
+    if (!channel?.send) return false;
+    const diag = this.diagnose();
+    const provider = (diag.providers || []).find(p => p.configured && !p.cooldownMs) || (diag.providers || []).find(p => p.configured);
+    const lines = ["😅 **এই মুহূর্তে উত্তর দিতে পারছি না।**", ""];
+    const kind = String(err?.kind || "");
+    if (kind === "not_configured" || diag.issues.some(i => i.code === "no_key")) {
+      lines.push("⚙️ **কারণ:** কোনো AI provider-এর API key সেট করা নেই।");
+      lines.push("👉 Admin Panel → AI Management → প্রতিটি provider-এর আলাদা সেকশনে key দিন (যেকোনো একটি হলেই চলবে)।");
+    } else if (kind === "all_cooling" || diag.issues.some(i => i.code === "all_cooling")) {
+      lines.push("⏳ **কারণ:** সব provider এখন free-tier cooldown-এ আছে।");
+      lines.push("👉 কয়েক মিনিট পরে আবার লিখুন, অথবা স্টাফ প্যানেল থেকে cooldown মুছে দিন।");
+    } else if (/timeout|timed out/i.test(String(err?.message || "")) || kind === "timeout") {
+      lines.push("⌛ **কারণ:** provider সময়মতো উত্তর দেয়নি (আজ ফ্রি-টিয়ার ধীর ছিল)।");
+      lines.push("👉 আবার লিখুন — দ্বিতীয়বার সাধারণত ঠিক হয়ে যায়।");
+    } else if (kind === "auth") {
+      lines.push("🔑 **কারণ:** API key ভুল বা মেয়াদোত্তীর্ণ।");
+      lines.push("👉 প্যানেলে নতুন key বসিয়ে সেভ করুন।");
+    } else if (kind === "quota" || kind === "rate_limit") {
+      lines.push("📉 **কারণ:** আজকের free quota শেষ / rate limit।");
+      lines.push("👉 কাল আবার চেষ্টা করুন, অথবা অন্য provider-এর key যোগ করুন।");
+    } else {
+      lines.push(`⚠️ **কারণ:** ${String(err?.message || err).slice(0, 160)}`);
+    }
+    if (provider) lines.push("", `🔎 এখন সবচেয়ে প্রস্তুত provider: **${provider.label}** (${provider.status})`);
+    lines.push("", "_স্টাফ: `/ai-status` চালালে পুরো ডায়াগনস্টিক দেখা যাবে।_");
+    await channel.send({ content: lines.join("\n"), allowedMentions: { parse: [] } }).catch(() => {});
+    return true;
   }
 
   // সব provider ডাউন হলে চ্যানেলে বারবার দুঃখ প্রকাশ নয় — ৫ মিনিটে একবার।

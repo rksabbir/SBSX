@@ -159,7 +159,7 @@ test("identity questions are answered without calling any provider", async () =>
   assert.equal(religion.replies[0].content, "আমি একটি AI, আমার ব্যক্তিগত কোনো ধর্ম নেই।");
 });
 
-test("when every provider fails the user sees nothing and no crash happens", async () => {
+test("v1.5.71: every failed provider now yields a Bangla explanation the user still gets a Bangla explanation (no silence)", async () => {
   const { chat } = buildChat({
     callProvider: async () => { throw Object.assign(new Error("down"), { kind: "server", status: 500 }); }
   });
@@ -167,8 +167,23 @@ test("when every provider fails the user sees nothing and no crash happens", asy
   const result = await chat.handleMessage(message);
   assert.equal(result.handled, true);
   assert.ok(result.error);
-  assert.equal(message.replies.length, 0);
   assert.equal(chat.stats.failed, 1);
+  // আগে ইউজার কিছুই পেত না — এখন কারণ + করণীয় চ্যানেলে যায় (কিন্তু "উত্তর" হিসেবে নয়)
+  assert.equal(message.replies.length, 1);
+  assert.match(message.replies[0].content, /উত্তর দিতে পারছি না/);
+  assert.match(message.replies[0].content, /কারণ/);
+});
+
+test("v1.5.71: failures explain no_key and all_cooling differently", async () => {
+  const { chat } = buildChat();
+  const sent = [];
+  const channel = { send: payload => { sent.push(payload); return Promise.resolve({}); } };
+  await chat.notifyUserFailure(channel, Object.assign(new Error("no key"), { kind: "not_configured" }));
+  assert.match(sent[0].content, /API key সেট করা নেই/);
+  await chat.notifyUserFailure(channel, Object.assign(new Error("cooling"), { kind: "all_cooling" }));
+  assert.match(sent[1].content, /cooldown/);
+  await chat.notifyUserFailure(channel, Object.assign(new Error("Request timed out"), { kind: "timeout" }));
+  assert.match(sent[2].content, /সময়মতো উত্তর দেয়নি/);
 });
 
 test("auto-reply channel config can be changed at runtime", async () => {
