@@ -12,9 +12,10 @@ const FAILURE_NOTICE_COOLDOWN_MS = 5 * 60 * 1000;
 const MAX_DEDUPE = 400;
 const MIN_LENGTH = 2;
 // প্রতি AI কলে সর্বোচ্চ এত সময়। ছোট রাখায় এক provider আটকে গেলেও দ্রুত পরেরটি উত্তর দেয়।
-const AI_REPLY_TIMEOUT_MS = Math.max(8_000, Math.min(60_000, Number(process.env.AI_REPLY_TIMEOUT_MS) || 12_000));
+// v1.5.70: free-tier provider ধীর হলেও ইউজার ৪০ সেকেন্ড অপেক্ষা করবে না — দ্রুত পরেরটায় যায়।
+const AI_REPLY_TIMEOUT_MS = Math.max(6_000, Math.min(60_000, Number(process.env.AI_REPLY_TIMEOUT_MS) || 9_000));
 // পুরো উত্তরের জন্য সর্বোচ্চ সময় (সব provider মিলিয়ে) — এর বেশি কেউ অপেক্ষা করে না।
-const AI_TOTAL_BUDGET_MS = Math.max(15_000, Math.min(120_000, Number(process.env.AI_TOTAL_BUDGET_MS) || 40_000));
+const AI_TOTAL_BUDGET_MS = Math.max(10_000, Math.min(120_000, Number(process.env.AI_TOTAL_BUDGET_MS) || 22_000));
 
 function normalizeChannelId(value) {
   return String(value || "").replace(/[^\d]/g, "");
@@ -191,6 +192,17 @@ class AiChat {
     const decision = this.shouldAnswer(message, botUserId);
     if (!decision.ok) {
       if (decision.reason !== "channel_off" && decision.reason !== "bot_author") this.stats.skipped += 1;
+      // v1.5.70: "সারাদিন উত্তর আসে না" ধরার জন্য চ্যানেল মিসম্যাচ এখন লগে স্পষ্ট দেখা যায়।
+      if (decision.reason === "channel_off") {
+        const seen = String(message?.channelId || "");
+        const now = this.now();
+        this.channelSkips = this.channelSkips || new Map();
+        const last = this.channelSkips.get(seen) || 0;
+        if (now - last > 60_000) {
+          this.channelSkips.set(seen, now);
+          this.log(`AI skipped a message: channel ${seen} is not in the auto-reply list (${[...this.channels].join(", ") || "none"}). Add it in AI_CHAT_CHANNEL_ID or the Admin Panel.`);
+        }
+      }
       return { handled: false, reason: decision.reason };
     }
     if (!this.markSeen(message.id)) return { handled: false, reason: "duplicate" };
@@ -269,6 +281,66 @@ class AiChat {
       ? "⚙️ এখনো কোনো AI provider-এর API key সেট করা হয়নি। অ্যাডমিন প্যানেলের AI Management থেকে key দিন।"
       : "😅 এই মুহূর্তে সব AI একসাথে ব্যস্ত/কুলডাউনে আছে। কয়েক মিনিট পরে আবার চেষ্টা করো।";
     channel.send({ content: text, allowedMentions: { parse: [] } }).catch(() => {});
+  }
+
+  // ── v1.5.70: কেন উত্তর আসছে না, সেটা এক জায়গায় নির্ণয় ────────────────────
+  // "সারাদিন কোনো রিপ্লাই আসে না" — এই ফাংশনই বলে দেয় ঠিক কোন ধাপে আটকেছে,
+  // আর প্যানেল/ডিসকর্ড দুই জায়গা থেকেই একই উত্তর দেখানো হয়।
+  diagnose() {
+    const router = this.router;
+    let snapshot = null;
+    try { snapshot = router?.snapshot ? router.snapshot() : null; } catch (_) { snapshot = null; }
+    const providers = Array.isArray(snapshot?.providers) ? snapshot.providers : [];
+    const usable = providers.filter(p => p.enabled && p.configured);
+    const ready = usable.filter(p => !p.cooldownMs);
+    const issues = [];
+    if (!this.enabled) issues.push({ code: "ai_disabled", message: "AI auto-reply বন্ধ আছে — Admin Panel → AI Management থেকে চালু করুন।" });
+    if (!this.channels.size) issues.push({ code: "no_channel", message: "কোনো auto-reply চ্যানেল সেট নেই — AI_CHAT_CHANNEL_ID দিন বা প্যানেল থেকে চ্যানেল সেট করুন।" });
+    if (!providers.length) issues.push({ code: "router_not_ready", message: "AI router এখনো তৈরি হয়নি — bot restart করুন।" });
+    else if (!usable.length) issues.push({ code: "no_key", message: "কোনো AI provider-এর API key সেট করা নেই — প্যানেলে অন্তত একটি free key দিন।" });
+    else if (!ready.length) issues.push({ code: "all_cooling", message: `সব provider cooldown-এ আছে — সবচেয়ে কম অপেক্ষা ${Math.ceil(Math.min(...usable.map(p => p.cooldownMs || 0)) / 1000)} সেকেন্ড।` });
+    return {
+      ok: issues.length === 0,
+      enabled: this.enabled,
+      channels: [...this.channels],
+      noticeChannelId: this.noticeChannelId,
+      providerCount: providers.length,
+      usableCount: usable.length,
+      readyCount: ready.length,
+      providers: providers.map(p => ({ id: p.id, label: p.label, configured: Boolean(p.configured), enabled: p.enabled, status: p.status, cooldownMs: p.cooldownMs || 0, lastError: p.lastError || "" })),
+      stats: { ...this.stats },
+      timeoutMs: AI_REPLY_TIMEOUT_MS,
+      totalBudgetMs: AI_TOTAL_BUDGET_MS,
+      issues,
+      checkedAt: this.now()
+    };
+  }
+
+  // diagnosis-কে ডিসকর্ডে পড়ার মতো বাংলা টেক্সটে রূপ দেয়।
+  describeDiagnosis(report) {
+    const d = report || this.diagnose();
+    const lines = [];
+    lines.push("🤖 **AKMAFIA YT — AI ডায়াগনস্টিক**");
+    lines.push(`• অবস্থা: ${d.ok ? "✅ উত্তর দিতে তৈরি" : "⚠️ সমস্যা আছে"}`);
+    lines.push(`• Auto-reply: ${d.enabled ? "চালু" : "বন্ধ"}`);
+    lines.push(`• চ্যানেল: ${d.channels.length ? d.channels.map(id => `<#${id}>`).join(", ") : "সেট করা নেই"}`);
+    lines.push(`• Provider: ${d.providerCount}টি · key আছে ${d.usableCount}টিতে · এখন প্রস্তুত ${d.readyCount}টি`);
+    lines.push(`• সময়সীমা: প্রতি provider ${Math.round(d.timeoutMs / 1000)}s · মোট ${Math.round(d.totalBudgetMs / 1000)}s`);
+    if (d.issues.length) {
+      lines.push("");
+      lines.push("**কেন উত্তর আসছিল না:**");
+      for (const issue of d.issues) lines.push(`❌ ${issue.message}`);
+    }
+    const broken = (d.providers || []).filter(p => !p.configured || p.cooldownMs > 0);
+    if (broken.length) {
+      lines.push("");
+      lines.push("**যেসব provider এখন কাজ করছে না:**");
+      for (const p of broken.slice(0, 8)) {
+        const state = !p.configured ? "key নেই" : `cooldown ${Math.ceil(p.cooldownMs / 1000)}s`;
+        lines.push(`• ${p.label} — ${state}${p.lastError ? ` (${String(p.lastError).slice(0, 60)})` : ""}`);
+      }
+    }
+    return lines.join("\n").slice(0, 1900);
   }
 
   // panel-এর জন্য সংক্ষিপ্ত অবস্থা

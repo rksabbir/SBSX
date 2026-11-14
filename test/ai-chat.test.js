@@ -235,3 +235,58 @@ test("live-studio-server exposes the AI Management endpoints", () => {
   assert.doesNotMatch(keysRoute, /saved\[field\.key\]\s*\?\s*saved/);
   assert.match(keysRoute, /configured: Boolean/);
 });
+
+// ── v1.5.70: diagnosis — "কেন উত্তর আসছে না" ─────────────────────────────
+test("diagnose() reports a ready state when a key exists and nothing is cooling", () => {
+  const { chat } = buildChat();
+  const report = chat.diagnose();
+  assert.equal(report.enabled, true);
+  assert.equal(report.channels.length, 1);
+  assert.ok(report.usableCount >= 1, "test keys are injected so at least one provider is usable");
+  assert.ok(report.readyCount >= 1);
+  assert.deepEqual(report.issues.map(i => i.code), []);
+  assert.equal(report.ok, true);
+  assert.ok(report.timeoutMs >= 6_000);
+  assert.ok(report.totalBudgetMs >= 10_000);
+});
+
+test("diagnose() flags a disabled AI chat and empty channel list", () => {
+  const { chat } = buildChat({ enabled: false, channels: [] });
+  const codes = chat.diagnose().issues.map(i => i.code);
+  assert.ok(codes.includes("ai_disabled"));
+  assert.ok(codes.includes("no_channel"));
+});
+
+test("diagnose() explains that no provider key is configured", () => {
+  const saved = {};
+  for (const name of KEY_ENVS) { saved[name] = process.env[name]; delete process.env[name]; }
+  try {
+    const { chat } = buildChat();
+    const report = chat.diagnose();
+    assert.equal(report.usableCount, 0);
+    assert.ok(report.issues.some(i => i.code === "no_key"));
+    assert.match(report.issues.find(i => i.code === "no_key").message, /API key/);
+  } finally {
+    for (const name of KEY_ENVS) if (saved[name] !== undefined) process.env[name] = saved[name];
+  }
+});
+
+test("describeDiagnosis() renders Bangla guidance with channels and providers", () => {
+  const { chat } = buildChat();
+  const text = chat.describeDiagnosis();
+  assert.match(text, /AI ডায়াগনস্টিক/);
+  assert.match(text, new RegExp(`<#${CHANNEL}>`));
+  assert.match(text, /Provider:/);
+  assert.ok(text.length <= 1900, "Discord message limit respected");
+});
+
+test("channel mismatches are logged once instead of failing silently", async () => {
+  const logs = [];
+  const { chat } = buildChat();
+  chat.log = message => logs.push(message);
+  const message = fakeMessage({ channelId: "999888777666555444", id: "off-channel" });
+  const result = await chat.handleMessage(message);
+  assert.equal(result.handled, false);
+  assert.equal(result.reason, "channel_off");
+  assert.ok(logs.some(line => line.includes("is not in the auto-reply list")));
+});
