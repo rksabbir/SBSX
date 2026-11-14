@@ -106,6 +106,9 @@ function describeTicketLockBlock(gate) {
       `একই ক্যাটাগরিতে একাধিক টিকিট খোলা যায় না। ওই টিকিট বন্ধ হলে আবার খুলতে পারবেন।\n` +
       `টিকিটে সরাসরি মেসেজ দিলেই আমাদের স্টাফ দেখতে পাবেন।`;
   }
+  if (gate.reason === "channel_missing" || gate.reason === "channel_never_created") {
+    return `🎫 ওই ক্যাটাগরির পুরোনো টিকিটটি ডিলিট হয়েই গেছে — লক ছেড়ে দেওয়া হচ্ছে। আবার বাটনে চাপ দিন, নতুন টিকিট তৈরি হবে।`;
+  }
   if (gate.reason === "reopen_cooldown") {
     const minutes = Math.max(1, Math.ceil((Number(gate.retryAfterMs) || 0) / 60000));
     return `⏳ আপনার **${label}** টিকিট কিছুক্ষণ আগেই বন্ধ হয়েছে।\n` +

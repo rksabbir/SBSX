@@ -40,11 +40,17 @@ class AiChat {
       if (clean) this.channels.add(clean);
     }
 
+    // v1.5.72: "টিকিট/অর্ডার খুললে AI উত্তর দেয় না" — সাপোর্ট টিকিট চ্যানেলেও AI উত্তর দেয়।
+    // ডিফল্ট চালু, প্যানেল থেকে বন্ধ করা যায়।
+    this.autoReplyTickets = options.autoReplyTickets !== false;
+
     this.seenMessages = [];
     this.seenSet = new Set();
     this.userCooldowns = new Map();
     this.userQueues = new Map();
     this.lastFailureNotice = 0;
+    this.lastUserFailureNotice = new Map();
+    this.lastDisabledLog = 0;
     this.noticeChannelId = "";
     this.stats = { handled: 0, replied: 0, failed: 0, skipped: 0 };
   }
@@ -83,6 +89,7 @@ class AiChat {
           this.channels = new Set(list.filter(Boolean));
         }
       }
+      if (typeof value.autoReplyTickets === "boolean") this.autoReplyTickets = value.autoReplyTickets;
       const notice = normalizeChannelId(value.noticeChannelId);
       if (notice) this.noticeChannelId = notice;
       return { enabled: this.enabled, channels: [...this.channels] };
@@ -105,6 +112,10 @@ class AiChat {
         }
         update.autoReplyChannels = map;
         this.channels = new Set(Object.keys(map));
+      }
+      if (typeof patch.autoReplyTickets === "boolean") {
+        update.autoReplyTickets = patch.autoReplyTickets;
+        this.autoReplyTickets = patch.autoReplyTickets;
       }
       if (patch.noticeChannelId !== undefined) {
         const notice = normalizeChannelId(patch.noticeChannelId);
@@ -137,6 +148,18 @@ class AiChat {
     return this.channels.has(normalizeChannelId(channelId));
   }
 
+  // সাপোর্ট/অর্ডার টিকিট চ্যানেলের নাম: ticket-1234 · order-5678 — এই চ্যানেলগুলো
+  // প্যানেলের auto-reply লিস্টে যোগ না করেও AI উত্তর দেবে (নাহলে টিকিট খোলা ইউজার
+  // কখনো উত্তর পেত না — "টিকিট/অর্ডার খুললে কোনো রিপ্লাই আসে না")।
+  static isTicketChannelName(name) {
+    return /^(ticket|report|customer|order)-\d{4}$/i.test(String(name || ""));
+  }
+
+  supportsTicketAutoReply(channel) {
+    if (!this.autoReplyTickets) return false;
+    return AiChat.isTicketChannelName(channel?.name);
+  }
+
   // একই মেসেজে দুইবার উত্তর যাবে না (event replay বা reconnect হলেও)।
   markSeen(messageId) {
     const id = String(messageId || "");
@@ -159,7 +182,9 @@ class AiChat {
     if (message.system) return { ok: false, reason: "system" };
     if (!message.guild) return { ok: false, reason: "dm" };
     if (this.guildId && String(message.guild.id) !== this.guildId) return { ok: false, reason: "other_guild" };
-    if (!this.isEnabledChannel(message.channelId)) return { ok: false, reason: "channel_off" };
+    if (!this.isEnabledChannel(message.channelId) && !this.supportsTicketAutoReply(message.channel)) {
+      return { ok: false, reason: "channel_off" };
+    }
 
     const content = String(message.content || "").trim();
     if (!content) return { ok: false, reason: "empty" };
@@ -202,6 +227,13 @@ class AiChat {
     if (!decision.ok) {
       if (decision.reason !== "channel_off" && decision.reason !== "bot_author") this.stats.skipped += 1;
       // v1.5.70: "সারাদিন উত্তর আসে না" ধরার জন্য চ্যানেল মিসম্যাচ এখন লগে স্পষ্ট দেখা যায়।
+      if (decision.reason === "disabled") {
+        const now = this.now();
+        if (now - (this.lastDisabledLog || 0) > 10 * 60_000) {
+          this.lastDisabledLog = now;
+          this.log("AI auto-reply is turned OFF in the panel (ai_router/config enabled=false) — no message will get a reply until an admin re-enables it.");
+        }
+      }
       if (decision.reason === "channel_off") {
         const seen = String(message?.channelId || "");
         const now = this.now();
@@ -273,7 +305,7 @@ class AiChat {
       } catch (err) {
         this.stats.failed += 1;
         this.log(`AI chat reply failed: ${err?.message || err}`);
-        await this.notifyUserFailure(channel, err);
+        await this.notifyUserFailure(channel, err, message.author.id);
         await this.notifyFailure(err);
         return { handled: true, error: String(err?.message || err) };
       } finally {
@@ -295,8 +327,17 @@ class AiChat {
 
   // v1.5.71: ব্যর্থ হলে চ্যানেলে কারণ + কী করতে হবে — প্রশ্ন করা ইউজারকে সরাসরি উত্তর।
   // (আগে শুধু ৫ মিনিটে একবার একটা সাধারণ বার্তা যেত, তাই "কেন উত্তর নেই" বোঝা যেত না।)
-  async notifyUserFailure(channel, err) {
+  async notifyUserFailure(channel, err, userId = "") {
     if (!channel?.send) return false;
+    // v1.5.72: একই ইউজার বারবার লিখলেও ৪৫ সেকেন্ডে একবারই ব্যাখ্যা — স্প্যাম নয়, তবু চুপও নয়।
+    const who = String(userId || channel?.id || "channel");
+    const last = this.lastUserFailureNotice.get(who) || 0;
+    if (this.now() - last < 45_000) return false;
+    this.lastUserFailureNotice.set(who, this.now());
+    if (this.lastUserFailureNotice.size > 500) {
+      const cutoff = this.now() - 10 * 60 * 1000;
+      for (const [key, at] of this.lastUserFailureNotice) if (at < cutoff) this.lastUserFailureNotice.delete(key);
+    }
     const diag = this.diagnose();
     const provider = (diag.providers || []).find(p => p.configured && !p.cooldownMs) || (diag.providers || []).find(p => p.configured);
     const lines = ["😅 **এই মুহূর্তে উত্তর দিতে পারছি না।**", ""];
@@ -359,6 +400,7 @@ class AiChat {
       ok: issues.length === 0,
       enabled: this.enabled,
       channels: [...this.channels],
+      autoReplyTickets: Boolean(this.autoReplyTickets),
       noticeChannelId: this.noticeChannelId,
       providerCount: providers.length,
       usableCount: usable.length,
@@ -380,6 +422,7 @@ class AiChat {
     lines.push(`• অবস্থা: ${d.ok ? "✅ উত্তর দিতে তৈরি" : "⚠️ সমস্যা আছে"}`);
     lines.push(`• Auto-reply: ${d.enabled ? "চালু" : "বন্ধ"}`);
     lines.push(`• চ্যানেল: ${d.channels.length ? d.channels.map(id => `<#${id}>`).join(", ") : "সেট করা নেই"}`);
+    lines.push(`• সাপোর্ট/অর্ডার টিকিটে AI: ${d.autoReplyTickets ? "চালু" : "বন্ধ"}`);
     lines.push(`• Provider: ${d.providerCount}টি · key আছে ${d.usableCount}টিতে · এখন প্রস্তুত ${d.readyCount}টি`);
     lines.push(`• সময়সীমা: প্রতি provider ${Math.round(d.timeoutMs / 1000)}s · মোট ${Math.round(d.totalBudgetMs / 1000)}s`);
     if (d.issues.length) {
@@ -404,6 +447,7 @@ class AiChat {
     return {
       enabled: this.enabled,
       channels: [...this.channels],
+      autoReplyTickets: Boolean(this.autoReplyTickets),
       noticeChannelId: this.noticeChannelId,
       stats: this.stats,
       pendingQueues: this.userQueues.size,

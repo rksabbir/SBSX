@@ -100,9 +100,15 @@ test("wiring: buy-panel no longer hangs — parallel reads, deferUpdate and rese
   assert.match(slice, /offline_payment_approved/);
 });
 
-test("version 1.5.71 is consistent", () => {
+test("package version is consistent with the API version strings", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
-  assert.equal(pkg.version, "1.5.71");
+  // ভার্সন-অজ্ঞেয়: যেকোনো নতুন রিলিজে টেস্ট ভাঙবে না, কিন্তু প্যানেল/সার্ভার আলাদা হলে ধরবে।
+  assert.match(pkg.version, /^1\.5\.\d+$/);
   const server = fs.readFileSync(path.join(root, "live-studio-server.js"), "utf8");
-  assert.doesNotMatch(server, /version: "1\.5\.70"/);
+  // কিছু পুরোনো route এখনো নিজের verson string ফেরত দেয় (1.5.56) — তাই সর্বোচ্চ verson-ই
+  // বর্তমান রিলিজ, এবং সেটাই package.json-এর সাথে মিলতে হবে।
+  const versions = [...server.matchAll(/version: "(1\.5\.(\d+))"/g)].map(m => ({ full: m[1], patch: Number(m[2]) }));
+  assert.ok(versions.length > 0, "live-studio-server.js must report its version");
+  const newest = versions.reduce((a, b) => (b.patch > a.patch ? b : a));
+  assert.equal(newest.full, pkg.version, `newest API version must be ${pkg.version}, saw ${newest.full}`);
 });
