@@ -5,7 +5,7 @@
 //  * cooldown + counters + history সব Firebase-এ যায়, তাই restart-এও টেকে।
 //  * cooldown-এ থাকা provider-কে একবারও ডাকা হয় না (wasteful retry নেই)।
 
-const { AI_PROVIDERS, getProviderSpec, callProvider, parseRetryAfterMs, providerModelChain, isModelGoneError } = require("./ai-providers");
+const { AI_PROVIDERS, getProviderSpec, callProvider, parseRetryAfterMs, providerModelChain, isModelGoneError, resolveProviderKey, resolveProviderAccount } = require("./ai-providers");
 
 const STATUS = {
   ACTIVE: "active",
@@ -300,14 +300,14 @@ class AiRouter {
     return p;
   }
 
+  // v1.5.71: key env না থাকলে প্যানেল-সেভ করা Firebase secret-ও ব্যবহার হয়।
+  // আগে শুধু env দেখত, তাই panel থেকে key দিলেও router সেটা "নেই" ধরে নিয়ে চুপচাপ বাদ দিত।
   keyFor(spec, secrets) {
-    const fromEnv = String(process.env[spec.env] || "").trim();
-    if (!fromEnv) return "";
-    if (spec.accountEnv && !String(process.env[spec.accountEnv] || "").trim()) {
-      const fromStore = String(secrets?.[`${spec.id}AccountId`] || "").trim();
-      if (!fromStore) return "";
-    }
-    return fromEnv;
+    if (!spec) return "";
+    const key = resolveProviderKey(spec, secrets || {});
+    if (!key) return "";
+    if (spec.accountEnv && !resolveProviderAccount(spec, secrets || {})) return "";
+    return key;
   }
 
   refreshAll() {
@@ -529,16 +529,17 @@ class AiRouter {
     const queue = order.slice(0, Math.max(1, Math.min(attempts, order.length)));
     for (const [index, p] of queue.entries()) {
       // বাকি সবাই সমান ভাগ পায় — এক ধীর provider পুরো বাজেট খেতে পারে না।
-      const allowance = Math.max(MIN_PROVIDER_TIMEOUT_MS, Math.floor(remaining() / (queue.length - index)));
+      const allowance = Math.max(MIN_PROVIDER_TIMEOUT_MS, Math.floor(remaining() / Math.max(1, queue.length - index)));
       if (tried.length && remaining() <= MIN_PROVIDER_TIMEOUT_MS) {
         this.pushHistory({ providerId: p.id, reason: "time_budget_exhausted", message: `মোট ${Math.round(totalBudget / 1000)}s শেষ` });
         break;
       }
       const spec = getProviderSpec(p.id);
       if (!spec) continue;
-      const apiKey = String(process.env[spec.env] || "").trim();
+      // env key না থাকলে প্যানেলে সেভ করা key — নাহলে প্যানেলের key দিয়ে কখনো উত্তর আসত না।
+      const apiKey = resolveProviderKey(spec, secrets);
       if (!apiKey) { p.status = STATUS.UNCONFIGURED; continue; }
-      const accountId = spec.accountEnv ? String(process.env[spec.accountEnv] || secrets?.[`${spec.id}AccountId`] || "").trim() : "";
+      const accountId = spec.accountEnv ? resolveProviderAccount(spec, secrets) : "";
 
       if (previous) {
         this.totals.switches += 1;
@@ -636,7 +637,8 @@ class AiRouter {
         docs: spec.docs,
         env: spec.env,
         accountEnv: spec.accountEnv || "",
-        configured: Boolean(String(process.env[spec.env] || "").trim()),
+        // env অথবা panel-সেভ করা key — যেটাই থাকুক, configured true।
+        configured: Boolean(this.keyFor(spec, this.secretsProvider() || {})),
         enabled: p.enabled,
         priority: p.priority,
         model: p.model || spec.defaultModel,

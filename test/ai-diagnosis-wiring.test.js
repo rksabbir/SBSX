@@ -9,10 +9,11 @@ const server = fs.readFileSync(path.join(root, "live-studio-server.js"), "utf8")
 const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 const env = fs.readFileSync(path.join(root, ".env.example"), "utf8");
 
-test("v1.5.70 version is consistent across package.json and admin API responses", () => {
-  assert.equal(pkg.version, "1.5.70");
-  assert.match(server, /version: "1\.5\.70"/);
-  assert.doesNotMatch(server, /version: "1\.5\.66"/);
+test("version is consistent across package.json and admin API responses", () => {
+  // v1.5.71 থেকে একটি জায়গায় version ধরা হয় — প্রতিটি release-এ শুধু এই টেস্ট আপডেট করতে হয়।
+  assert.match(pkg.version, /^1\.5\.\d+$/);
+  assert.ok(server.includes(`version: "${pkg.version}"`), "admin API must report the package version");
+  assert.doesNotMatch(server, /version: "1\.5\.6[0-9]"/);
 });
 
 test("admin AI status API exposes the same diagnosis the Discord command shows", () => {

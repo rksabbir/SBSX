@@ -1760,8 +1760,10 @@ let liveStudioPresenceActive = false;
 const AI_CHAT_ENABLED = String(process.env.AI_CHAT_ENABLED || "true").toLowerCase() !== "false";
 const AI_CHAT_CHANNELS = String(process.env.AI_CHAT_CHANNEL_ID || AI_DEFAULT_CHANNEL_ID || "")
     .split(",").map(value => value.replace(/[^\d]/g, "")).filter(Boolean);
+// v1.5.71: প্যানেলে সেভ করা AI key-ও router দেখতে পাবে (শুধু env নয়)।
 const aiChat = new AiChat({
     db,
+    secretsProvider: () => ({ ...((global.__aiProviderSecrets) || {}) }),
     client,
     enabled: AI_CHAT_ENABLED,
     guildId: ALLOWED_GUILD_ID,
@@ -3259,6 +3261,12 @@ function registerOfflinePaymentRequestListener() {
 }
 
 
+// deferUpdate করা হলে editReply কাজ করে না (সেটা panel মেসেজ এডিট করে) — তাই ephemeral followUp।
+async function replyAfterDefer(interaction, usedDeferUpdate, payload) {
+    if (usedDeferUpdate) return interaction.followUp({ ...payload, flags: [MessageFlags.Ephemeral] });
+    return interaction.editReply(payload);
+}
+
 // ── v1.5.70: "is thinking…" watchdog ───────────────────────────────────────
 // Discord শুধু ৩ সেকেন্ড সময় দেয়। কোনো handler ভেতরে আটকে গেলে বা এরর খেয়ে ফেললে
 // ইন্টারঅ্যাকশন "is thinking…" অবস্থাতেই ঝুলে থাকে — ইউজারের কাছে মনে হয় কিছুই হচ্ছে না।
@@ -3313,6 +3321,24 @@ client.on("interactionCreate", async (interaction) => {
             cooldowns.set(cooldownKey, true);
             setTimeout(() => cooldowns.delete(cooldownKey), 3000);
         }
+    }
+
+    // v1.5.71: আটকে থাকা checkout session বাতিল — ইউজার আবার package বেছে নিতে পারে।
+    if (interaction.isButton() && interaction.customId.startsWith("reset_checkout_")) {
+        const category = getNormalizedCategory(interaction.customId.slice("reset_checkout_".length));
+        await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+        const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
+        const cleared = await sessionRef.transaction(current => {
+            if (!current) return;
+            // যে session ইতিমধ্যে credit পেয়ে গেছে সেটা কখনো মুছি না (টাকা হারানোর ঝুঁকি)।
+            if (["offline_payment_approved", "completed"].includes(String(current.status || ""))) return;
+            if ((Number(current.totalPaid) || 0) > 0) return;
+            return null;
+        }, undefined, false);
+        if (!cleared.committed) {
+            return interaction.editReply("☝️ এই checkout-এ ইতিমধ্যেই পেমেন্ট credit হয়েছে — বাতিল করা যাবে না। নতুন প্যাকেজ কিনতে চাইলে অন্য প্যাকেজ বেছে নিন অথবা Support-এ জানান।");
+        }
+        return interaction.editReply("✅ পুরোনো checkout বাতিল হয়েছে। এখন Shop panel থেকে আবার package বেছে নিন।");
     }
 
     if (interaction.isButton() && interaction.customId === "toggle_auto_coupon") {
@@ -3464,18 +3490,31 @@ client.on("interactionCreate", async (interaction) => {
             if (!isPackageEnabled(category)) return interaction.reply({ content: "এই প্যাকেজটি Admin Panel থেকে সাময়িকভাবে বন্ধ করা হয়েছে।", flags: [MessageFlags.Ephemeral] });
             const basePrice = getPackagePrice(category);
             const sessionRef = db.ref(`pending_payments/${userId}_${category}`);
-            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const existingSessionSnap = await sessionRef.once("value");
+            // v1.5.71: dropdown selection-এ deferUpdate — Discord-এর লোডিং/"thinking" দেখায় না।
+            // শুধু বাংলাদেশি বাংলা রিপ্লাই পরে ephemeral ভাবে পাঠানো হয়; ব্যর্থ হলে deferReply-তে ফিরে যায়।
+            let usedDeferUpdate = false;
+            try {
+                await interaction.deferUpdate();
+                usedDeferUpdate = true;
+            } catch (_) {
+                await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
+            }
+            // v1.5.71: session আর auto-coupon preference একসাথে (parallel) — আগে একটার পর একটা
+            // অপেক্ষা করত, তাই ৩ সেকেন্ডের Discord deadline পেরিয়ে লোডিং-ই থেকে যেত।
+            const [existingSessionSnap, autoCouponEnabled] = await Promise.all([
+                sessionRef.once("value"),
+                isAutoCouponEnabled(userId).catch(() => true)
+            ]);
             const existingSession = existingSessionSnap.val();
             if (existingSession?.status === "offline_payment_approved") {
                 const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success));
-                return interaction.editReply({ content: "✅ Admin/Staff আপনার offline payment approve করেছেন। এখন account credentials তৈরি করতে পারবেন।", components: [row] });
+                return replyAfterDefer(interaction, usedDeferUpdate, { content: "✅ Admin/Staff আপনার offline payment approve করেছেন। এখন account credentials তৈরি করতে পারবেন।", components: [row] });
             }
             if (existingSession?.status === "offline_payment_requested") {
-                return interaction.editReply("🕓 আপনার offline payment request Admin/Staff review-এর অপেক্ষায় আছে। একই request আবার পাঠানোর প্রয়োজন নেই।");
+                return replyAfterDefer(interaction, usedDeferUpdate, "🕓 আপনার offline payment request Admin/Staff review-এর অপেক্ষায় আছে। একই request আবার পাঠানোর প্রয়োজন নেই।");
             }
             if (existingSession?.status === "offline_payment_rejected") {
-                return interaction.editReply("❌ আপনার offline payment request reject হয়েছে। নতুন payment করতে বা staff-এর সঙ্গে যোগাযোগ করতে পারেন।");
+                return replyAfterDefer(interaction, usedDeferUpdate, "❌ আপনার offline payment request reject হয়েছে। নতুন payment করতে বা staff-এর সঙ্গে যোগাযোগ করতে পারেন।");
             }
             const newSession = {
                 targetPrice: basePrice,
@@ -3495,11 +3534,17 @@ client.on("interactionCreate", async (interaction) => {
                 return newSession;
             }, undefined, false);
             if (!sessionResult.committed) {
-                return interaction.editReply("⚠️ এই প্যাকেজের একটি পেমেন্ট ইতোমধ্যে প্রক্রিয়াধীন। পুরোনো TxnID/অ্যাকাউন্ট প্রক্রিয়া শেষ না হওয়া পর্যন্ত নতুন checkout শুরু করা যাবে না।");
+                // v1.5.71: আটকে থাকা পুরোনো session থেকে বেরোনোর পথ আগে ছিল না।
+                const resetRow = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`reset_checkout_${category}`).setLabel("🔄 পুরোনো checkout বাতিল করে নতুন শুরু").setStyle(ButtonStyle.Secondary)
+                );
+                return replyAfterDefer(interaction, usedDeferUpdate, {
+                    content: "⚠️ এই প্যাকেজের একটি পুরোনো পেমেন্ট আটকে আছে। নতুন করে শুরু করতে নিচের বাটনে চাপ দিন।",
+                    components: [resetRow]
+                });
             }
 
             let checkoutSession = sessionResult.snapshot.val() || newSession;
-            const autoCouponEnabled = await isAutoCouponEnabled(userId).catch(() => true);
             if (autoCouponEnabled) {
                 const autoCoupon = await reserveBestAutoCoupon(userId, category, basePrice).catch(err => {
                     console.error("Automatic coupon lookup failed:", err.message);
@@ -3543,7 +3588,7 @@ client.on("interactionCreate", async (interaction) => {
                             const credentialRow = new ActionRowBuilder().addComponents(
                                 new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success)
                             );
-                            return interaction.editReply({ embeds: [freeEmbed], components: [credentialRow] });
+                            return replyAfterDefer(interaction, usedDeferUpdate, { embeds: [freeEmbed], components: [credentialRow] });
                         }
                         // Fail closed if atomic coupon consumption fails; ask for the normal package payment.
                         await releaseCouponReservation(autoCoupon.code, userId, category).catch(() => {});
@@ -3585,7 +3630,12 @@ client.on("interactionCreate", async (interaction) => {
                     new ButtonBuilder().setCustomId(`apply_coupon_${category}`).setLabel("🎟️ Coupon Code ব্যবহার করুন").setStyle(ButtonStyle.Secondary)
                 ));
             }
-            return interaction.editReply({ embeds: [pickerEmbed], components });
+            // deferUpdate-এর পর ephemeral রিপ্লাই followUp দিয়ে দিতে হয় (editReply হলে panel মেসেজ বদলে যেত)।
+            const panelMessage = interaction.message;
+            if (usedDeferUpdate && interaction.message) {
+                return interaction.followUp({ embeds: [pickerEmbed], components, flags: [MessageFlags.Ephemeral] });
+            }
+            return replyAfterDefer(interaction, usedDeferUpdate, { embeds: [pickerEmbed], components });
         } else if (type) {
             const ephemeralEmbed = new EmbedBuilder().setTitle(`📌 Selected Category: ${value.toUpperCase().replace("_", " ")}`).setDescription(`চ্যানেল তৈরি করতে নিচের বাটনে চাপ দিন।`).setColor(embedColor);
             const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(buttonId).setLabel(`Create ${type.toUpperCase()}`).setStyle(ButtonStyle.Success));
@@ -6592,6 +6642,18 @@ async function startBot() {
     };
     for (const [key, envName] of Object.entries(secretEnvNames)) {
         if (typeof privateSecrets[key] === "string" && privateSecrets[key].trim()) process.env[envName] = privateSecrets[key].trim();
+    }
+    // provider id → key ম্যাপ, যাতে env ছাড়াও প্যানেলের key দিয়ে AI উত্তর দিতে পারে।
+    // AI secret-এর key নাম → provider id (panels: geminiApiKey → gemini, HF: huggingfaceApiKey → huggingface)
+    const aiSecretKeys = {
+        gemini: "geminiApiKey", groq: "groqApiKey", cerebras: "cerebrasApiKey",
+        openrouter: "openrouterApiKey", cloudflare: "cloudflareApiToken", cloudflareAccountId: "cloudflareAccountId",
+        nvidia: "nvidiaApiKey", cohere: "cohereApiKey", huggingface: "huggingfaceApiKey"
+    };
+    global.__aiProviderSecrets = { ...privateSecrets };
+    for (const [providerId, secretKey] of Object.entries(aiSecretKeys)) {
+        const value = String(privateSecrets[secretKey] || "").trim();
+        if (value) global.__aiProviderSecrets[providerId] = value;
     }
     TOKEN = String(process.env.TOKEN || "").trim();
     if (!TOKEN) {
