@@ -33,7 +33,9 @@ test("channel creation failure releases the lock instead of trapping the user", 
 });
 
 test("closing and deleting a ticket releases the lock", () => {
-  assert.match(index, /releaseTicketLock\(\{ channelId: interaction\.channel\.id, reason: "closed"/);
+  // v1.5.69: বন্ধ/ডিলিট দুটোই releaseLocksForChannel দিয়ে যায়, যেটা ভেতরে releaseTicketLock ডাকে।
+  assert.match(index, /releaseLocksForChannel\(interaction\.channel\.id, \{ reason: "closed"/);
+  assert.match(index, /reason: closeDecision\.reason|reason: decision\.reason/);
   assert.match(index, /client\.on\("channelDelete"/);
   assert.match(index, /onTicketChannelDeleted\(channel\)/);
 });

@@ -8,6 +8,9 @@ const fs = require("fs");
 const crypto = require("crypto");
 const { promisify } = require("util");
 const ticketChannelTools = require("./ticket-channel");
+const offlineCoupon = require("./offline-coupon");
+const supporterBoard = require("./supporter-board");
+const ticketLockActions = require("./ticket-lock-actions");
 const orderTracking = require("./order-tracking");
 const os = require("os");
 const admin = require("firebase-admin"); // Firebase Admin SDK
@@ -284,7 +287,7 @@ let ADMIN_BOT_CONFIG = {
         communityAnalyticsEnabled: true, raidAlertEnabled: true
     },
     checkout: { readerRequired: true, allowPartialPayments: true, sessionExpiryHours: 24 },
-    coupons: { enabled: true, overpaymentMode: "auto", expiryDays: 90 },
+    coupons: { enabled: true, overpaymentMode: "auto", expiryDays: 90, offlineEnabled: true },
     automod: { maxUppercaseRatio: 0.7, minCapsLetters: 6, spamCount: 5, spamWindowSeconds: 5, warningLimit: 3, timeoutMinutes: 10, blockedWords: ["gali1", "gali2", "gali3", "khanki", "magi", "baimon"] },
     leveling: { xpMin: 5, xpMax: 9, xpPerLevelBase: 100 },
     links: { verificationLink: "" },
@@ -429,6 +432,69 @@ async function autoWatchReaderOnline(interaction, category, sessionRef, provider
     } finally {
         readerWatchLocks.delete(sessionKey);
     }
+}
+
+// ── Offline coupon helpers ─────────────────────────────────────────────────
+// Offline (manual bKash/Nagad) checkout-এও কুপন কাজ করে। কুপন যাচাই হয় checkout-এর
+// সময়, আর approve করার সময়ই কুপন ব্যালেন্স খরচ হয় (যাতে pending request টাকা না
+// পাঠিয়ে কুপন খরচ না করে ফেলে)।
+async function evaluateOfflineCouponForUser({ code, userId, basePrice }) {
+    const cleaned = String(code || "").trim().toUpperCase();
+    const result = offlineCoupon.evaluateOfflineCoupon({ coupon: null, userId, basePrice });
+    if (!cleaned) return { ok: false, reason: "empty", code: "" };
+    const snap = await db.ref(`coupons/${cleaned}`).once("value");
+    const coupon = snap.val();
+    const evaluated = offlineCoupon.evaluateOfflineCoupon({ coupon, userId, basePrice });
+    return { ...evaluated, code: evaluated.code || cleaned };
+}
+
+// offline request তৈরির সময়ই কুপন খরচ হয় (transaction-এ, একবারই), আর
+// request reject/expire হলে টাকাটা কুপনে ফেরত যায় — যাতে কুপন নষ্ট না হয়।
+async function consumeOfflineCoupon({ code, userId, spend, requestId = "" }) {
+    const cleaned = String(code || "").trim().toUpperCase();
+    const amount = Math.max(0, Number(spend) || 0);
+    if (!cleaned || amount <= 0) return { committed: false, skipped: true };
+    const ref = db.ref(`coupons/${cleaned}`);
+    const result = await ref.transaction(current => {
+        if (!current) return;
+        if (String(current.userId || "") !== String(userId || "")) return;
+        const status = String(current.status || "");
+        const expired = current.expiresAt && Number(current.expiresAt) < Date.now();
+        if (status !== "active" || expired) return;
+        const patch = offlineCoupon.couponPatchForConsumption(current, amount, Date.now());
+        return {
+            ...current,
+            ...patch,
+            offlineRequestId: requestId || null,
+            reservedBy: null,
+            reservedCategory: null,
+            reservedAt: null
+        };
+    }, undefined, false);
+    return { committed: Boolean(result.committed), coupon: result.snapshot?.val() || null };
+}
+
+async function refundOfflineCoupon(request) {
+    const code = String(request?.couponCode || "").trim().toUpperCase();
+    const spend = Math.max(0, Number(request?.couponDiscount) || 0);
+    if (!code || spend <= 0) return false;
+    const ref = db.ref(`coupons/${code}`);
+    const result = await ref.transaction(current => {
+        if (!current) return;
+        // শুধু এই request-এর খরচই ফেরত দিই — অন্য কোথাও ব্যবহার হয়ে থাকলে হাত দিই না।
+        if (String(current.offlineRequestId || "") !== String(request.id || "")) return;
+        const balance = Number(current.remainingValue ?? current.couponValue ?? current.discountValue) || 0;
+        return {
+            ...current,
+            remainingValue: Math.round((balance + spend) * 100) / 100,
+            status: "active",
+            consumedValue: Math.max(0, Math.round(((Number(current.consumedValue) || 0) - spend) * 100) / 100),
+            offlineRequestId: null,
+            refundedAt: Date.now()
+        };
+    }, undefined, false);
+    if (result.committed) console.log(`[offlinepay] Refunded ${spend} BDT to coupon ${code} for request ${request?.id || ""}`);
+    return Boolean(result.committed);
 }
 
 function buildPaymentPage(category, session, readerState, providerNumber) {
@@ -602,6 +668,180 @@ app.post("/api/admin/offline-payment/unban", async (req, res) => {
         }
         console.error("Offline unban API failed:", err.message);
         return res.status(500).json({ ok: false, error: "unban_failed" });
+    }
+});
+
+// ── সাপোর্টার বোর্ড (টপ বায়ার) ────────────────────────────────────────────
+// কোন চ্যানেলে টপ বায়ারদের রিয়েল-টাইম লিস্ট বসবে। খালি হলে অটো-পোস্ট হয় না,
+// কিন্তু প্যানেল থেকে /api/admin/supporters দিয়ে সবসময় দেখা যাবে।
+// প্যানেল Firebase config-এ (adminConfig/bot/discord/channels/supporterBoard) সেভ করে,
+// .env-এও দেওয়া যায় (SUPPORTER_BOARD_CHANNEL_ID)। config লোডের পরে পড়া হয়, তাই দুটোই কাজ করে।
+function getSupporterBoardChannelId() {
+    return String(
+        ADMIN_BOT_CONFIG?.discord?.channels?.supporterBoard || process.env.SUPPORTER_BOARD_CHANNEL_ID || ""
+    ).replace(/\D/g, "");
+}
+
+// অর্ডার ডেটা → সাপোর্টার লিডারবোর্ড (একই ফাংশন প্যানেল ও ডিসকর্ড দুটোতেই ব্যবহার হয়)।
+async function loadSupporterBoard({ limit = 10, now = Date.now() } = {}) {
+    const snap = await db.ref("offline_payment_requests").once("value").catch(() => null);
+    const orders = [];
+    for (const [id, record] of Object.entries(snap?.val() || {})) {
+        if (!record) continue;
+        const status = String(record.status || "");
+        const paid = Number(record.approvedAmount) || Number(record.claimedAmount) || 0;
+        if (!["approved", "auto_approved", "offline_payment_approved"].includes(status) || paid <= 0) continue;
+        orders.push({
+            discordUserId: String(record.discordUserId || ""),
+            username: String(record.discordUsername || ""),
+            paidAmount: paid,
+            package: String(record.category || ""),
+            paidAt: Number(record.reviewedAt || record.updatedAt || record.createdAt) || 0,
+            requestId: id
+        });
+    }
+    return supporterBoard.buildSupporterBoard({ orders, limit, now });
+}
+
+// ডিসকর্ডে সাপোর্টার বোর্ড পোস্ট/আপডেট (একই মেসেজ বারবার এডিট হয়)।
+async function publishSupporterBoard({ guild } = {}) {
+    const channelId = getSupporterBoardChannelId();
+    if (!channelId || !guild) return { ok: false, reason: "no_channel" };
+    const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+    if (!channel) return { ok: false, reason: "channel_not_found" };
+    try {
+        const board = await loadSupporterBoard({ limit: 10 });
+        const body = supporterBoard.formatSupporterBoardText(board, { maxRows: 10 })
+            .split("\n").filter(line => !/^🏆 \*\*টপ সাপোর্টার/.test(line)).join("\n").trim();
+        const embed = new EmbedBuilder()
+            .setTitle("🏆 টপ সাপোর্টার — রিয়েল-টাইম")
+            .setDescription(body.slice(0, 4000))
+            .setColor("#FFD700")
+            .setFooter({ text: `সর্বশেষ আপডেট · মোট সাপোর্ট ${board.totalSupport} ৳` })
+            .setTimestamp(new Date());
+        const storeRef = db.ref("runtime/supporterBoardMessage");
+        const existingId = (await storeRef.once("value")).val();
+        const existing = existingId ? await channel.messages.fetch(String(existingId)).catch(() => null) : null;
+        if (existing) {
+            await existing.edit({ embeds: [embed] });
+            return { ok: true, updated: true, messageId: existing.id, rows: board.rows.length };
+        }
+        const sent = await channel.send({ embeds: [embed] });
+        await storeRef.set(sent.id).catch(() => {});
+        return { ok: true, created: true, messageId: sent.id, rows: board.rows.length };
+    } catch (err) {
+        console.error("[supporters] publish failed:", err?.message || err);
+        return { ok: false, reason: String(err?.message || err) };
+    }
+}
+
+// অর্ডার approve হলেই বোর্ড রিফ্রেশ — ডিসকর্ডে লিস্ট রিয়েল-টাইম থাকে (debounce সহ)।
+let supporterBoardRefreshTimer = null;
+function scheduleSupporterBoardRefresh(delayMs = 4000) {
+    if (!getSupporterBoardChannelId()) return;
+    if (supporterBoardRefreshTimer) return;
+    supporterBoardRefreshTimer = setTimeout(async () => {
+        supporterBoardRefreshTimer = null;
+        try {
+            const guild = client?.guilds?.cache?.get(ALLOWED_GUILD_ID);
+            if (!guild) return;
+            const result = await publishSupporterBoard({ guild });
+            if (!result.ok) console.warn(`[supporters] refresh skipped: ${result.reason}`);
+        } catch (err) {
+            console.warn("[supporters] refresh failed:", err?.message || err);
+        }
+    }, delayMs);
+    supporterBoardRefreshTimer.unref?.();
+}
+
+// প্যানেল থেকে টপ বায়ার লিস্ট (রিয়েল-টাইম)।
+app.get("/api/admin/supporters", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "panel_origin_not_allowed" });
+    try {
+        await verifyAdminApiRequest(req);
+        const limit = Math.max(1, Math.min(50, Number(req.query?.limit) || 10));
+        const board = await loadSupporterBoard({ limit });
+        return res.json({ ok: true, ...board, channelId: getSupporterBoardChannelId(), version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Supporters API failed:", err.message);
+        return res.status(500).json({ ok: false, error: "supporters_failed" });
+    }
+});
+
+// প্যানেল থেকে বোর্ড এখনই পোস্ট/রিফ্রেশ।
+app.post("/api/admin/supporters/post", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "panel_origin_not_allowed" });
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const guild = client.guilds.cache.get(ALLOWED_GUILD_ID);
+        const result = await publishSupporterBoard({ guild });
+        if (!result.ok) {
+            return res.status(result.reason === "no_channel" ? 400 : 502).json({
+                ok: false, error: result.reason,
+                message: result.reason === "no_channel"
+                    ? "SUPPORTER_BOARD_CHANNEL_ID সেট করা নেই — .env-এ চ্যানেলের ID দিন।"
+                    : "বোর্ড পোস্ট করা যায়নি (Send Messages / Embed Links অনুমতি দেখুন)।"
+            });
+        }
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "supporter_board_posted", timestamp: Date.now(), summary: `Top supporter board posted in ${getSupporterBoardChannelId()}` }).catch(() => {});
+        return res.json({ ok: true, ...result, version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Supporter board post failed:", err.message);
+        return res.status(500).json({ ok: false, error: "supporter_board_failed" });
+    }
+});
+
+// ── টিকিট লক: প্যানেল থেকে আনলক ────────────────────────────────────────────
+app.get("/api/admin/ticket-locks", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "panel_origin_not_allowed" });
+    try {
+        await verifyAdminApiRequest(req);
+        const userId = String(req.query?.userId || "").replace(/\D/g, "");
+        const snap = await db.ref(`open_tickets/${ALLOWED_GUILD_ID}`).once("value");
+        const found = ticketLockActions.findTicketLocks({ locks: snap.val() || {}, userId });
+        return res.json({ ok: true, rows: ticketLockActions.summarizeLocks(found), version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Ticket lock list failed:", err.message);
+        return res.status(500).json({ ok: false, error: "ticket_lock_list_failed" });
+    }
+});
+
+// টিকিট বন্ধ/মুছে গেলে লক অটো আনলক; প্যানেল থেকেও হাতে করা যায়।
+app.post("/api/admin/ticket-locks/unlock", async (req, res) => {
+    const origin = String(req.get("origin") || "");
+    if (origin && !ADMIN_PANEL_ORIGINS.has(origin)) return res.status(403).json({ ok: false, error: "panel_origin_not_allowed" });
+    try {
+        const actor = await verifyAdminApiRequest(req);
+        const parsed = ticketLockActions.parseUnlockRequest(req.body || {});
+        if (!parsed.ok) return res.status(400).json({ ok: false, error: parsed.reason });
+        const snap = await db.ref(`open_tickets/${ALLOWED_GUILD_ID}`).once("value");
+        const found = ticketLockActions.findTicketLocks({ locks: snap.val() || {}, userId: parsed.userId, channelId: parsed.channelId });
+        let released = 0;
+        for (const item of found) {
+            const done = await releaseTicketLock({ channelId: item.channelId, userId: item.userId, key: item.key, reason: parsed.reason, closedBy: actor.uid })
+                .catch(() => false);
+            if (done) released += 1;
+        }
+        await db.ref("auditLog").push({ adminUid: actor.uid, actionType: "ticket_lock_unlocked", timestamp: Date.now(), summary: `Released ${released} ticket lock(s) for ${parsed.userId || parsed.channelId}` }).catch(() => {});
+        return res.json({ ok: true, released, checked: found.length, message: ticketLockActions.describeUnlockResult({ released, checked: found.length, reason: parsed.reason }), version: require("./package.json").version });
+    } catch (err) {
+        if (err?.statusCode === 401 || err?.statusCode === 403) {
+            return res.status(err.statusCode).json({ ok: false, error: err.statusCode === 403 ? "forbidden" : "unauthorized" });
+        }
+        console.error("Ticket lock unlock failed:", err.message);
+        return res.status(500).json({ ok: false, error: "ticket_unlock_failed" });
     }
 });
 
@@ -2324,6 +2564,8 @@ async function expireStaleOfflineRequest(requestId, request) {
             .update({ status: "expired", expiredAt: now, lastUpdated: now })
             .catch(() => {});
     }
+    // মেয়াদ শেষ হলে কুপনের টাকা ফেরত — ইউজার যাতে কুপন হারিয়ে না ফেলে।
+    await refundOfflineCoupon({ ...request, id: requestId }).catch(() => {});
     console.log(`[offlinepay] Expired stale request ${requestId} (session=${session?.status || "missing"})`);
     return true;
 }
@@ -2347,7 +2589,10 @@ async function creditOfflineSessionFromRequest(requestId, request) {
             if (current.offlinePaymentRequestId !== requestId) return;
             if (current.status === "offline_payment_approved") return current;
             if (current.status !== "offline_payment_requested") return;
-            const amount = Math.max(0, Number(current.targetPrice) || 0);
+            // কুপন দিয়ে পুরো টাকা ঢাকা পড়লে totalPaid 0-ই থাকে, বাকিটা coupon-covered হিসেবে ধরা হয়।
+            const amount = request.fullyCoveredByCoupon
+                ? Math.max(0, Number(current.totalPaid) || 0)
+                : Math.max(0, Number(current.targetPrice) || 0);
             return { ...current, status: "offline_payment_approved", totalPaid: amount,
                 usedTxns: [...(Array.isArray(current.usedTxns) ? current.usedTxns : []), `OFFLINE_ADMIN_APPROVED:${requestId}`],
                 offlineApprovedBy: request.reviewedBy || "admin-panel", offlineApprovedAt: Date.now(),
@@ -2578,6 +2823,7 @@ async function tryAutoApproveOfflineRequest(requestId) {
             .update({ sessionCreditedAt: now, updatedAt: now }).catch(() => {});
         await notifyOfflineRequester(finalRequest, true, { auto: true }).catch(() => {});
         await postOfflineApprovedReview(finalRequest, { auto: true }).catch(() => {});
+        scheduleSupporterBoardRefresh();
         await db.ref("auditLog").push({
             adminUid: "reader_auto", actionType: "offline_payment_auto_approved", timestamp: now,
             summary: `Auto approved offline request ${requestId} for ${request.discordUserId} — ${credit} BDT (reader ${verdict.readerUid}/${verdict.readerEventKey}, txn ${txnId})`
@@ -3308,7 +3554,12 @@ client.on("interactionCreate", async (interaction) => {
             return interaction.editReply({ embeds: [zeroPriceEmbed], components: [row] });
         }
 
-        await db.ref(`pending_payments/${userId}_${category}`).set({
+        // অফলাইন payment বেছে নেওয়া থাকলে session-টা select_provider-এ ফেলে দিই না —
+        // নাহলে Reader offline থাকলেও কুপন দেওয়ার পর ইউজার offline request দিতে পারেন না।
+        const existingSession = (await db.ref(`pending_payments/${userId}_${category}`).once("value")).val() || {};
+        const keepOfflineState = Boolean(existingSession?.provider)
+            && ["reader_offline", "offline_payment_requested", "offline_payment_approved", "offline_payment_rejected"].includes(String(existingSession.status || ""));
+        const sessionPatch = {
             targetPrice: finalPrice,
             basePrice,
             appliedCoupon: appliedCouponCode,
@@ -3319,13 +3570,30 @@ client.on("interactionCreate", async (interaction) => {
             status: "select_provider",
             createdAt: Date.now(),
             createdByDiscordId: userId
-        });
+        };
+        if (keepOfflineState) {
+            Object.assign(sessionPatch, {
+                provider: existingSession.provider,
+                status: existingSession.status,
+                createdAt: existingSession.createdAt || Date.now(),
+                offlinePaymentRequestId: existingSession.offlinePaymentRequestId || null,
+                offlinePaymentRequestedAt: existingSession.offlinePaymentRequestedAt || null,
+                offlineCouponCode: appliedCouponCode || null,
+                offlineCouponDiscount: appliedDiscountValue || 0,
+                offlinePayableAmount: finalPrice,
+                updatedAt: Date.now()
+            });
+        }
+        await db.ref(`pending_payments/${userId}_${category}`).set(sessionPatch);
 
         const pickerEmbed = new EmbedBuilder()
             .setTitle(`🛍️ ${category.toUpperCase()} — পেমেন্ট মাধ্যম নির্বাচন করুন`)
             .setDescription(
                 `📦 **প্যাকেজের রেগুলার মূল্য:** \`${basePrice}\` BDT\n` +
                 `💰 **ছাড়ের পর পরিশোধযোগ্য:** \`${finalPrice}\` BDT\n\n` +
+                (appliedCouponCode
+                    ? `🎁 **অফলাইনেও কুপন কাজ করবে** — Reader offline থাকলেও offline payment request-এ এই ছাড় ধরা থাকবে, পাঠাতে হবে শুধু **${finalPrice} ৳**।\n\n`
+                    : "") +
                 `📱 bKash অথবা Nagad নির্বাচন করুন। নম্বর দেখানোর আগে bot স্বয়ংক্রিয়ভাবে **ONLINE CHECK** করবে। Reader offline থাকলে নম্বর দেখানো হবে না।\n\n` +
                 `🎁 **কুপন স্ট্যাটাস:**\n${discountText}`
             )
@@ -3334,6 +3602,20 @@ client.on("interactionCreate", async (interaction) => {
             new ButtonBuilder().setCustomId(`pay_provider_bkash_${category}`).setLabel("bKash নির্বাচন করুন").setStyle(ButtonStyle.Primary),
             new ButtonBuilder().setCustomId(`pay_provider_nagad_${category}`).setLabel("Nagad নির্বাচন করুন").setStyle(ButtonStyle.Success)
         );
+        if (keepOfflineState) {
+            // কুপন বসানোর পরও আগের offlineFlow ধরে রাখি — ইউজার যেখানে ছিলেন সেখানেই ফিরবে।
+            const offlineProvider = String(sessionPatch.provider || "").toLowerCase();
+            const readerState = await getPaymentReaderState().catch(() => ({ online: false }));
+            const offlinePage = buildPaymentPage(category, {
+                ...sessionPatch, provider: offlineProvider, targetPrice: finalPrice,
+                basePrice, appliedDiscount: appliedDiscountValue, appliedCoupon: appliedCouponCode
+            }, readerState, getPaymentNumber(offlineProvider));
+            return interaction.editReply({
+                content: `✅ কুপন বসানো হয়েছে — অফলাইন পেমেন্টেও ছাড় কার্যকর।\n${discountText}`,
+                embeds: offlinePage.embeds,
+                components: offlinePage.components
+            });
+        }
         return interaction.editReply({ embeds: [pickerEmbed], components: [providerRow] });
     }
 
@@ -3409,6 +3691,30 @@ client.on("interactionCreate", async (interaction) => {
         if (session.provider !== provider || session.status !== "reader_offline") {
             return interaction.editReply("⚠️ এই checkout এখন offline-payment request-এর জন্য প্রস্তুত নয়। Payment option আবার নির্বাচন করুন।");
         }
+        // কুপন থাকলে অফলাইনেও ছাড় — কত টাকা পাঠাতে হবে সেটা এখানেই হিসাব হয়।
+        const sessionBasePrice = Math.max(0, Number(session.basePrice) || Number(session.targetPrice) || 0);
+        const sessionCouponCode = String(session.appliedCoupon || "").trim().toUpperCase();
+        let offlineCoupon = { ok: false, reason: "empty", code: sessionCouponCode };
+        if (sessionCouponCode && ADMIN_BOT_CONFIG.coupons?.enabled !== false) {
+            offlineCoupon = await evaluateOfflineCouponForUser({
+                code: sessionCouponCode, userId: interaction.user.id, basePrice: sessionBasePrice
+            }).catch(() => ({ ok: false, reason: "empty", code: sessionCouponCode }));
+        }
+        const offlineCouponDiscount = offlineCoupon.ok ? Number(offlineCoupon.discount) || 0 : 0;
+        const offlinePayable = offlineCoupon.ok
+            ? Number(offlineCoupon.payable) || 0
+            : Math.max(0, Number(session.targetPrice) || 0);
+        const amountCheck = offlineCoupon.reconcileOfflineAmount({
+            claimedAmount, packagePrice: sessionBasePrice || offlinePayable,
+            couponDiscount: offlineCouponDiscount, allowPartial: true
+        });
+        if (offlineCouponDiscount > 0 && claimedAmount > 0 && amountCheck.covered === false && amountCheck.shortfall > 0) {
+            return interaction.editReply(
+                `⚠️ কুপনের পর পাঠাতে হবে **${offlinePayable} ৳**, কিন্তু আপনি লিখেছেন **${claimedAmount} ৳**।\n` +
+                `কুপন ছাড় (**${offlineCouponDiscount} ৳**) ধরা আছে — সঠিক পরিমাণ লিখে আবার request দিন, নয়তো Admin আংশিক approve করবেন।`
+            );
+        }
+
         const existingSnap = await db.ref("offline_payment_requests").orderByChild("discordUserId").equalTo(interaction.user.id).once("value");
         const openRecords = [];
         for (const [openId, openRecord] of Object.entries(existingSnap.val() || {})) {
@@ -3433,15 +3739,54 @@ client.on("interactionCreate", async (interaction) => {
             if (gate.reason === "too_many_open") return interaction.editReply("⚠️ আপনার একসাথে একাধিক offline payment request pending আছে। আগেরগুলো নিষ্পত্তি হওয়ার পর নতুন request দিন।");
             return interaction.editReply(`🛡️ Spam protection: আবার offline request দেওয়ার আগে ${Math.ceil((gate.retryAfterMs || 0) / 60000)} মিনিট অপেক্ষা করুন।`);
         }
+        // কুপন আগে খরচ করি (atomically) — এতে একই কুপন দিয়ে দুইবার ছাড় নেওয়া যায় না।
+        let couponConsumption = { committed: false, skipped: true };
+        if (offlineCoupon.ok && offlineCouponDiscount > 0) {
+            couponConsumption = await consumeOfflineCoupon({
+                code: offlineCoupon.code, userId: interaction.user.id, spend: offlineCouponDiscount
+            }).catch(() => ({ committed: false }));
+            if (!couponConsumption.committed) {
+                return interaction.editReply("❌ কুপনটি এইমাত্র ব্যবহার হয়ে গেছে বা মেয়াদ শেষ — নিরাপত্তার জন্য offline request বন্ধ করা হয়েছে। কুপন ছাড়াই আবার request দিন অথবা Support-এ জানান।");
+            }
+        }
         const reqRef = db.ref("offline_payment_requests").push();
         const requestData = {
             id: reqRef.key, discordUserId: interaction.user.id, discordUsername: interaction.user.username,
             category, provider, amount: Number(session.targetPrice) || 0, status: "pending",
             txnId, senderNumber, claimedAmount,
+            // অফলাইন কুপন: পুরো দাম, প্রয়োগ হওয়া কুপন আর ছাড়ের পরের পরিশোধ্য টাকা।
+            basePrice: sessionBasePrice || Number(session.targetPrice) || 0,
+            couponCode: offlineCoupon.ok ? offlineCoupon.code : null,
+            couponDiscount: offlineCouponDiscount,
+            payableAmount: offlinePayable,
+            couponApplied: offlineCoupon.ok === true,
+            couponConsumed: couponConsumption.committed === true,
             createdAt: Date.now(), checkoutKey: `${interaction.user.id}_${category}`, guildId: interaction.guild.id
         };
         await reqRef.set(requestData);
+        if (couponConsumption.committed) {
+            // কুপন রেকর্ডে request ID বসাই — reject হলে ঠিক এই খরচটাই ফেরত যাবে।
+            await db.ref(`coupons/${offlineCoupon.code}`).update({ offlineRequestId: reqRef.key }).catch(() => {});
+        }
         await sessionRef.update({ status: "offline_payment_requested", offlinePaymentRequestId: reqRef.key, offlinePaymentRequestedAt: Date.now() });
+        // কুপন যদি পুরো টাকা ঢেকে দেয়, offline-এ আর কিছু পাঠানোর দরকার নেই — নিজেই credit হয়ে যাবে।
+        if (offlineCoupon.ok && offlineCoupon.fullyCovered) {
+            const coveredAt = Date.now();
+            await reqRef.update({
+                status: "approved", approvedAmount: 0, approvedBy: "coupon_full_cover",
+                reviewedBy: "coupon_full_cover", reviewedByUsername: "Coupon", reviewedAt: coveredAt,
+                autoApproved: true, fullyCoveredByCoupon: true, updatedAt: coveredAt
+            }).catch(() => {});
+            const credited = await creditOfflineSessionFromRequest(reqRef.key, {
+                ...requestData, status: "approved", fullyCoveredByCoupon: true
+            }).catch(() => false);
+            return interaction.editReply(
+                `🎉 কুপন \`${offlineCoupon.code}\` পুরো ${offlineCoupon.discount} ৳ ঢেকে দিয়েছে — **offline-এ কোনো টাকা পাঠাতে হবে না।**\n` +
+                (credited
+                    ? `✅ আপনার প্যাকেজ নিজে থেকেই credit হয়েছে, অ্যাকাউন্ট তৈরির বাটন এখনই ব্যবহার করতে পারবেন।`
+                    : `ℹ️ Request সংরক্ষিত হয়েছে (ID: \`${reqRef.key}\`) — checkout page থেকে account creation চালু করুন।`)
+            );
+        }
         let staffChannel = interaction.guild.channels.cache.get(STAFF_ADMIN_LOG_ID);
         if (!staffChannel) staffChannel = await interaction.guild.channels.fetch(STAFF_ADMIN_LOG_ID).catch(() => null);
         const staffChannelReady = Boolean(staffChannel && staffChannel.isTextBased());
@@ -3455,11 +3800,16 @@ client.on("interactionCreate", async (interaction) => {
             new ButtonBuilder().setCustomId(`offlinepay_approve_${reqRef.key}`).setLabel("Approve (manual verify) ").setStyle(ButtonStyle.Success),
             new ButtonBuilder().setCustomId(`offlinepay_reject_${reqRef.key}`).setLabel("Reject").setStyle(ButtonStyle.Danger)
         );
+        const couponLine = offlineCoupon.ok
+            ? `**Coupon:** \`${offlineCoupon.code}\` — ছাড় **${offlineCouponDiscount} BDT** (${offlineCoupon.percentOff}%)\n**লোকাল ছাড়ের পর পাঠাতে হবে:** ${offlinePayable} BDT\n` +
+              (offlineCoupon.fullyCovered ? "**⚡ কুপন পুরো টাকা ঢেকে দিয়েছে — approve করলেই কোনো টাকা ছাড়াই credit হবে।**\n" : "")
+            : (sessionCouponCode ? `**Coupon:** \`${sessionCouponCode}\` — ${offlineCoupon.reason || "ব্যবহারযোগ্য নয়"}\n` : "");
         const reviewEmbed = new EmbedBuilder().setTitle("🧾 Offline Payment Approval Required")
             .setDescription(`**User:** <@${interaction.user.id}> (\`${interaction.user.id}\`)
 **Package:** ${category}
 **Provider:** ${provider.toUpperCase()}
-**Package price:** ${requestData.amount} BDT
+**Package price:** ${requestData.basePrice} BDT
+${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${requestData.payableAmount} BDT
 **User বলেছেন পাঠিয়েছেন:** ${claimedAmount} BDT
 **TxnID:** \`${txnId}\`
 **Sender number:** \`${senderNumber}\`
@@ -3482,7 +3832,12 @@ client.on("interactionCreate", async (interaction) => {
         if (session.status === "offline_payment_approved") {
             const paid = Number(session.totalPaid) || 0;
             const target_ = Number(session.targetPrice) || 0;
-            if (paid > 0 && target_ > 0 && paid + 0.009 < target_) {
+            // কুপন পুরো টাকা ঢেকে দিলে "আংশিক পেমেন্ট" দেখানো ভুল হবে।
+            const coveredRequest = session.offlinePaymentRequestId
+                ? (await db.ref(`offline_payment_requests/${session.offlinePaymentRequestId}`).once("value")).val()
+                : null;
+            const couponCovered = coveredRequest?.fullyCoveredByCoupon === true;
+            if (!couponCovered && paid > 0 && target_ > 0 && paid + 0.009 < target_) {
                 const partialRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Account credential তৈরি করুন").setStyle(ButtonStyle.Secondary));
                 return interaction.editReply({ content: `⚠️ আংশিক পেমেন্ট approve হয়েছে — **${paid} / ${target_} BDT**। বাকি ${Math.max(0, target_ - paid)} BDT পরিশোধ না হওয়া পর্যন্ত সম্পূর্ণ অ্যাক্সেস নাও পেতে পারেন।`, components: [partialRow] });
             }
@@ -3490,6 +3845,10 @@ client.on("interactionCreate", async (interaction) => {
             const approvedRecord = session.offlinePaymentRequestId
                 ? (await db.ref(`offline_payment_requests/${session.offlinePaymentRequestId}`).once("value")).val()
                 : null;
+            if (couponCovered) {
+                const rowCovered = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`open_cred_modal_${category}`).setLabel("🔑 Create Account Credentials").setStyle(ButtonStyle.Success));
+                return interaction.editReply({ content: `🎉 আপনার কুপন \`${coveredRequest.couponCode}\` পুরো **${Number(coveredRequest.couponDiscount) || 0} ৳** ছাড় দিয়েছে — কোনো টাকা পাঠানোর দরকার হয়নি। নিচের বাটনে account তৈরি করুন।`, components: [rowCovered] });
+            }
             const approvedCopy = approvedRecord?.autoApproved
                 ? `✅ Reader-verified payment পাওয়া গেছে, credit হয়েছে **${paid} BDT**। নিচের বাটনে username/password তৈরি করুন — Admin পরে যাচাই করে নেবেন।`
                 : `✅ Admin/Staff offline payment approve করেছেন। নিচের বাটনে username/password তৈরি করুন।`;
@@ -3802,10 +4161,12 @@ client.on("interactionCreate", async (interaction) => {
             await notifyOfflineRequester(request, true).catch(() => {});
             // post-review: Admin এক ক্লিকে "Fake — Revoke & Ban" করতে পারেন।
             await postOfflineApprovedReview({ ...request, id: requestId }, { auto: false }).catch(() => {});
+            scheduleSupporterBoardRefresh();
             await interaction.editReply(`✅ Offline payment request approve করা হয়েছে (${actorTag})। ${Number(request.approvedAmount)} BDT credit হয়েছে; User এখন Shop-এ একই package পুনরায় select করে অথবা request status button দিয়ে account creation চালু করতে পারবেন।`);
         } else {
             await sessionRef.transaction(current => current?.offlinePaymentRequestId === requestId && current.status === "offline_payment_requested"
                 ? { ...current, status: "offline_payment_rejected", offlineRejectedBy: interaction.user.id, offlineRejectedAt: Date.now() } : undefined, undefined, false);
+            await refundOfflineCoupon({ ...request, id: requestId }).catch(() => {});
             await notifyOfflineRequester(request, false).catch(() => {});
             await interaction.editReply(`❌ Offline payment request reject করা হয়েছে (${actorTag}) — কারণ: ${rejectInfo.reasonLabel}`);
         }
@@ -4778,7 +5139,7 @@ client.on("interactionCreate", async (interaction) => {
         }
 
         // টিকিট বন্ধ — লক ছেড়ে দাও (cooldown শুরু হবে), যাতে ইউজার পরে আবার খুলতে পারে।
-        await releaseTicketLock({ channelId: interaction.channel.id, reason: "closed", closedBy: interaction.user.id })
+        await releaseLocksForChannel(interaction.channel.id, { reason: "closed", closedBy: interaction.user.id })
             .catch(err => console.warn("Ticket lock release failed:", err.message));
         await interaction.editReply("🔒 চ্যানেলটি ৫ সেকেন্ডের মধ্যে ডিলিট হবে।");
         setTimeout(async () => {
@@ -5048,11 +5409,33 @@ async function finalizeTicketLock({ ref, channelId, userId, key }) {
     return Boolean(result.committed);
 }
 
+// ── প্যানেল থেকে লক আনলক (auto-release সহ) ────────────────────────────────
+// টিকিট বন্ধ/চ্যানেল মুছে গেলে এই একই ফাংশন লক ছাড়ে, আর admin panel থেকে
+// userId/channelId দিয়েও ডাকা যায়। index খালি থাকলে Firebase থেকে মিলিয়ে নেয়।
+async function releaseLocksForChannel(channelId, { reason = "closed", closedBy = "" } = {}) {
+    const decision = ticketLockActions.shouldAutoRelease({ closed: reason === "closed", channelDeleted: reason === "channel_deleted" });
+    if (!decision.release) return { released: 0, reason: decision.reason };
+    let released = 0;
+    const direct = await releaseTicketLock({ channelId, reason: decision.reason, closedBy }).catch(() => false);
+    if (direct) released += 1;
+    if (!direct && channelId) {
+        // index মিস হলে Firebase-এর খোলা লক থেকে channelId মিলিয়ে ছাড়ি।
+        const snap = await db.ref(`open_tickets/${ALLOWED_GUILD_ID}`).once("value").catch(() => null);
+        const found = ticketLockActions.findTicketLocks({ locks: snap?.val() || {}, channelId });
+        for (const item of found) {
+            const ok = await releaseTicketLock({ channelId: item.channelId, userId: item.userId, key: item.key, reason: decision.reason, closedBy })
+                .catch(() => false);
+            if (ok) released += 1;
+        }
+    }
+    return { released, reason: decision.reason };
+}
+
 // চ্যানেল ডিলিট হয়ে গেলে লক ছেড়ে দেওয়া।
 async function onTicketChannelDeleted(channel) {
     const name = String(channel?.name || "");
     if (!/^(ticket|report|customer)-\d{4}$/i.test(name)) return;
-    await releaseTicketLock({ channelId: channel.id, reason: "channel_deleted" }).catch(() => {});
+    await releaseLocksForChannel(channel.id, { reason: "channel_deleted" }).catch(() => {});
     // index-এ থাকলে সেটাও closed করে দিই
     await db.ref(`ticketTranscriptIndex/${channel.id}`).update({ channelDeletedAt: Date.now() }).catch(() => {});
 }
