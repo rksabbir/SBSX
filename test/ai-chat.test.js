@@ -178,11 +178,12 @@ test("v1.5.71: failures explain no_key and all_cooling differently", async () =>
   const { chat } = buildChat();
   const sent = [];
   const channel = { send: payload => { sent.push(payload); return Promise.resolve({}); } };
-  await chat.notifyUserFailure(channel, Object.assign(new Error("no key"), { kind: "not_configured" }));
+  // v1.5.72: একই ইউজার বারবার লিখলে ৪৫ সেকেন্ডে একবারই ব্যাখ্যা যায় — তাই আলাদা user id।
+  await chat.notifyUserFailure(channel, Object.assign(new Error("no key"), { kind: "not_configured" }), "u-a");
   assert.match(sent[0].content, /API key সেট করা নেই/);
-  await chat.notifyUserFailure(channel, Object.assign(new Error("cooling"), { kind: "all_cooling" }));
+  await chat.notifyUserFailure(channel, Object.assign(new Error("cooling"), { kind: "all_cooling" }), "u-b");
   assert.match(sent[1].content, /cooldown/);
-  await chat.notifyUserFailure(channel, Object.assign(new Error("Request timed out"), { kind: "timeout" }));
+  await chat.notifyUserFailure(channel, Object.assign(new Error("Request timed out"), { kind: "timeout" }), "u-c");
   assert.match(sent[2].content, /সময়মতো উত্তর দেয়নি/);
 });
 

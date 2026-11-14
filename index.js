@@ -219,7 +219,8 @@ const OFFLINE_FRAUD_BAN_ENABLED = String(process.env.OFFLINE_FRAUD_BAN_ENABLED |
 // টিকিট বন্ধ হওয়ার পর কতক্ষণ অপেক্ষা করে আবার খোলা যাবে।
 const TICKET_REOPEN_COOLDOWN_MS = Math.max(0, Number(process.env.TICKET_REOPEN_COOLDOWN_MS || 5 * 60 * 1000));
 const TICKET_LOCK_SWEEP_INTERVAL_MS = Math.max(60_000, Number(process.env.TICKET_LOCK_SWEEP_INTERVAL_MS || 10 * 60 * 1000));
-const TICKET_LOCK_MAX_AGE_MS = Math.max(60 * 60 * 1000, Number(process.env.TICKET_LOCK_MAX_AGE_MS || 7 * 24 * 60 * 60 * 1000));
+// v1.5.72: মৃত লক ৭ দিন আটকে রাখা মানে ইউজার এক সপ্তাহ টিকিটই খুলতে পারবে না। ডিফল্ট ২৪ ঘণ্টা।
+const TICKET_LOCK_MAX_AGE_MS = Math.max(60 * 60 * 1000, Number(process.env.TICKET_LOCK_MAX_AGE_MS || 24 * 60 * 60 * 1000));
 let ticketLockSweepTimer = null;
 let offlineSweepTimer = null;
 let offlineAutoVerifyTimer = null;
@@ -1750,6 +1751,20 @@ const client = new Client({
     partials: [Partials.Channel, Partials.GuildMember, Partials.Message, Partials.Reaction]
 });
 
+// v1.5.72: Firebase `.once()` কখনো কখনো ঝুলে যায় (network stall)। payment panel-এর online
+// check এই কারণে আটকে গেলে ইউজার শুধু "checkout পাওয়া যায়নি"/অন্তহীন লোডিং দেখত।
+// তাই প্রতিটি critical read-এর উপর একটি কঠিন সময়সীমা বসানো হয় — শেষে default ধরে এগোয়।
+function withDeadline(promise, ms, fallback) {
+    const limit = Math.max(1000, Number(ms) || 8000);
+    let timer = null;
+    const guard = new Promise(resolve => {
+        timer = setTimeout(() => resolve(fallback), limit);
+        if (typeof timer.unref === "function") timer.unref();
+    });
+    return Promise.race([Promise.resolve(promise).catch(() => fallback), guard])
+        .finally(() => clearTimeout(timer));
+}
+
 // Invite-based LiveKit room, channel-wide persistent live pins, realtime Radar and secure moderation.
 // Live Studio temporarily overrides only the Bot's profile activity; the configured status returns when it ends.
 let liveStudioPresenceActive = false;
@@ -1905,7 +1920,7 @@ async function notifyAiDiagnostic(report) {
         .setTitle("🤖 AKMAFIA AI — উত্তর আসছে না কেন")
         .setDescription(aiChat.describeDiagnosis(report).slice(0, 4000))
         .setColor("#E67E22")
-        .setFooter({ text: "ঠিক হওয়ার পর এই সতর্কতা নিজে থেকে বন্ধ হয়ে যাবে · v1.5.70" })
+        .setFooter({ text: "ঠিক হওয়ার পর এই সতর্কতা নিজে থেকে বন্ধ হয়ে যাবে · v1.5.72" })
         .setTimestamp(new Date());
     await channel.send({ content: `<@&${getConfiguredRoleId("admin")}> AI auto-reply প্রস্তুত নয়।`, embeds: [embed], allowedMentions: { roles: [getConfiguredRoleId("admin")] } }).catch(() => {});
     return true;
@@ -3336,6 +3351,14 @@ client.on("interactionCreate", async (interaction) => {
             return null;
         }, undefined, false);
         if (!cleared.committed) {
+            const stuckSession = (await sessionRef.once("value").catch(() => null))?.val() || {};
+            const stuckStatus = String(stuckSession.status || "");
+            if (stuckStatus === "creating") {
+                return interaction.editReply("⏳ আপনার পেমেন্ট সফল হয়েছে, account তৈরি হচ্ছে। কয়েক সেকেন্ডের মধ্যে শেষ হবে — এই checkout এখন বাতিল করা যাবে না।");
+            }
+            if (stuckStatus === "completed") {
+                return interaction.editReply("✅ এই checkout থেকে ইতিমধ্যেই account তৈরি হয়ে গেছে। নতুন প্যাকেজ কিনতে Shop panel থেকে আবার package বেছে নিন।");
+            }
             return interaction.editReply("☝️ এই checkout-এ ইতিমধ্যেই পেমেন্ট credit হয়েছে — বাতিল করা যাবে না। নতুন প্যাকেজ কিনতে চাইলে অন্য প্যাকেজ বেছে নিন অথবা Support-এ জানান।");
         }
         return interaction.editReply("✅ পুরোনো checkout বাতিল হয়েছে। এখন Shop panel থেকে আবার package বেছে নিন।");
@@ -4399,10 +4422,13 @@ ${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${
         let ownsCheck = false;
         try {
             await interaction.deferUpdate();
-            const sessionSnap = await sessionRef.once("value");
-            const session = sessionSnap.val();
+            // v1.5.72: এই read ঝুলে গেলে বাটন ক্লিক "লোডিং" হয়ে আটকে থাকত — এখন কঠিন সময়সীমা।
+            const sessionSnap = await withDeadline(sessionRef.once("value"), 8000, null);
+            const session = sessionSnap?.val?.();
             if (!session) {
-                return interaction.editReply({ content: "⚠️ এই checkout পাওয়া যায়নি। Shop থেকে আবার package নির্বাচন করুন।", embeds: [], components: [] });
+                // v1.5.72: আগে শুধু "checkout পাওয়া যায়নি" বলা হতো — আটকে থাকা session-এর
+                // আসল কারণ (পেমেন্ট credited / account তৈরি চলছে) কেউ জানত না।
+                return interaction.editReply({ content: "⚠️ এই checkout পাওয়া যায়নি (সম্ভবত বাতিল বা মেয়াদ শেষ)। Shop থেকে আবার package নির্বাচন করুন।", embeds: [], components: [] });
             }
 
             const claimTime = Date.now();
@@ -4416,7 +4442,7 @@ ${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${
             readerCheckLastAt.set(interaction.user.id, claimTime);
             await interaction.editReply({ content: "🟠 **ONLINE CHECK চলছে...** Reader online না হওয়া পর্যন্ত পেমেন্ট নম্বর দেখানো হবে না।", embeds: [], components: [] });
 
-            const readerState = await getPaymentReaderState();
+            const readerState = await withDeadline(getPaymentReaderState(), 9000, { online: false, lastSeenAt: null, deviceUid: null, reason: "reader_check_timeout" });
             const paymentNumber = getPaymentNumber(provider);
             const now = Date.now();
             const patch = readerState.online && paymentNumber
@@ -4442,6 +4468,10 @@ ${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${
             const reply = await interaction.editReply({ content: "", ...buildPaymentPage(category, updatedSession, readerState, paymentNumber) });
             if (!readerState.online && TRUSTED_READER_UIDS.size > 0) {
                 void autoWatchReaderOnline(interaction, category, sessionRef, provider);
+            }
+            // v1.5.72: Reader ডেটা পড়তেই দেরি হলে ইউজার যেন বুঝতে পারে — "নম্বর নেই" নয়।
+            if (["reader_check_timeout", "firebase_error"].includes(String(readerState.reason || ""))) {
+                console.warn(`[payment] reader state read slow/failed for ${interaction.user.id} (${readerState.reason})`);
             }
             return reply;
         } catch (err) {
@@ -4493,8 +4523,8 @@ ${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${
         try {
             await interaction.deferUpdate();
             const sessionRef = db.ref(`pending_payments/${interaction.user.id}_${category}`);
-            const snap = await sessionRef.once("value");
-            const session = snap.val();
+            const snap = await withDeadline(sessionRef.once("value"), 8000, null);
+            const session = snap?.val?.();
             if (!session || !["reader_offline", "number_not_configured", "awaiting_txn", "pending"].includes(session.status) || !["bkash", "nagad"].includes(String(session.provider || ""))) {
                 return interaction.editReply({ content: "❌ সক্রিয় payment session পাওয়া যায়নি। Shop থেকে package নির্বাচন করুন।", embeds: [], components: [] });
             }
@@ -4523,7 +4553,7 @@ ${couponLine}**ছাড়ের পর পরিশোধযোগ্য:** ${
             }
             readerCheckLastAt.set(interaction.user.id, now);
             await interaction.editReply({ content: "🟠 **ONLINE CHECK চলছে...** একই সময়ে আরেকটি check request প্রয়োজন নেই।", embeds: [], components: [] });
-            const readerState = await getPaymentReaderState();
+            const readerState = await withDeadline(getPaymentReaderState(), 9000, { online: false, lastSeenAt: null, deviceUid: null, reason: "reader_check_timeout" });
             const paymentNumber = getPaymentNumber(session.provider);
             const updatedSession = { ...session, lastReaderCheckAt: Date.now() };
             if (readerState.online && paymentNumber) {
@@ -5596,15 +5626,46 @@ async function releaseTicketLock({ channelId = "", userId = "", key = "", reason
 async function claimTicketSlot({ guildId, userId, type, category, now = Date.now() }) {
     const key = ticketLockKey(type, category);
     const ref = db.ref(`open_tickets/${guildId}/${userId}/${key}`);
-    const result = await ref.transaction(current => {
+    const attempt = () => ref.transaction(current => {
         const gate = evaluateTicketOpenGate({ lock: current, now, cooldownMs: TICKET_REOPEN_COOLDOWN_MS });
         if (!gate.allowed) return;
         return buildTicketLockRecord({ channelId: "", category, type, ownerId: userId, now });
     }, undefined, false);
+
+    let result = await attempt();
     if (result.committed) return { allowed: true, key, ref };
+
+    // v1.5.72: "টিকিট খুললেই বলে আগের টিকিট খোলা আছে" — কিন্তু সেই চ্যানেলই আর নেই।
+    // আগে মৃত লক ৭ দিন পর্যন্ত আটকে রাখত (sweep ১০ মিনিটে একবার, তাও শুধু channelId থাকলে)।
+    // এখন লকের চ্যানেল সত্যিই নেই কি না দেখে সাথে সাথে লক ছেড়ে দেওয়া হয়।
+    const stale = await describeStaleTicketLock(guildId, result.snapshot?.val() || (await ref.once("value")).val(), now);
+    if (stale) {
+        await releaseTicketLock({
+            channelId: String(result.snapshot?.val()?.channelId || ""),
+            userId, key, reason: stale
+        }).catch(() => {});
+        console.log(`[ticketlock] Reclaimed stale ${key} for ${userId} (${stale})`);
+        result = await attempt();
+        if (result.committed) return { allowed: true, key, ref, reclaimed: stale };
+    }
+
     const current = result.snapshot?.val() || (await ref.once("value")).val();
     const gate = evaluateTicketOpenGate({ lock: current, now, cooldownMs: TICKET_REOPEN_COOLDOWN_MS });
     return { allowed: false, key, gate: { ...gate, type, category } };
+}
+
+// লকের চ্যানেল সত্যিই মুছে গেছে (অথবা লক তৈরি হয়েছিল কিন্তু চ্যানেল কখনো তৈরি হয়নি) কি না।
+// খালি channelId-কে ভাঙা ধরা হয় না যদি লকটি একদম সদ্য হয় — তখন অন্য request চ্যানেল বানাচ্ছে।
+async function describeStaleTicketLock(guildId, lock, now = Date.now()) {
+    if (!lock || String(lock.status || "open") !== "open") return "";
+    const channelId = String(lock.channelId || "");
+    const openedAt = Number(lock.openedAt) || 0;
+    if (!channelId) return (openedAt && now - openedAt > 2 * 60 * 1000) ? "channel_never_created" : "";
+    const guild = client.guilds.cache.get(String(guildId));
+    if (!guild) return "";
+    if (guild.channels.cache.get(channelId)) return "";
+    const fetched = await withDeadline(guild.channels.fetch(channelId).catch(() => null), 6000, null);
+    return fetched ? "" : "channel_missing";
 }
 
 async function finalizeTicketLock({ ref, channelId, userId, key }) {
@@ -5687,6 +5748,7 @@ function startTicketLockSweepTimer() {
     }, TICKET_LOCK_SWEEP_INTERVAL_MS);
     if (typeof ticketLockSweepTimer.unref === "function") ticketLockSweepTimer.unref();
 }
+
 
 // Bot restart হলে আগের খোলা টিকিটগুলোর জন্য লক তৈরি করে — নাহলে পুরোনো টিকিট
 // থাকা ইউজারও নতুন টিকিট খুলতে পারত।
